@@ -23,6 +23,7 @@ pub struct Snapshot {
     pub scheduler: SchedulerSnapshot,
     pub routing: RoutingSnapshot,
     pub webhooks: WebhookSnapshot,
+    pub web_ui: WebUiSnapshot,
     pub global: GlobalStats,
     pub current_downloads: Vec<DownloadItem>,
     pub history_downloads: Vec<DownloadItem>,
@@ -78,6 +79,30 @@ pub struct WebhookSnapshot {
     pub enabled: bool,
     pub ping_mode: WebhookPingMode,
     pub ping_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebUiStatus {
+    Disabled,
+    Starting,
+    Listening,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebUiSnapshot {
+    pub enabled: bool,
+    pub bind_address: String,
+    pub port: u16,
+    pub cookie_days: u32,
+    pub status: WebUiStatus,
+    pub url: String,
+    pub auth_configured: bool,
+    pub pending_pair_pins: Vec<String>,
+    pub active_session_count: usize,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -183,6 +208,15 @@ pub enum ApiRequest {
         ping_id: Option<String>,
     },
     TriggerWebhookTest,
+    SetWebUiSettings {
+        enabled: bool,
+        bind_address: String,
+        port: u16,
+        cookie_days: u32,
+    },
+    ApproveWebUiPin {
+        pin: String,
+    },
     SetRememberedCancelBehavior {
         behavior: CancelBehaviorPreference,
     },
@@ -258,6 +292,7 @@ impl Snapshot {
                 }],
             },
             webhooks: WebhookSnapshot::default(),
+            web_ui: WebUiSnapshot::default(),
             global: GlobalStats::default(),
             current_downloads: Vec::new(),
             history_downloads: Vec::new(),
@@ -313,6 +348,29 @@ impl Default for WebhookSnapshot {
             enabled: false,
             ping_mode: WebhookPingMode::None,
             ping_id: None,
+        }
+    }
+}
+
+impl Default for WebUiStatus {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+impl Default for WebUiSnapshot {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_address: "0.0.0.0".into(),
+            port: 39123,
+            cookie_days: 30,
+            status: WebUiStatus::Disabled,
+            url: "http://127.0.0.1:39123".into(),
+            auth_configured: true,
+            pending_pair_pins: Vec::new(),
+            active_session_count: 0,
+            last_error: None,
         }
     }
 }

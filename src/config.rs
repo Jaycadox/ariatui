@@ -6,12 +6,15 @@ use serde::{Deserialize, Serialize};
 use crate::paths::AppPaths;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
     pub daemon: DaemonConfig,
     pub ui: UiConfig,
+    pub web: WebConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DaemonConfig {
     pub poll_interval_ms: u64,
     pub rpc_request_timeout_secs: u64,
@@ -23,9 +26,19 @@ pub struct DaemonConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UiConfig {
     pub refresh_interval_ms: u64,
     pub show_details_by_default: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebConfig {
+    pub default_enabled: bool,
+    pub default_bind_address: String,
+    pub default_port: u16,
+    pub default_cookie_days: u32,
 }
 
 impl Default for AppConfig {
@@ -44,7 +57,31 @@ impl Default for AppConfig {
                 refresh_interval_ms: 250,
                 show_details_by_default: true,
             },
+            web: WebConfig {
+                default_enabled: false,
+                default_bind_address: "0.0.0.0".into(),
+                default_port: 39123,
+                default_cookie_days: 30,
+            },
         }
+    }
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        AppConfig::default().daemon
+    }
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        AppConfig::default().ui
+    }
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        AppConfig::default().web
     }
 }
 

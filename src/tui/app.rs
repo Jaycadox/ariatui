@@ -20,12 +20,14 @@ use crate::{
         event::{UiEvent, next_event},
         focus::TabKind,
         forms::{
-            AddUrlForm, CancelChoice, CancelForm, FilenameChoice, FilenameChoiceForm,
-            RangeField, RangeForm, RoutingField, RoutingRuleForm, SpeedForm, WebhookForm,
+            AddUrlForm, CancelChoice, CancelForm, FilenameChoice, FilenameChoiceForm, PinForm,
+            RangeField, RangeForm, RoutingField, RoutingRuleForm, SpeedForm, WebUiForm,
+            WebhookForm,
         },
         input::InputField,
     },
     units,
+    web::{validate_bind_address, validate_cookie_days},
     webhook::{validate_discord_webhook_url, validate_ping_id},
 };
 
@@ -35,6 +37,8 @@ pub enum ModalState {
     ChooseFilename(FilenameChoiceForm),
     Cancel(CancelForm),
     EditWebhooks(WebhookForm),
+    ApproveWebUiPin(PinForm),
+    EditWebUi(WebUiForm),
     EditManual(SpeedForm),
     EditUsualInternetSpeed(SpeedForm),
     EditRange(RangeForm),
@@ -101,8 +105,7 @@ impl UiApp {
         terminal: &mut Terminal<B>,
     ) -> Result<()>
     where
-        <B as ratatui::backend::Backend>::Error:
-            std::error::Error + Send + Sync + 'static,
+        <B as ratatui::backend::Backend>::Error: std::error::Error + Send + Sync + 'static,
     {
         let refresh = Duration::from_millis(self.app.config.ui.refresh_interval_ms);
         loop {
@@ -212,6 +215,8 @@ impl UiApp {
                     self.open_routing_editor();
                 } else if self.tab == TabKind::Webhooks {
                     self.open_webhooks_editor();
+                } else if self.tab == TabKind::WebUi {
+                    self.open_web_ui_editor();
                 } else {
                     self.show_details = !self.show_details;
                 }
@@ -228,7 +233,9 @@ impl UiApp {
                 }
             }
             KeyCode::Char('p') => {
-                if let Some(item) = self.current_selected() {
+                if self.tab == TabKind::WebUi {
+                    self.modal = Some(ModalState::ApproveWebUiPin(PinForm::new("")));
+                } else if let Some(item) = self.current_selected() {
                     self.issue(ApiRequest::Pause {
                         gid: item.gid.clone(),
                         force: true,
@@ -286,6 +293,19 @@ impl UiApp {
                         ManualOrScheduled::Scheduled => ManualOrScheduled::Manual,
                     };
                     self.issue(ApiRequest::SetMode { mode: next }).await?;
+                } else if self.tab == TabKind::WebUi {
+                    let response = self
+                        .request_response(ApiRequest::SetWebUiSettings {
+                            enabled: !self.snapshot.web_ui.enabled,
+                            bind_address: self.snapshot.web_ui.bind_address.clone(),
+                            port: self.snapshot.web_ui.port,
+                            cookie_days: self.snapshot.web_ui.cookie_days,
+                        })
+                        .await?;
+                    if let Some(snapshot) = response.result {
+                        self.snapshot = snapshot;
+                        self.normalize_indices();
+                    }
                 }
             }
             KeyCode::Char('e') => {
@@ -293,6 +313,8 @@ impl UiApp {
                     self.open_scheduler_editor();
                 } else if self.tab == TabKind::Webhooks {
                     self.open_webhooks_editor();
+                } else if self.tab == TabKind::WebUi {
+                    self.open_web_ui_editor();
                 }
             }
             KeyCode::Char('u') => {
@@ -367,9 +389,7 @@ impl UiApp {
                 KeyCode::Enter => {
                     let filename = form.selected_filename();
                     if filename.is_empty() {
-                        self.modal = Some(ModalState::Error(
-                            "Filename cannot be empty".into(),
-                        ));
+                        self.modal = Some(ModalState::Error("Filename cannot be empty".into()));
                     } else {
                         let url = form.url.clone();
                         self.issue(ApiRequest::AddHttpUrl {
@@ -432,6 +452,52 @@ impl UiApp {
                         ping_id: validated_ping_id,
                     })
                     .await?;
+                    self.modal = None;
+                }
+                _ => {
+                    form.active_input().input(key);
+                }
+            },
+            ModalState::ApproveWebUiPin(form) => match key.code {
+                KeyCode::Esc => self.modal = None,
+                KeyCode::Enter => {
+                    let pin = form.value();
+                    self.issue(ApiRequest::ApproveWebUiPin { pin }).await?;
+                    self.modal = None;
+                }
+                _ => {
+                    form.input.input(key);
+                }
+            },
+            ModalState::EditWebUi(form) => match key.code {
+                KeyCode::Esc => self.modal = None,
+                KeyCode::Tab => form.next_focus(),
+                KeyCode::BackTab => form.previous_focus(),
+                KeyCode::Enter => {
+                    let (bind_address, port, cookie_days) = form.values();
+                    validate_bind_address(&bind_address)?;
+                    let port = port
+                        .parse::<u16>()
+                        .map_err(|_| eyre!("port must be a number between 1 and 65535"))?;
+                    if port == 0 {
+                        return Err(eyre!("port must be a number between 1 and 65535"));
+                    }
+                    let cookie_days = cookie_days
+                        .parse::<u32>()
+                        .map_err(|_| eyre!("cookie days must be between 1 and 365"))?;
+                    validate_cookie_days(cookie_days)?;
+                    let response = self
+                        .request_response(ApiRequest::SetWebUiSettings {
+                            enabled: self.snapshot.web_ui.enabled,
+                            bind_address,
+                            port,
+                            cookie_days,
+                        })
+                        .await?;
+                    if let Some(snapshot) = response.result {
+                        self.snapshot = snapshot;
+                        self.normalize_indices();
+                    }
                     self.modal = None;
                 }
                 _ => {
@@ -574,7 +640,7 @@ impl UiApp {
                 let routing_len = self.routing_rules().len();
                 move_index(&mut self.routing_index, routing_len, delta);
             }
-            TabKind::Webhooks => {}
+            TabKind::Webhooks | TabKind::WebUi => {}
         }
     }
 
@@ -678,7 +744,19 @@ impl UiApp {
         self.modal = Some(ModalState::EditWebhooks(WebhookForm::new(
             &self.snapshot.webhooks.discord_webhook_url,
             self.snapshot.webhooks.ping_mode,
-            self.snapshot.webhooks.ping_id.as_deref().unwrap_or_default(),
+            self.snapshot
+                .webhooks
+                .ping_id
+                .as_deref()
+                .unwrap_or_default(),
+        )));
+    }
+
+    fn open_web_ui_editor(&mut self) {
+        self.modal = Some(ModalState::EditWebUi(WebUiForm::new(
+            &self.snapshot.web_ui.bind_address,
+            self.snapshot.web_ui.port,
+            self.snapshot.web_ui.cookie_days,
         )));
     }
 

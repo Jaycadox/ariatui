@@ -90,8 +90,10 @@ impl FilenameChoiceForm {
     }
 
     pub fn update_block(&mut self) {
-        self.custom
-            .set_block(field_block("Custom Name", self.selection == FilenameChoice::Custom));
+        self.custom.set_block(field_block(
+            "Custom Name",
+            self.selection == FilenameChoice::Custom,
+        ));
     }
 }
 
@@ -119,6 +121,112 @@ impl Default for CancelForm {
 #[derive(Debug)]
 pub struct SpeedForm {
     pub input: InputField,
+}
+
+#[derive(Debug)]
+pub struct PinForm {
+    pub input: InputField,
+}
+
+impl PinForm {
+    pub fn new(initial: &str) -> Self {
+        let mut input = InputField::new();
+        input.insert_str(initial);
+        input.set_placeholder_text("1234");
+        input.set_block(field_block("Browser PIN", true));
+        Self { input }
+    }
+
+    pub fn value(&self) -> String {
+        self.input.value().to_string()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebUiField {
+    BindAddress,
+    Port,
+    CookieDays,
+}
+
+#[derive(Debug)]
+pub struct WebUiForm {
+    pub bind_address: InputField,
+    pub port: InputField,
+    pub cookie_days: InputField,
+    pub focus: WebUiField,
+}
+
+impl WebUiForm {
+    pub fn new(bind_address: &str, port: u16, cookie_days: u32) -> Self {
+        let mut bind_input = InputField::new();
+        bind_input.insert_str(bind_address);
+        bind_input.set_placeholder_text("0.0.0.0");
+
+        let mut port_input = InputField::new();
+        port_input.insert_str(port.to_string());
+        port_input.set_placeholder_text("39123");
+
+        let mut days_input = InputField::new();
+        days_input.insert_str(cookie_days.to_string());
+        days_input.set_placeholder_text("30");
+
+        let mut form = Self {
+            bind_address: bind_input,
+            port: port_input,
+            cookie_days: days_input,
+            focus: WebUiField::BindAddress,
+        };
+        form.update_blocks();
+        form
+    }
+
+    pub fn next_focus(&mut self) {
+        self.focus = match self.focus {
+            WebUiField::BindAddress => WebUiField::Port,
+            WebUiField::Port => WebUiField::CookieDays,
+            WebUiField::CookieDays => WebUiField::BindAddress,
+        };
+        self.update_blocks();
+    }
+
+    pub fn previous_focus(&mut self) {
+        self.focus = match self.focus {
+            WebUiField::BindAddress => WebUiField::CookieDays,
+            WebUiField::Port => WebUiField::BindAddress,
+            WebUiField::CookieDays => WebUiField::Port,
+        };
+        self.update_blocks();
+    }
+
+    pub fn active_input(&mut self) -> &mut InputField {
+        match self.focus {
+            WebUiField::BindAddress => &mut self.bind_address,
+            WebUiField::Port => &mut self.port,
+            WebUiField::CookieDays => &mut self.cookie_days,
+        }
+    }
+
+    pub fn values(&self) -> (String, String, String) {
+        (
+            self.bind_address.value().to_string(),
+            self.port.value().to_string(),
+            self.cookie_days.value().to_string(),
+        )
+    }
+
+    fn update_blocks(&mut self) {
+        self.bind_address.set_block(field_block(
+            "Bind Address",
+            self.focus == WebUiField::BindAddress,
+        ));
+        self.port
+            .set_block(field_block("Port", self.focus == WebUiField::Port));
+        self.cookie_days.set_block(field_block(
+            "Cookie Days",
+            self.focus == WebUiField::CookieDays,
+        ));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,8 +300,10 @@ impl WebhookForm {
     }
 
     fn update_blocks(&mut self) {
-        self.url
-            .set_block(field_block("Discord Webhook URL", self.focus == WebhookField::Url));
+        self.url.set_block(field_block(
+            "Discord Webhook URL",
+            self.focus == WebhookField::Url,
+        ));
         self.ping_id.set_block(field_block(
             "Specific User/Role ID",
             self.focus == WebhookField::PingId,

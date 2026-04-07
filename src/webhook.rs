@@ -59,4 +59,3 @@ pub fn mention_prefix(mode: WebhookPingMode, ping_id: Option<&str>) -> String {
             .unwrap_or_default(),
     }
 }
-

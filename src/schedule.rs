@@ -52,6 +52,11 @@ mod tests {
             discord_webhook_url: String::new(),
             webhook_ping_mode: crate::webhook::WebhookPingMode::None,
             webhook_ping_id: String::new(),
+            web_ui_enabled: false,
+            web_ui_bind_address: "0.0.0.0".into(),
+            web_ui_port: 39123,
+            web_ui_cookie_days: 30,
+            web_ui_session_secret: String::new(),
         };
         let now = Local.with_ymd_and_hms(2026, 4, 7, 10, 30, 0).unwrap();
         let resolved = resolve(now, &state).expect("resolve");

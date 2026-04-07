@@ -1,4 +1,9 @@
-use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use chrono::Local;
 use color_eyre::eyre::{Result, eyre};
@@ -16,7 +21,7 @@ use crate::{
         snapshot::{
             ApiPayload, ApiReply, Aria2ChildStatus, ChildLifecycle, DownloadItem, DownloadStatus,
             GlobalStats, ResolvedHttpUrl, RoutingSnapshot, SchedulerSnapshot, Snapshot,
-            WebhookSnapshot,
+            WebUiStatus, WebhookSnapshot,
         },
     },
     routing::{match_rule, normalize_rules},
@@ -24,8 +29,11 @@ use crate::{
         client::Aria2RpcClient,
         types::{Aria2File, Aria2GlobalStat, Aria2Status},
     },
-    schedule, units,
-    webhook::{WebhookPingMode, mention_prefix, validate_discord_webhook_url, validate_ping_id, webhook_enabled},
+    schedule, units, web,
+    webhook::{
+        WebhookPingMode, mention_prefix, validate_discord_webhook_url, validate_ping_id,
+        webhook_enabled,
+    },
 };
 
 #[derive(Debug)]
@@ -44,6 +52,15 @@ pub struct DaemonState {
     pub seen_terminal_events: Mutex<HashSet<String>>,
     pub notifications_initialized: Mutex<bool>,
     pub last_notified_restart_count: Mutex<u32>,
+    pub web_pairings: Mutex<HashMap<String, WebPairing>>,
+    pub web_sessions: Mutex<HashMap<String, Instant>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WebPairing {
+    pub pin: String,
+    pub expires_at: Instant,
+    pub approved_session_token: Option<String>,
 }
 
 pub type SharedDaemonState = Arc<DaemonState>;
@@ -74,6 +91,8 @@ impl DaemonState {
             seen_terminal_events: Mutex::new(HashSet::new()),
             notifications_initialized: Mutex::new(false),
             last_notified_restart_count: Mutex::new(0),
+            web_pairings: Mutex::new(HashMap::new()),
+            web_sessions: Mutex::new(HashMap::new()),
         })
     }
 
@@ -241,6 +260,18 @@ impl DaemonState {
             ping_mode: state.webhook_ping_mode,
             ping_id: validate_ping_id(state.webhook_ping_mode, Some(&state.webhook_ping_id))?,
         };
+        if snapshot.web_ui.url.is_empty() {
+            snapshot.web_ui.url =
+                web::format_listener_url(&state.web_ui_bind_address, state.web_ui_port);
+        }
+        let (pending_pair_pins, active_session_count) = web::auth_summary(self).await;
+        snapshot.web_ui.enabled = state.web_ui_enabled;
+        snapshot.web_ui.bind_address = state.web_ui_bind_address.clone();
+        snapshot.web_ui.port = state.web_ui_port;
+        snapshot.web_ui.cookie_days = state.web_ui_cookie_days;
+        snapshot.web_ui.auth_configured = true;
+        snapshot.web_ui.pending_pair_pins = pending_pair_pins;
+        snapshot.web_ui.active_session_count = active_session_count;
         snapshot.global = parse_global(global);
         snapshot.current_downloads = active
             .into_iter()
@@ -297,7 +328,9 @@ impl DaemonState {
         match request {
             crate::daemon::ApiRequest::Ping | crate::daemon::ApiRequest::GetSnapshot => {}
             crate::daemon::ApiRequest::ResolveHttpUrl { url } => {
-                payload = Some(ApiPayload::ResolvedHttpUrl(self.resolve_http_url(&url).await?));
+                payload = Some(ApiPayload::ResolvedHttpUrl(
+                    self.resolve_http_url(&url).await?,
+                ));
             }
             crate::daemon::ApiRequest::AddHttpUrl { url, filename } => {
                 let state = self.app.state.read().await.clone();
@@ -406,6 +439,31 @@ impl DaemonState {
             }
             crate::daemon::ApiRequest::TriggerWebhookTest => {
                 self.send_test_webhook().await?;
+                self.perform_refresh().await?;
+            }
+            crate::daemon::ApiRequest::SetWebUiSettings {
+                enabled,
+                bind_address,
+                port,
+                cookie_days,
+            } => {
+                web::validate_bind_address(&bind_address)?;
+                web::validate_cookie_days(cookie_days)?;
+                if port == 0 {
+                    return Err(eyre!("web ui port must be between 1 and 65535"));
+                }
+                let mut state = self.app.state.write().await;
+                state.web_ui_enabled = enabled;
+                state.web_ui_bind_address = bind_address;
+                state.web_ui_port = port;
+                state.web_ui_cookie_days = cookie_days;
+                state.save(&self.app.paths.state_file)?;
+                drop(state);
+                web::set_web_snapshot(self, WebUiStatus::Starting, None, None).await;
+                self.perform_refresh().await?;
+            }
+            crate::daemon::ApiRequest::ApproveWebUiPin { pin } => {
+                web::approve_pairing_pin(self, &pin).await?;
                 self.perform_refresh().await?;
             }
             crate::daemon::ApiRequest::SetRememberedCancelBehavior { behavior } => {

@@ -7,6 +7,7 @@ use crate::{
     paths::AppPaths,
     routing::{DownloadRoutingRule, validate_rules},
     units,
+    web::{validate_bind_address, validate_cookie_days},
     webhook::{WebhookPingMode, validate_discord_webhook_url, validate_ping_id},
 };
 
@@ -40,6 +41,11 @@ pub struct PersistedState {
     pub discord_webhook_url: String,
     pub webhook_ping_mode: WebhookPingMode,
     pub webhook_ping_id: String,
+    pub web_ui_enabled: bool,
+    pub web_ui_bind_address: String,
+    pub web_ui_port: u16,
+    pub web_ui_cookie_days: u32,
+    pub web_ui_session_secret: String,
 }
 
 impl Default for PersistedState {
@@ -58,6 +64,11 @@ impl Default for PersistedState {
             discord_webhook_url: String::new(),
             webhook_ping_mode: WebhookPingMode::None,
             webhook_ping_id: String::new(),
+            web_ui_enabled: false,
+            web_ui_bind_address: "0.0.0.0".into(),
+            web_ui_port: 39123,
+            web_ui_cookie_days: 30,
+            web_ui_session_secret: String::new(),
         }
     }
 }
@@ -112,6 +123,11 @@ impl PersistedState {
         validate_rules(&self.default_download_dir, &self.download_rules)?;
         validate_discord_webhook_url(&self.discord_webhook_url)?;
         let _ = validate_ping_id(self.webhook_ping_mode, Some(&self.webhook_ping_id))?;
+        validate_bind_address(&self.web_ui_bind_address)?;
+        validate_cookie_days(self.web_ui_cookie_days)?;
+        if self.web_ui_port == 0 {
+            bail!("web ui port must be between 1 and 65535");
+        }
         Ok(())
     }
 }

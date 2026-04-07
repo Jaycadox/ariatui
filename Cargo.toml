@@ -4,21 +4,27 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+axum = { version = "0.8", features = ["form"] }
+axum-extra = { version = "0.10", features = ["cookie"] }
+base64 = "0.22"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive"] }
 color-eyre = "0.6"
 crossterm = "0.29"
 directories = "6.0"
 futures = "0.3"
+hmac = "0.12"
 libc = "0.2"
 rand = "0.10"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 regex = "1.12"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+sha2 = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.48", features = ["full"] }
 toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+time = "0.3"
 which = "8.0"

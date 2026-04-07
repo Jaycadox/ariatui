@@ -10,7 +10,7 @@ use std::sync::Arc;
 use color_eyre::eyre::Result;
 use tokio::sync::RwLock;
 
-use crate::{config::AppConfig, paths::AppPaths, state::PersistedState};
+use crate::{config::AppConfig, paths::AppPaths, state::PersistedState, web};
 
 pub use self::{
     reconcile::{DaemonState, SharedDaemonState},
@@ -56,10 +56,12 @@ pub async fn run(app: SharedApp) -> Result<()> {
 
     let reconcile_task = tokio::spawn(reconcile::run(shared.clone()));
     let server_task = tokio::spawn(server::run(shared.clone()));
+    let web_task = tokio::spawn(web::supervise(shared.clone()));
 
     tokio::select! {
         result = reconcile_task => result??,
         result = server_task => result??,
+        result = web_task => result??,
     }
 
     Ok(())

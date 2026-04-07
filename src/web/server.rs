@@ -1,0 +1,2151 @@
+use std::fmt::Write as _;
+
+use axum::{
+    Form, Json, Router,
+    extract::{Path, Query, State},
+    response::{Html, IntoResponse, Redirect, Response},
+    routing::{get, post},
+};
+use axum_extra::extract::{
+    CookieJar,
+    cookie::{Cookie, SameSite},
+};
+use chrono::{Local, Timelike};
+use color_eyre::eyre::Result;
+use serde::{Deserialize, Serialize};
+use time::Duration as CookieDuration;
+
+use crate::{
+    daemon::{
+        ApiPayload, ApiRequest, DownloadItem, DownloadStatus, SharedDaemonState, Snapshot,
+        snapshot::SchedulerSnapshot,
+    },
+    routing::{DownloadRoutingRule, describe_directory_input, match_rule, validate_rule},
+    state::{CancelBehaviorPreference, ManualOrScheduled},
+    units::{self, Percentage, format_bytes, format_bytes_per_sec, format_eta, format_limit},
+    web::{
+        AUTH_COOKIE_NAME, PAIR_COOKIE_NAME, PairingStatus, create_or_get_pairing, pairing_status,
+        remove_session, session_is_valid, validate_bind_address, validate_cookie_days,
+    },
+    webhook::{WebhookPingMode, validate_discord_webhook_url, validate_ping_id},
+};
+
+pub fn router(state: SharedDaemonState) -> Router {
+    Router::new()
+        .route("/", get(root))
+        .route("/login", get(login_page))
+        .route("/login/status", get(login_status))
+        .route("/logout", post(logout))
+        .route("/current", get(current_page))
+        .route("/current/add", get(add_url_page))
+        .route("/current/add/resolve", post(add_url_resolve))
+        .route("/current/add/confirm", post(add_url_confirm))
+        .route("/current/{gid}/pause", post(pause_download))
+        .route("/current/{gid}/resume", post(resume_download))
+        .route(
+            "/current/{gid}/cancel",
+            get(cancel_page).post(cancel_submit),
+        )
+        .route("/history", get(history_page))
+        .route("/history/{gid}/remove", post(remove_history))
+        .route("/scheduler", get(scheduler_page))
+        .route(
+            "/scheduler/manual",
+            get(edit_manual_page).post(save_manual_limit),
+        )
+        .route(
+            "/scheduler/usual",
+            get(edit_usual_page).post(save_usual_limit),
+        )
+        .route("/scheduler/range/new", get(new_range_page))
+        .route("/scheduler/range/{start}/{end}/edit", get(edit_range_page))
+        .route("/scheduler/range/save", post(save_range))
+        .route("/scheduler/range/delete", post(delete_range))
+        .route("/scheduler/mode", post(set_scheduler_mode))
+        .route("/routing", get(routing_page))
+        .route("/routing/rule/new", get(new_rule_page))
+        .route("/routing/rule/{index}/edit", get(edit_rule_page))
+        .route("/routing/rule/save", post(save_rule))
+        .route("/routing/rule/{index}/delete", post(delete_rule))
+        .route("/routing/rule/{index}/move/up", post(move_rule_up))
+        .route("/routing/rule/{index}/move/down", post(move_rule_down))
+        .route("/webhooks", get(webhooks_page).post(save_webhooks))
+        .route("/webhooks/test", post(trigger_webhook_test))
+        .route("/web-ui", get(web_ui_page).post(save_web_ui))
+        .with_state(state)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebTab {
+    Current,
+    History,
+    Scheduler,
+    Routing,
+    Webhooks,
+    WebUi,
+}
+
+impl WebTab {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Current => "Current",
+            Self::History => "History",
+            Self::Scheduler => "Scheduler",
+            Self::Routing => "Routing",
+            Self::Webhooks => "Webhooks",
+            Self::WebUi => "Web UI",
+        }
+    }
+
+    fn href(self) -> &'static str {
+        match self {
+            Self::Current => "/current",
+            Self::History => "/history",
+            Self::Scheduler => "/scheduler",
+            Self::Routing => "/routing",
+            Self::Webhooks => "/webhooks",
+            Self::WebUi => "/web-ui",
+        }
+    }
+
+    fn all() -> [Self; 6] {
+        [
+            Self::Current,
+            Self::History,
+            Self::Scheduler,
+            Self::Routing,
+            Self::Webhooks,
+            Self::WebUi,
+        ]
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ItemQuery {
+    selected: Option<String>,
+    test: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UrlFormData {
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfirmAddFormData {
+    url: String,
+    filename_choice: String,
+    custom_filename: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CancelFormData {
+    delete_files: bool,
+    remember_behavior: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LimitFormData {
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModeFormData {
+    mode: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RangeFormData {
+    start_hour: usize,
+    end_hour: usize,
+    limit: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RoutingRuleFormData {
+    index: Option<usize>,
+    pattern: String,
+    directory: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebhookFormData {
+    discord_webhook_url: String,
+    ping_mode: String,
+    ping_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebUiFormData {
+    enabled: Option<String>,
+    bind_address: String,
+    port: u16,
+    cookie_days: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct RangePath {
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct RulePath {
+    index: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct LoginStatusBody {
+    status: &'static str,
+}
+
+async fn root(State(state): State<SharedDaemonState>, jar: CookieJar) -> Response {
+    if authenticated(&state, &jar).await.unwrap_or(false) {
+        Redirect::to("/current").into_response()
+    } else {
+        Redirect::to("/login").into_response()
+    }
+}
+
+async fn login_page(State(state): State<SharedDaemonState>, jar: CookieJar) -> Response {
+    if authenticated(&state, &jar).await.unwrap_or(false) {
+        return Redirect::to("/current").into_response();
+    }
+    match create_or_get_pairing(
+        state.as_ref(),
+        jar.get(PAIR_COOKIE_NAME).map(|cookie| cookie.value()),
+    )
+    .await
+    {
+        Ok((request_id, pin)) => {
+            let cookie = Cookie::build((PAIR_COOKIE_NAME, request_id))
+                .path("/")
+                .http_only(true)
+                .same_site(SameSite::Strict)
+                .max_age(CookieDuration::minutes(5))
+                .build();
+            (jar.add(cookie), Html(render_login(&pin))).into_response()
+        }
+        Err(error) => Html(render_public_shell(
+            "Login",
+            &format!("<p class=\"error\">{}</p>", esc(&error.to_string())),
+        ))
+        .into_response(),
+    }
+}
+
+async fn login_status(State(state): State<SharedDaemonState>, jar: CookieJar) -> Response {
+    let Some(pair_cookie) = jar.get(PAIR_COOKIE_NAME) else {
+        return Json(LoginStatusBody { status: "expired" }).into_response();
+    };
+    match pairing_status(state.as_ref(), pair_cookie.value()).await {
+        Ok(PairingStatus::Pending) => Json(LoginStatusBody { status: "pending" }).into_response(),
+        Ok(PairingStatus::Expired) => Json(LoginStatusBody { status: "expired" }).into_response(),
+        Ok(PairingStatus::Approved { auth_token }) => {
+            let persisted = state.app.state.read().await.clone();
+            let auth_cookie = Cookie::build((AUTH_COOKIE_NAME, auth_token))
+                .path("/")
+                .http_only(true)
+                .same_site(SameSite::Strict)
+                .max_age(CookieDuration::days(persisted.web_ui_cookie_days as i64))
+                .build();
+            let pair_cookie = Cookie::build((PAIR_COOKIE_NAME, ""))
+                .path("/")
+                .http_only(true)
+                .same_site(SameSite::Strict)
+                .max_age(CookieDuration::seconds(0))
+                .build();
+            (
+                jar.add(auth_cookie).remove(pair_cookie),
+                Json(LoginStatusBody { status: "approved" }),
+            )
+                .into_response()
+        }
+        Err(error) => Html(render_public_shell(
+            "Login",
+            &format!("<p class=\"error\">{}</p>", esc(&error.to_string())),
+        ))
+        .into_response(),
+    }
+}
+
+async fn logout(State(state): State<SharedDaemonState>, jar: CookieJar) -> Response {
+    if let Some(cookie) = jar.get(AUTH_COOKIE_NAME) {
+        remove_session(state.as_ref(), cookie.value()).await;
+    }
+    let cookie = Cookie::build((AUTH_COOKIE_NAME, ""))
+        .path("/")
+        .http_only(true)
+        .same_site(SameSite::Strict)
+        .max_age(CookieDuration::seconds(0))
+        .build();
+    let pair_cookie = Cookie::build((PAIR_COOKIE_NAME, ""))
+        .path("/")
+        .http_only(true)
+        .same_site(SameSite::Strict)
+        .max_age(CookieDuration::seconds(0))
+        .build();
+    (
+        jar.remove(cookie).remove(pair_cookie),
+        Redirect::to("/login"),
+    )
+        .into_response()
+}
+
+async fn current_page(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Query(query): Query<ItemQuery>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    Html(render_current_page(
+        &snapshot,
+        query.selected.as_deref(),
+        None,
+        None,
+        true,
+    ))
+    .into_response()
+}
+
+async fn add_url_page(State(state): State<SharedDaemonState>, jar: CookieJar) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    Html(render_add_url_page(&snapshot, None, None, None)).into_response()
+}
+
+async fn add_url_resolve(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Form(form): Form<UrlFormData>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    let url = form.url.trim().to_string();
+    if url.is_empty() {
+        return Html(render_add_url_page(
+            &snapshot,
+            Some("URL cannot be empty"),
+            None,
+            None,
+        ))
+        .into_response();
+    }
+
+    match state
+        .execute(ApiRequest::ResolveHttpUrl { url: url.clone() })
+        .await
+    {
+        Ok(reply) => match reply.payload {
+            Some(ApiPayload::ResolvedHttpUrl(resolved)) => {
+                if let Some((label, remote_filename)) = prompt_candidate(&resolved) {
+                    Html(render_add_url_page(
+                        &reply.snapshot,
+                        None,
+                        Some((
+                            &resolved.url,
+                            &resolved.url_filename,
+                            label,
+                            &remote_filename,
+                        )),
+                        None,
+                    ))
+                    .into_response()
+                } else {
+                    match state
+                        .execute(ApiRequest::AddHttpUrl {
+                            url: resolved.url,
+                            filename: Some(resolved.url_filename),
+                        })
+                        .await
+                    {
+                        Ok(_) => Redirect::to("/current").into_response(),
+                        Err(error) => Html(render_add_url_page(
+                            &reply.snapshot,
+                            Some(&error.to_string()),
+                            None,
+                            Some(&url),
+                        ))
+                        .into_response(),
+                    }
+                }
+            }
+            _ => Redirect::to("/current").into_response(),
+        },
+        Err(_) => match state
+            .execute(ApiRequest::AddHttpUrl {
+                url: url.clone(),
+                filename: None,
+            })
+            .await
+        {
+            Ok(_) => Redirect::to("/current").into_response(),
+            Err(error) => Html(render_add_url_page(
+                &snapshot,
+                Some(&error.to_string()),
+                None,
+                Some(&url),
+            ))
+            .into_response(),
+        },
+    }
+}
+
+async fn add_url_confirm(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Form(form): Form<ConfirmAddFormData>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    let filename = if form.filename_choice == "__custom__" {
+        form.custom_filename.unwrap_or_default().trim().to_string()
+    } else {
+        form.filename_choice.trim().to_string()
+    };
+    if filename.is_empty() {
+        return Html(render_add_url_page(
+            &snapshot,
+            Some("Filename cannot be empty"),
+            None,
+            Some(&form.url),
+        ))
+        .into_response();
+    }
+    match state
+        .execute(ApiRequest::AddHttpUrl {
+            url: form.url.clone(),
+            filename: Some(filename),
+        })
+        .await
+    {
+        Ok(_) => Redirect::to("/current").into_response(),
+        Err(error) => Html(render_add_url_page(
+            &snapshot,
+            Some(&error.to_string()),
+            None,
+            Some(&form.url),
+        ))
+        .into_response(),
+    }
+}
+
+async fn pause_download(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Path(gid): Path<String>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let _ = state.execute(ApiRequest::Pause { gid, force: true }).await;
+    Redirect::to("/current").into_response()
+}
+
+async fn resume_download(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Path(gid): Path<String>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let _ = state.execute(ApiRequest::Resume { gid }).await;
+    Redirect::to("/current").into_response()
+}
+
+async fn cancel_page(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Path(gid): Path<String>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    Html(render_cancel_page(&snapshot, &gid, None)).into_response()
+}
+
+async fn cancel_submit(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Path(gid): Path<String>,
+    Form(form): Form<CancelFormData>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    if let Some(value) = form.remember_behavior.as_deref() {
+        let behavior = match value {
+            "ask" => Some(CancelBehaviorPreference::Ask),
+            "keep_partials" => Some(CancelBehaviorPreference::KeepPartials),
+            "delete_partials" => Some(CancelBehaviorPreference::DeletePartials),
+            _ => None,
+        };
+        if let Some(behavior) = behavior {
+            let _ = state
+                .execute(ApiRequest::SetRememberedCancelBehavior { behavior })
+                .await;
+        }
+    }
+    match state
+        .execute(ApiRequest::Cancel {
+            gid,
+            delete_files: form.delete_files,
+        })
+        .await
+    {
+        Ok(_) => Redirect::to("/current").into_response(),
+        Err(error) => {
+            Html(render_cancel_page(&snapshot, "", Some(&error.to_string()))).into_response()
+        }
+    }
+}
+
+async fn history_page(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Query(query): Query<ItemQuery>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    Html(render_history_page(&snapshot, query.selected.as_deref())).into_response()
+}
+
+async fn remove_history(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Path(gid): Path<String>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let _ = state.execute(ApiRequest::RemoveHistory { gid }).await;
+    Redirect::to("/history").into_response()
+}
+
+async fn scheduler_page(State(state): State<SharedDaemonState>, jar: CookieJar) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    Html(render_scheduler_page(&snapshot, None)).into_response()
+}
+
+async fn edit_manual_page(State(state): State<SharedDaemonState>, jar: CookieJar) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    Html(render_limit_editor_page(
+        &snapshot,
+        WebTab::Scheduler,
+        "Manual limit",
+        "/scheduler/manual",
+        &format_limit(snapshot.scheduler.manual_limit_bps),
+        "Accepted examples: 10M, 10 mb/s, 10mbps, 1 kbps, unlimited.",
+        None,
+    ))
+    .into_response()
+}
+
+async fn save_manual_limit(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Form(form): Form<LimitFormData>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    match units::parse_limit(&form.value) {
+        Ok(limit_bps) => {
+            let _ = state
+                .execute(ApiRequest::SetManualLimit { limit_bps })
+                .await;
+            Redirect::to("/scheduler").into_response()
+        }
+        Err(error) => Html(render_limit_editor_page(
+            &snapshot,
+            WebTab::Scheduler,
+            "Manual limit",
+            "/scheduler/manual",
+            &form.value,
+            "Accepted examples: 10M, 10 mb/s, 10mbps, 1 kbps, unlimited.",
+            Some(&error.to_string()),
+        ))
+        .into_response(),
+    }
+}
+
+async fn edit_usual_page(State(state): State<SharedDaemonState>, jar: CookieJar) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    Html(render_limit_editor_page(
+        &snapshot,
+        WebTab::Scheduler,
+        "Usual internet speed",
+        "/scheduler/usual",
+        &format_limit(snapshot.scheduler.usual_internet_speed_bps),
+        "This caps scheduled ETA modeling, including unlimited schedule slots.",
+        None,
+    ))
+    .into_response()
+}
+
+async fn save_usual_limit(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Form(form): Form<LimitFormData>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    match units::parse_limit(&form.value) {
+        Ok(limit_bps) => {
+            let _ = state
+                .execute(ApiRequest::SetUsualInternetSpeed { limit_bps })
+                .await;
+            Redirect::to("/scheduler").into_response()
+        }
+        Err(error) => Html(render_limit_editor_page(
+            &snapshot,
+            WebTab::Scheduler,
+            "Usual internet speed",
+            "/scheduler/usual",
+            &form.value,
+            "This caps scheduled ETA modeling, including unlimited schedule slots.",
+            Some(&error.to_string()),
+        ))
+        .into_response(),
+    }
+}
+
+async fn new_range_page(State(state): State<SharedDaemonState>, jar: CookieJar) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    Html(render_range_editor_page(
+        &snapshot,
+        0,
+        24,
+        "unlimited",
+        None,
+    ))
+    .into_response()
+}
+
+async fn edit_range_page(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Path(path): Path<RangePath>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    let limit = snapshot
+        .scheduler
+        .schedule_limits_bps
+        .get(path.start)
+        .copied()
+        .unwrap_or(None);
+    Html(render_range_editor_page(
+        &snapshot,
+        path.start,
+        path.end,
+        &format_limit(limit),
+        None,
+    ))
+    .into_response()
+}
+
+async fn save_range(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Form(form): Form<RangeFormData>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    let limit = match units::parse_limit(&form.limit) {
+        Ok(limit) => limit,
+        Err(error) => {
+            return Html(render_range_editor_page(
+                &snapshot,
+                form.start_hour,
+                form.end_hour,
+                &form.limit,
+                Some(&error.to_string()),
+            ))
+            .into_response();
+        }
+    };
+    if form.start_hour >= form.end_hour || form.end_hour > 24 {
+        return Html(render_range_editor_page(
+            &snapshot,
+            form.start_hour,
+            form.end_hour,
+            &form.limit,
+            Some("range must satisfy 0 <= start < end <= 24"),
+        ))
+        .into_response();
+    }
+    let mut limits = snapshot.scheduler.schedule_limits_bps.to_vec();
+    for hour in form.start_hour..form.end_hour {
+        limits[hour] = limit;
+    }
+    let _ = state
+        .execute(ApiRequest::SetSchedule { limits_bps: limits })
+        .await;
+    Redirect::to("/scheduler").into_response()
+}
+
+async fn delete_range(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Form(form): Form<RangeFormData>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    let mut limits = snapshot.scheduler.schedule_limits_bps.to_vec();
+    for hour in form.start_hour..form.end_hour.min(24) {
+        limits[hour] = None;
+    }
+    let _ = state
+        .execute(ApiRequest::SetSchedule { limits_bps: limits })
+        .await;
+    Redirect::to("/scheduler").into_response()
+}
+
+async fn set_scheduler_mode(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Form(form): Form<ModeFormData>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let mode = if form.mode == "scheduled" {
+        ManualOrScheduled::Scheduled
+    } else {
+        ManualOrScheduled::Manual
+    };
+    let _ = state.execute(ApiRequest::SetMode { mode }).await;
+    Redirect::to("/scheduler").into_response()
+}
+
+async fn routing_page(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Query(query): Query<ItemQuery>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    Html(render_routing_page(&snapshot, query.test.as_deref(), None)).into_response()
+}
+
+async fn new_rule_page(State(state): State<SharedDaemonState>, jar: CookieJar) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    Html(render_rule_editor_page(
+        &snapshot,
+        None,
+        "",
+        &snapshot.routing.default_download_dir,
+        None,
+    ))
+    .into_response()
+}
+
+async fn edit_rule_page(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Path(path): Path<RulePath>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    let rule = snapshot.routing.rules.get(path.index);
+    match rule {
+        Some(rule) => Html(render_rule_editor_page(
+            &snapshot,
+            Some(path.index),
+            &rule.pattern,
+            &rule.directory,
+            None,
+        ))
+        .into_response(),
+        None => Redirect::to("/routing").into_response(),
+    }
+}
+
+async fn save_rule(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Form(form): Form<RoutingRuleFormData>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    let is_fallback = form.pattern.trim() == "*";
+    let rule = DownloadRoutingRule {
+        pattern: form.pattern.clone(),
+        directory: form.directory.clone(),
+    };
+    if let Err(error) = validate_rule(&rule, is_fallback) {
+        return Html(render_rule_editor_page(
+            &snapshot,
+            form.index,
+            &form.pattern,
+            &form.directory,
+            Some(&error.to_string()),
+        ))
+        .into_response();
+    }
+    let mut rules = snapshot
+        .routing
+        .rules
+        .iter()
+        .filter(|rule| rule.pattern != "*")
+        .cloned()
+        .collect::<Vec<_>>();
+    if is_fallback {
+        let _ = state
+            .execute(ApiRequest::SetDownloadRouting {
+                default_download_dir: form.directory,
+                rules,
+            })
+            .await;
+    } else if let Some(index) = form.index {
+        let nonfallback_index = snapshot.routing.rules[..index]
+            .iter()
+            .filter(|rule| rule.pattern != "*")
+            .count();
+        if nonfallback_index < rules.len() {
+            rules[nonfallback_index] = rule;
+        } else {
+            rules.push(rule);
+        }
+        let _ = state
+            .execute(ApiRequest::SetDownloadRouting {
+                default_download_dir: snapshot.routing.default_download_dir.clone(),
+                rules,
+            })
+            .await;
+    } else {
+        rules.push(rule);
+        let _ = state
+            .execute(ApiRequest::SetDownloadRouting {
+                default_download_dir: snapshot.routing.default_download_dir.clone(),
+                rules,
+            })
+            .await;
+    }
+    Redirect::to("/routing").into_response()
+}
+
+async fn delete_rule(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Path(path): Path<RulePath>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    if snapshot
+        .routing
+        .rules
+        .get(path.index)
+        .is_some_and(|rule| rule.pattern == "*")
+    {
+        return Redirect::to("/routing").into_response();
+    }
+    let mut nonfallback_index = 0usize;
+    let rules = snapshot
+        .routing
+        .rules
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, rule)| {
+            if rule.pattern == "*" {
+                None
+            } else {
+                let include = nonfallback_index != index_to_nonfallback(&snapshot, path.index, idx);
+                nonfallback_index += 1;
+                if include { Some(rule.clone()) } else { None }
+            }
+        })
+        .collect::<Vec<_>>();
+    let _ = state
+        .execute(ApiRequest::SetDownloadRouting {
+            default_download_dir: snapshot.routing.default_download_dir.clone(),
+            rules,
+        })
+        .await;
+    Redirect::to("/routing").into_response()
+}
+
+async fn move_rule_up(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Path(path): Path<RulePath>,
+) -> Response {
+    move_rule(state, jar, path.index, -1).await
+}
+
+async fn move_rule_down(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Path(path): Path<RulePath>,
+) -> Response {
+    move_rule(state, jar, path.index, 1).await
+}
+
+async fn move_rule(
+    state: SharedDaemonState,
+    jar: CookieJar,
+    full_index: usize,
+    delta: isize,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    if snapshot
+        .routing
+        .rules
+        .get(full_index)
+        .is_some_and(|rule| rule.pattern == "*")
+    {
+        return Redirect::to("/routing").into_response();
+    }
+    let mut rules = snapshot
+        .routing
+        .rules
+        .iter()
+        .filter(|rule| rule.pattern != "*")
+        .cloned()
+        .collect::<Vec<_>>();
+    let index = snapshot.routing.rules[..full_index]
+        .iter()
+        .filter(|rule| rule.pattern != "*")
+        .count();
+    if index >= rules.len() {
+        return Redirect::to("/routing").into_response();
+    }
+    let new_index =
+        (index as isize + delta).clamp(0, rules.len().saturating_sub(1) as isize) as usize;
+    rules.swap(index, new_index);
+    let _ = state
+        .execute(ApiRequest::SetDownloadRouting {
+            default_download_dir: snapshot.routing.default_download_dir.clone(),
+            rules,
+        })
+        .await;
+    Redirect::to("/routing").into_response()
+}
+
+async fn webhooks_page(State(state): State<SharedDaemonState>, jar: CookieJar) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    Html(render_webhooks_page(&snapshot, None)).into_response()
+}
+
+async fn save_webhooks(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Form(form): Form<WebhookFormData>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    let ping_mode = match form.ping_mode.as_str() {
+        "everyone" => WebhookPingMode::Everyone,
+        "specific_id" => WebhookPingMode::SpecificId,
+        _ => WebhookPingMode::None,
+    };
+    if let Err(error) = validate_discord_webhook_url(&form.discord_webhook_url) {
+        return Html(render_webhooks_page(&snapshot, Some(&error.to_string()))).into_response();
+    }
+    if let Err(error) = validate_ping_id(ping_mode, Some(&form.ping_id)) {
+        return Html(render_webhooks_page(&snapshot, Some(&error.to_string()))).into_response();
+    }
+    let _ = state
+        .execute(ApiRequest::SetWebhookSettings {
+            discord_webhook_url: form.discord_webhook_url,
+            ping_mode,
+            ping_id: Some(form.ping_id),
+        })
+        .await;
+    Redirect::to("/webhooks").into_response()
+}
+
+async fn trigger_webhook_test(State(state): State<SharedDaemonState>, jar: CookieJar) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    match state.execute(ApiRequest::TriggerWebhookTest).await {
+        Ok(_) => Redirect::to("/webhooks").into_response(),
+        Err(error) => {
+            Html(render_webhooks_page(&snapshot, Some(&error.to_string()))).into_response()
+        }
+    }
+}
+
+async fn web_ui_page(State(state): State<SharedDaemonState>, jar: CookieJar) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    Html(render_web_ui_page(&snapshot, None)).into_response()
+}
+
+async fn save_web_ui(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Form(form): Form<WebUiFormData>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    if let Err(error) = validate_bind_address(&form.bind_address) {
+        return Html(render_web_ui_page(&snapshot, Some(&error.to_string()))).into_response();
+    }
+    if let Err(error) = validate_cookie_days(form.cookie_days) {
+        return Html(render_web_ui_page(&snapshot, Some(&error.to_string()))).into_response();
+    }
+    let enabled = form.enabled.is_some();
+    match state
+        .execute(ApiRequest::SetWebUiSettings {
+            enabled,
+            bind_address: form.bind_address,
+            port: form.port,
+            cookie_days: form.cookie_days,
+        })
+        .await
+    {
+        Ok(reply) => {
+            if !enabled {
+                Html(render_disabled_message()).into_response()
+            } else {
+                Html(render_web_ui_page(&reply.snapshot, None)).into_response()
+            }
+        }
+        Err(error) => Html(render_web_ui_page(&snapshot, Some(&error.to_string()))).into_response(),
+    }
+}
+
+async fn authenticated(state: &SharedDaemonState, jar: &CookieJar) -> Result<bool> {
+    let Some(cookie) = jar.get(AUTH_COOKIE_NAME) else {
+        return Ok(false);
+    };
+    Ok(session_is_valid(state.as_ref(), cookie.value()).await)
+}
+
+async fn auth_redirect(state: &SharedDaemonState, jar: &CookieJar) -> Option<Response> {
+    match authenticated(state, jar).await {
+        Ok(true) => None,
+        _ => Some(Redirect::to("/login").into_response()),
+    }
+}
+
+fn render_login(pin: &str) -> String {
+    let body = format!(
+        r#"<section class="card narrow-card">
+<h2>Browser pairing</h2>
+<p>Type this PIN into the terminal UI in the <strong>Web UI</strong> tab to approve this browser:</p>
+<p class="pin">{}</p>
+<p class="muted">The page will continue automatically after approval.</p>
+<div id="pairing-status" class="muted">Waiting for terminal approval...</div>
+</section>"#,
+        esc(pin)
+    );
+    render_public_shell("Login", &body)
+}
+
+fn render_public_shell(title: &str, body: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{}</title>
+<style>{}</style>
+</head>
+<body>
+<main class="wrap narrow">
+<h1>AriaTUI Web</h1>
+{}
+</main>
+<script>{}</script>
+</body>
+</html>"#,
+        esc(title),
+        styles(),
+        body,
+        script()
+    )
+}
+
+fn render_shell(
+    snapshot: &Snapshot,
+    active: WebTab,
+    body: &str,
+    auto_refresh: bool,
+    page_title: &str,
+) -> String {
+    let mut tabs = String::new();
+    for tab in WebTab::all() {
+        let class = if tab == active { "tab active" } else { "tab" };
+        let _ = write!(
+            tabs,
+            r#"<a class="{class}" href="{}">{}</a>"#,
+            tab.href(),
+            esc(tab.title())
+        );
+    }
+    format!(
+        r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{}</title>
+<style>{}</style>
+</head>
+<body data-autorefresh="{}">
+<main class="wrap">
+<header id="app-header" class="header">{}</header>
+<nav class="tabs">{}</nav>
+<section id="page-body">{}</section>
+<form method="post" action="/logout" class="logout"><button type="submit">Log out</button></form>
+</main>
+<script>{}</script>
+</body>
+</html>"#,
+        esc(page_title),
+        styles(),
+        if auto_refresh { "1" } else { "0" },
+        render_header(snapshot),
+        tabs,
+        body,
+        script()
+    )
+}
+
+fn render_header(snapshot: &Snapshot) -> String {
+    format!(
+        "<strong>aria2 {}</strong> &nbsp; down {} &nbsp; up {} &nbsp; active {} waiting {} stopped {} &nbsp; mode {:?} limit {} &nbsp; web {}",
+        esc(&format!("{:?}", snapshot.aria2_status.lifecycle).to_lowercase()),
+        esc(&format_bytes_per_sec(snapshot.global.download_speed_bps)),
+        esc(&format_bytes_per_sec(snapshot.global.upload_speed_bps)),
+        snapshot.global.num_active,
+        snapshot.global.num_waiting,
+        snapshot.global.num_stopped,
+        snapshot.scheduler.mode,
+        esc(&format_limit(snapshot.scheduler.effective_limit_bps)),
+        esc(&format!("{:?}", snapshot.web_ui.status).to_lowercase()),
+    )
+}
+
+fn render_current_page(
+    snapshot: &Snapshot,
+    selected_gid: Option<&str>,
+    message: Option<&str>,
+    error: Option<&str>,
+    auto_refresh: bool,
+) -> String {
+    let selected = selected_gid
+        .and_then(|gid| {
+            snapshot
+                .current_downloads
+                .iter()
+                .find(|item| item.gid == gid)
+        })
+        .or_else(|| snapshot.current_downloads.first());
+    let mut rows = String::new();
+    for item in &snapshot.current_downloads {
+        let selected_class = if Some(item.gid.as_str()) == selected_gid {
+            "selected"
+        } else {
+            ""
+        };
+        let actions = match item.status {
+            DownloadStatus::Active => format!(
+                r#"<form method="post" action="/current/{}/pause"><button>Pause</button></form><a class="button danger" href="/current/{}/cancel">Cancel</a>"#,
+                esc(&item.gid),
+                esc(&item.gid)
+            ),
+            DownloadStatus::Paused => format!(
+                r#"<form method="post" action="/current/{}/resume"><button>Resume</button></form><a class="button danger" href="/current/{}/cancel">Cancel</a>"#,
+                esc(&item.gid),
+                esc(&item.gid)
+            ),
+            DownloadStatus::Waiting => format!(
+                r#"<a class="button danger" href="/current/{}/cancel">Cancel</a>"#,
+                esc(&item.gid)
+            ),
+            _ => String::new(),
+        };
+        let _ = write!(
+            rows,
+            r#"<tr class="{selected_class}">
+<td><a href="/current?selected={}">{}</a></td>
+<td>{}</td>
+<td>{}</td>
+<td>{} / {}</td>
+<td>{}</td>
+<td>{}</td>
+<td>{}</td>
+<td class="actions">{}</td>
+</tr>"#,
+            esc(&item.gid),
+            esc(&status_label(&item.status)),
+            esc(&item.name),
+            esc(&progress_text(item)),
+            esc(&format_bytes(item.completed_bytes)),
+            esc(&format_bytes(item.total_bytes)),
+            esc(&format_bytes_per_sec(item.download_speed_bps)),
+            esc(&format_eta(item.eta_seconds)),
+            esc(&item.gid),
+            actions,
+        );
+    }
+
+    let mut body = String::new();
+    if let Some(message) = message {
+        let _ = write!(body, "<p class=\"message\">{}</p>", esc(message));
+    }
+    if let Some(error) = error {
+        let _ = write!(body, "<p class=\"error\">{}</p>", esc(error));
+    }
+    body.push_str(
+        r#"<div class="toolbar"><a class="button" href="/current/add">Add URL</a></div>"#,
+    );
+    body.push_str("<div class=\"split\">");
+    let _ = write!(
+        body,
+        r#"<section class="card">
+<h2>Current downloads</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Status</th><th>Name</th><th>Progress</th><th>Done/Total</th><th>Speed</th><th>ETA</th><th>GID</th><th>Actions</th></tr></thead>
+<tbody>{}</tbody>
+</table>
+</div>
+</section>"#,
+        rows
+    );
+    let _ = write!(
+        body,
+        r#"<aside class="card"><h2>Details</h2>{}</aside>"#,
+        render_download_details(selected, &snapshot.scheduler)
+    );
+    body.push_str("</div>");
+    render_shell(snapshot, WebTab::Current, &body, auto_refresh, "Current")
+}
+
+fn render_add_url_page(
+    snapshot: &Snapshot,
+    error: Option<&str>,
+    chooser: Option<(&str, &str, &str, &str)>,
+    initial_url: Option<&str>,
+) -> String {
+    let mut body = String::new();
+    if let Some(error) = error {
+        let _ = write!(body, "<p class=\"error\">{}</p>", esc(error));
+    }
+    let _ = write!(
+        body,
+        r#"<section class="card narrow-card">
+<h2>Add URL</h2>
+<form method="post" action="/current/add/resolve" class="stack">
+<label>HTTP or HTTPS URL</label>
+<input type="text" name="url" value="{}" placeholder="https://example.com/file.iso" />
+<div class="actions"><button type="submit">Resolve and add</button><a class="button" href="/current">Back</a></div>
+</form>
+</section>"#,
+        esc(initial_url.unwrap_or(""))
+    );
+    if let Some((url, url_filename, remote_label, remote_filename)) = chooser {
+        let preview = match match_rule(
+            &snapshot.routing.default_download_dir,
+            &snapshot.routing.rules,
+            remote_filename,
+        ) {
+            Ok(route) => route
+                .resolved_directory
+                .join(remote_filename)
+                .display()
+                .to_string(),
+            Err(error) => error.to_string(),
+        };
+        let _ = write!(
+            body,
+            r#"<section class="card narrow-card">
+<h2>Choose filename</h2>
+<form method="post" action="/current/add/confirm" class="stack">
+<input type="hidden" name="url" value="{}" />
+<label><input type="radio" name="filename_choice" value="{}"> URL filename: {}</label>
+<label><input type="radio" name="filename_choice" value="{}" checked> {}: {}</label>
+<label><input type="radio" name="filename_choice" value="__custom__"> Use a custom filename</label>
+<label>Custom filename</label>
+<input type="text" name="custom_filename" value="{}" />
+<p class="muted">Routing preview: {}</p>
+<div class="actions"><button type="submit">Add download</button></div>
+</form>
+</section>"#,
+            esc(url),
+            esc(url_filename),
+            esc(url_filename),
+            esc(remote_filename),
+            esc(remote_label),
+            esc(remote_filename),
+            esc(remote_filename),
+            esc(&preview)
+        );
+    }
+    render_shell(snapshot, WebTab::Current, &body, false, "Add URL")
+}
+
+fn render_cancel_page(snapshot: &Snapshot, gid: &str, error: Option<&str>) -> String {
+    let item = snapshot
+        .current_downloads
+        .iter()
+        .find(|item| item.gid == gid);
+    let mut body = String::new();
+    if let Some(error) = error {
+        let _ = write!(body, "<p class=\"error\">{}</p>", esc(error));
+    }
+    let _ = write!(
+        body,
+        r#"<section class="card narrow-card">
+<h2>Cancel download</h2>
+<p>{}</p>
+<form method="post" action="/current/{}/cancel" class="stack">
+<label><input type="radio" name="delete_files" value="false" checked> Keep partial files</label>
+<label><input type="radio" name="delete_files" value="true"> Delete partial files</label>
+<label>Remember behavior</label>
+<select name="remember_behavior">
+<option value="">Do not change</option>
+<option value="ask">Always ask</option>
+<option value="keep_partials">Always keep partials</option>
+<option value="delete_partials">Always delete partials</option>
+</select>
+<div class="actions"><button type="submit" class="danger">Cancel download</button><a class="button" href="/current">Back</a></div>
+</form>
+</section>"#,
+        esc(&item
+            .map(|item| item.name.clone())
+            .unwrap_or_else(|| gid.to_string())),
+        esc(gid)
+    );
+    render_shell(snapshot, WebTab::Current, &body, false, "Cancel Download")
+}
+
+fn render_history_page(snapshot: &Snapshot, selected_gid: Option<&str>) -> String {
+    let selected = selected_gid
+        .and_then(|gid| {
+            snapshot
+                .history_downloads
+                .iter()
+                .find(|item| item.gid == gid)
+        })
+        .or_else(|| snapshot.history_downloads.first());
+    let mut rows = String::new();
+    for item in &snapshot.history_downloads {
+        let _ = write!(
+            rows,
+            r#"<tr>
+<td><a href="/history?selected={}">{}</a></td>
+<td>{}</td>
+<td>{}</td>
+<td>{}</td>
+<td>{}</td>
+<td><form method="post" action="/history/{}/remove"><button>Forget</button></form></td>
+</tr>"#,
+            esc(&item.gid),
+            esc(&status_label(&item.status)),
+            esc(&item.name),
+            esc(&format_bytes(item.total_bytes)),
+            esc(item.error_code.as_deref().unwrap_or("-")),
+            esc(&item.gid),
+            esc(&item.gid),
+        );
+    }
+    let body = format!(
+        r#"<div class="split">
+<section class="card">
+<h2>History</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Status</th><th>Name</th><th>Size</th><th>Error</th><th>GID</th><th>Action</th></tr></thead>
+<tbody>{}</tbody>
+</table>
+</div>
+</section>
+<aside class="card"><h2>Details</h2>{}</aside>
+</div>"#,
+        rows,
+        render_download_details(selected, &snapshot.scheduler)
+    );
+    render_shell(snapshot, WebTab::History, &body, true, "History")
+}
+
+fn render_scheduler_page(snapshot: &Snapshot, error: Option<&str>) -> String {
+    let ranges = scheduler_ranges(snapshot);
+    let mut rows = String::new();
+    for range in &ranges {
+        let _ = write!(
+            rows,
+            r#"<tr>
+<td>{:02}:00</td><td>{:02}:00</td><td>{}</td>
+<td class="actions">
+<a class="button" href="/scheduler/range/{}/{}/edit">Edit</a>
+<form method="post" action="/scheduler/range/delete">
+<input type="hidden" name="start_hour" value="{}">
+<input type="hidden" name="end_hour" value="{}">
+<input type="hidden" name="limit" value="unlimited">
+<button>Clear</button>
+</form>
+</td>
+</tr>"#,
+            range.0,
+            range.1,
+            esc(&format_limit(range.2)),
+            range.0,
+            range.1,
+            range.0,
+            range.1
+        );
+    }
+    let mut body = String::new();
+    if let Some(error) = error {
+        let _ = write!(body, "<p class=\"error\">{}</p>", esc(error));
+    }
+    let _ = write!(
+        body,
+        r#"<div class="grid2">
+<section class="card">
+<h2>Scheduler</h2>
+<form method="post" action="/scheduler/mode" class="inline">
+<label><input type="radio" name="mode" value="manual" {}> Manual</label>
+<label><input type="radio" name="mode" value="scheduled" {}> Scheduled</label>
+<button type="submit">Apply mode</button>
+</form>
+<p>Manual limit: {} &nbsp; <a class="button" href="/scheduler/manual">Edit</a></p>
+<p>Usual internet speed: {} &nbsp; <a class="button" href="/scheduler/usual">Edit</a></p>
+<p>Effective limit: {}</p>
+<p>Next change: {}</p>
+<div class="chart-shell">{}</div>
+</section>
+<section class="card">
+<div class="toolbar"><a class="button" href="/scheduler/range/new">New range</a></div>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Start</th><th>End</th><th>Limit</th><th>Actions</th></tr></thead>
+<tbody>{}</tbody>
+</table>
+</div>
+</section>
+</div>"#,
+        if snapshot.scheduler.mode == ManualOrScheduled::Manual {
+            "checked"
+        } else {
+            ""
+        },
+        if snapshot.scheduler.mode == ManualOrScheduled::Scheduled {
+            "checked"
+        } else {
+            ""
+        },
+        esc(&format_limit(snapshot.scheduler.manual_limit_bps)),
+        esc(&format_limit(snapshot.scheduler.usual_internet_speed_bps)),
+        esc(&format_limit(snapshot.scheduler.effective_limit_bps)),
+        esc(&snapshot.scheduler.next_change_at_local),
+        render_schedule_svg(&snapshot.scheduler.schedule_limits_bps),
+        rows,
+    );
+    render_shell(snapshot, WebTab::Scheduler, &body, true, "Scheduler")
+}
+
+fn render_limit_editor_page(
+    snapshot: &Snapshot,
+    tab: WebTab,
+    title: &str,
+    action: &str,
+    value: &str,
+    hint: &str,
+    error: Option<&str>,
+) -> String {
+    let mut body = String::new();
+    if let Some(error) = error {
+        let _ = write!(body, "<p class=\"error\">{}</p>", esc(error));
+    }
+    let _ = write!(
+        body,
+        r#"<section class="card narrow-card">
+<h2>{}</h2>
+<form method="post" action="{}" class="stack">
+<input type="text" name="value" value="{}">
+<p class="muted">{}</p>
+<div class="actions"><button type="submit">Save</button><a class="button" href="{}">Back</a></div>
+</form>
+</section>"#,
+        esc(title),
+        esc(action),
+        esc(value),
+        esc(hint),
+        esc(tab.href())
+    );
+    render_shell(snapshot, tab, &body, false, title)
+}
+
+fn render_range_editor_page(
+    snapshot: &Snapshot,
+    start: usize,
+    end: usize,
+    limit: &str,
+    error: Option<&str>,
+) -> String {
+    let mut body = String::new();
+    if let Some(error) = error {
+        let _ = write!(body, "<p class=\"error\">{}</p>", esc(error));
+    }
+    let _ = write!(
+        body,
+        r#"<section class="card narrow-card">
+<h2>Schedule range</h2>
+<form method="post" action="/scheduler/range/save" class="stack">
+<label>Start hour</label>
+<input type="number" name="start_hour" min="0" max="23" value="{}">
+<label>End hour</label>
+<input type="number" name="end_hour" min="1" max="24" value="{}">
+<label>Limit</label>
+<input type="text" name="limit" value="{}">
+<p class="muted">Examples: 10M, 10 mb/s, 1 kbps, unlimited.</p>
+<div class="actions"><button type="submit">Save range</button><a class="button" href="/scheduler">Back</a></div>
+</form>
+</section>"#,
+        start,
+        end,
+        esc(limit)
+    );
+    render_shell(snapshot, WebTab::Scheduler, &body, false, "Schedule Range")
+}
+
+fn render_routing_page(
+    snapshot: &Snapshot,
+    test_name: Option<&str>,
+    error: Option<&str>,
+) -> String {
+    let mut rows = String::new();
+    for (index, rule) in snapshot.routing.rules.iter().enumerate() {
+        let kind = if rule.pattern == "*" {
+            "fallback"
+        } else {
+            "regex"
+        };
+        let actions = if rule.pattern == "*" {
+            format!(r#"<a class="button" href="/routing/rule/{index}/edit">Edit</a>"#)
+        } else {
+            format!(
+                r#"<a class="button" href="/routing/rule/{index}/edit">Edit</a>
+<form method="post" action="/routing/rule/{index}/move/up"><button>Up</button></form>
+<form method="post" action="/routing/rule/{index}/move/down"><button>Down</button></form>
+<form method="post" action="/routing/rule/{index}/delete"><button class="danger">Delete</button></form>"#
+            )
+        };
+        let _ = write!(
+            rows,
+            r#"<tr><td>{}</td><td>{}</td><td>{}</td><td class="actions">{}</td></tr>"#,
+            esc(kind),
+            esc(&rule.pattern),
+            esc(&rule.directory),
+            actions
+        );
+    }
+    let test_result = test_name.map(|name| {
+        match match_rule(
+            &snapshot.routing.default_download_dir,
+            &snapshot.routing.rules,
+            name,
+        ) {
+            Ok(route) => format!(
+                "Rule {} matched: {} -> {}",
+                route.index + 1,
+                route.rule.pattern,
+                route.resolved_directory.display()
+            ),
+            Err(error) => error.to_string(),
+        }
+    });
+    let mut body = String::new();
+    if let Some(error) = error {
+        let _ = write!(body, "<p class=\"error\">{}</p>", esc(error));
+    }
+    let _ = write!(
+        body,
+        r#"<div class="grid2">
+<section class="card">
+<h2>Routing</h2>
+<p>Fallback folder: {}</p>
+<div class="toolbar"><a class="button" href="/routing/rule/new">Add rule</a></div>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Type</th><th>Pattern</th><th>Directory</th><th>Actions</th></tr></thead>
+<tbody>{}</tbody>
+</table>
+</div>
+</section>
+<section class="card">
+<h2>Rule tester</h2>
+<form method="get" action="/routing" class="stack">
+<input type="text" name="test" value="{}" placeholder="example-file.iso">
+<button type="submit">Test</button>
+</form>
+<p>{}</p>
+</section>
+</div>"#,
+        esc(&snapshot.routing.default_download_dir),
+        rows,
+        esc(test_name.unwrap_or("")),
+        esc(test_result.as_deref().unwrap_or(
+            "Type a dummy file name to see which rule matches and where it would download."
+        )),
+    );
+    render_shell(snapshot, WebTab::Routing, &body, true, "Routing")
+}
+
+fn render_rule_editor_page(
+    snapshot: &Snapshot,
+    index: Option<usize>,
+    pattern: &str,
+    directory: &str,
+    error: Option<&str>,
+) -> String {
+    let mut body = String::new();
+    if let Some(error) = error {
+        let _ = write!(body, "<p class=\"error\">{}</p>", esc(error));
+    }
+    let dir_status = describe_directory_input(directory).unwrap_or_else(|error| error.to_string());
+    let _ = write!(
+        body,
+        r#"<section class="card narrow-card">
+<h2>Routing rule</h2>
+<form method="post" action="/routing/rule/save" class="stack">
+{}
+<label>Pattern</label>
+<input type="text" name="pattern" value="{}">
+<label>Directory</label>
+<input type="text" name="directory" value="{}">
+<p class="muted">{}</p>
+<div class="actions"><button type="submit">Save</button><a class="button" href="/routing">Back</a></div>
+</form>
+</section>"#,
+        index
+            .map(|value| format!(r#"<input type="hidden" name="index" value="{value}">"#))
+            .unwrap_or_default(),
+        esc(pattern),
+        esc(directory),
+        esc(&dir_status),
+    );
+    render_shell(snapshot, WebTab::Routing, &body, false, "Routing Rule")
+}
+
+fn render_webhooks_page(snapshot: &Snapshot, error: Option<&str>) -> String {
+    let mut body = String::new();
+    if let Some(error) = error {
+        let _ = write!(body, "<p class=\"error\">{}</p>", esc(error));
+    }
+    let ping_mode = match snapshot.webhooks.ping_mode {
+        WebhookPingMode::None => "none",
+        WebhookPingMode::Everyone => "everyone",
+        WebhookPingMode::SpecificId => "specific_id",
+    };
+    let _ = write!(
+        body,
+        r#"<section class="card narrow-card">
+<h2>Webhooks</h2>
+<form method="post" action="/webhooks" class="stack">
+<label>Discord webhook URL</label>
+<input type="text" name="discord_webhook_url" value="{}">
+<label>Ping mode</label>
+<select name="ping_mode">
+<option value="none" {}>No ping</option>
+<option value="everyone" {}>@everyone</option>
+<option value="specific_id" {}>Specific user/role ID</option>
+</select>
+<label>Specific ID</label>
+<input type="text" name="ping_id" value="{}">
+<p class="muted">Events: completed, failed, removed, aria2 restart.</p>
+<div class="actions"><button type="submit">Save</button></div>
+</form>
+<form method="post" action="/webhooks/test"><button type="submit">Send test notification</button></form>
+</section>"#,
+        esc(&snapshot.webhooks.discord_webhook_url),
+        if ping_mode == "none" { "selected" } else { "" },
+        if ping_mode == "everyone" {
+            "selected"
+        } else {
+            ""
+        },
+        if ping_mode == "specific_id" {
+            "selected"
+        } else {
+            ""
+        },
+        esc(snapshot.webhooks.ping_id.as_deref().unwrap_or("")),
+    );
+    render_shell(snapshot, WebTab::Webhooks, &body, true, "Webhooks")
+}
+
+fn render_web_ui_page(snapshot: &Snapshot, error: Option<&str>) -> String {
+    let mut body = String::new();
+    if let Some(error) = error {
+        let _ = write!(body, "<p class=\"error\">{}</p>", esc(error));
+    }
+    let _ = write!(
+        body,
+        r#"<section class="card narrow-card">
+<h2>Web UI</h2>
+<p>Status: {:?}</p>
+<p>URL: {}</p>
+<p>Pairing auth: {}</p>
+<p>Pending browser PINs: {}</p>
+<p>Active browser sessions: {}</p>
+{}
+<form method="post" action="/web-ui" class="stack">
+<label><input type="checkbox" name="enabled" {}> Enabled</label>
+<label>Bind address</label>
+<input type="text" name="bind_address" value="{}">
+<label>Port</label>
+<input type="number" name="port" min="1" max="65535" value="{}">
+<label>Cookie lifetime (days)</label>
+<input type="number" name="cookie_days" min="1" max="365" value="{}">
+<div class="actions"><button type="submit">Save settings</button></div>
+</form>
+</section>"#,
+        snapshot.web_ui.status,
+        esc(&snapshot.web_ui.url),
+        if snapshot.web_ui.auth_configured {
+            "ready"
+        } else {
+            "not ready"
+        },
+        if snapshot.web_ui.pending_pair_pins.is_empty() {
+            "-".to_string()
+        } else {
+            snapshot.web_ui.pending_pair_pins.join(", ")
+        },
+        snapshot.web_ui.active_session_count,
+        snapshot
+            .web_ui
+            .last_error
+            .as_ref()
+            .map(|error| format!(r#"<p class="error">{}</p>"#, esc(error)))
+            .unwrap_or_default(),
+        if snapshot.web_ui.enabled {
+            "checked"
+        } else {
+            ""
+        },
+        esc(&snapshot.web_ui.bind_address),
+        snapshot.web_ui.port,
+        snapshot.web_ui.cookie_days,
+    );
+    render_shell(snapshot, WebTab::WebUi, &body, true, "Web UI")
+}
+
+fn render_disabled_message() -> String {
+    render_public_shell(
+        "Web UI disabled",
+        "<p>The web UI has been disabled. This page will stop working as soon as the daemon closes the listener.</p>",
+    )
+}
+
+fn render_download_details(item: Option<&DownloadItem>, scheduler: &SchedulerSnapshot) -> String {
+    let Some(item) = item else {
+        return "<p>No item selected.</p>".into();
+    };
+    format!(
+        r#"<dl class="details">
+<dt>Name</dt><dd>{}</dd>
+<dt>GID</dt><dd>{}</dd>
+<dt>Progress</dt><dd>{} / {}</dd>
+<dt>Speed</dt><dd>{}</dd>
+<dt>ETA</dt><dd>{}</dd>
+<dt>Scheduled ETA</dt><dd>{}</dd>
+<dt>Path</dt><dd>{}</dd>
+<dt>Source</dt><dd>{}</dd>
+<dt>Error</dt><dd>{}</dd>
+</dl>"#,
+        esc(&item.name),
+        esc(&item.gid),
+        esc(&format_bytes(item.completed_bytes)),
+        esc(&format_bytes(item.total_bytes)),
+        esc(&format_bytes_per_sec(item.download_speed_bps)),
+        esc(&format_eta(item.eta_seconds)),
+        esc(&format_eta(scheduled_eta_seconds(item, scheduler))),
+        esc(item.primary_path.as_deref().unwrap_or("-")),
+        esc(item.source_uri.as_deref().unwrap_or("-")),
+        esc(item.error_message.as_deref().unwrap_or("-")),
+    )
+}
+
+fn progress_text(item: &DownloadItem) -> String {
+    if item.total_bytes == 0 {
+        "0%".into()
+    } else {
+        Percentage(item.completed_bytes as f64 / item.total_bytes as f64).to_string()
+    }
+}
+
+fn status_label(status: &DownloadStatus) -> &'static str {
+    match status {
+        DownloadStatus::Active => "active",
+        DownloadStatus::Waiting => "waiting",
+        DownloadStatus::Paused => "paused",
+        DownloadStatus::Complete => "complete",
+        DownloadStatus::Error => "error",
+        DownloadStatus::Removed => "removed",
+        DownloadStatus::Unknown => "unknown",
+    }
+}
+
+fn scheduler_ranges(snapshot: &Snapshot) -> Vec<(usize, usize, Option<u64>)> {
+    let limits = &snapshot.scheduler.schedule_limits_bps;
+    if limits.is_empty() {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut current = limits[0];
+    for hour in 1..limits.len() {
+        if limits[hour] != current {
+            ranges.push((start, hour, current));
+            start = hour;
+            current = limits[hour];
+        }
+    }
+    ranges.push((start, limits.len(), current));
+    ranges
+}
+
+fn render_schedule_svg(limits: &[Option<u64>; 24]) -> String {
+    let finite = limits.iter().flatten().copied().collect::<Vec<_>>();
+    let max_finite = finite.iter().copied().max().unwrap_or(1);
+    let min_finite = finite.iter().copied().min().unwrap_or(max_finite);
+    let current_hour = Local::now().hour() as usize;
+    let chart_top = 16.0;
+    let chart_height = 144.0;
+    let bar_width = 14.0;
+    let gap = 8.0;
+    let mut body = String::new();
+    body.push_str(
+        r#"<svg class="schedule-chart" viewBox="0 0 584 220" role="img" aria-label="Hourly scheduler limits chart">"#,
+    );
+    body.push_str(r##"<rect x="0" y="0" width="584" height="220" rx="10" fill="#101010"/>"##);
+    for grid in 0..=4 {
+        let y = chart_top + (chart_height / 4.0) * grid as f64;
+        let _ = write!(
+            body,
+            r##"<line x1="38" y1="{:.1}" x2="566" y2="{:.1}" stroke="#2b2b2b" stroke-width="1"/>"##,
+            y, y
+        );
+    }
+    for (hour, limit) in limits.iter().enumerate() {
+        let x = 42.0 + hour as f64 * (bar_width + gap);
+        let normalized = match limit {
+            None => 1.0,
+            Some(_) if max_finite == min_finite => 0.55,
+            Some(value) => {
+                ((*value - min_finite) as f64 / (max_finite - min_finite) as f64 * 0.85) + 0.15
+            }
+        };
+        let bar_height = chart_height * normalized;
+        let y = chart_top + chart_height - bar_height;
+        let fill = if hour == current_hour {
+            "#f2c94c"
+        } else if limit.is_none() {
+            "#25c2a0"
+        } else {
+            "#4f8cff"
+        };
+        let _ = write!(
+            body,
+            r#"<g><rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" rx="3" fill="{}"><title>{:02}:00 - {}</title></rect></g>"#,
+            x,
+            y,
+            bar_width,
+            bar_height.max(2.0),
+            fill,
+            hour,
+            esc(&format_limit(*limit))
+        );
+        if hour % 3 == 0 {
+            let _ = write!(
+                body,
+                r##"<text x="{:.1}" y="188" text-anchor="middle" fill="#bdbdbd" font-size="11">{:02}</text>"##,
+                x + bar_width / 2.0,
+                hour
+            );
+        }
+    }
+    body.push_str(r##"<text x="18" y="18" fill="#bdbdbd" font-size="11">Higher bars mean higher limits. Unlimited uses full height.</text>"##);
+    body.push_str(r##"<text x="18" y="206" fill="#8f8f8f" font-size="11">Hours</text>"##);
+    body.push_str("</svg>");
+    body
+}
+
+fn prompt_candidate(resolved: &crate::daemon::ResolvedHttpUrl) -> Option<(&'static str, String)> {
+    resolved
+        .remote_filename
+        .clone()
+        .map(|filename| ("server filename", filename))
+        .or_else(|| {
+            resolved
+                .redirect_filename
+                .clone()
+                .map(|filename| ("redirect target", filename))
+        })
+}
+
+fn index_to_nonfallback(
+    snapshot: &Snapshot,
+    full_index: usize,
+    candidate_full_index: usize,
+) -> usize {
+    snapshot.routing.rules[..candidate_full_index.min(full_index + 1)]
+        .iter()
+        .filter(|rule| rule.pattern != "*")
+        .count()
+        .saturating_sub(1)
+}
+
+fn esc(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn styles() -> &'static str {
+    r#"
+body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: #111; color: #eee; margin: 0; }
+.wrap { max-width: 1280px; margin: 0 auto; padding: 1rem; }
+.narrow { max-width: 520px; }
+.narrow-card { max-width: 720px; }
+.header, .card, .tabs, .logout { border: 1px solid #444; background: #181818; padding: 0.75rem; margin-bottom: 0.75rem; }
+.tabs { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.tab, .button, button { background: #262626; color: #eee; border: 1px solid #555; text-decoration: none; padding: 0.45rem 0.7rem; display: inline-block; cursor: pointer; }
+.tab.active { background: #0e5f5f; border-color: #29b8b8; }
+.split { display: grid; grid-template-columns: 2fr 1fr; gap: 0.75rem; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+.stack { display: flex; flex-direction: column; gap: 0.6rem; }
+.inline, .actions { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+.toolbar { margin-bottom: 0.75rem; }
+table { width: 100%; border-collapse: collapse; min-width: 720px; }
+th, td { border-bottom: 1px solid #333; padding: 0.45rem; text-align: left; vertical-align: top; }
+input, select { width: 100%; box-sizing: border-box; background: #0f0f0f; color: #eee; border: 1px solid #555; padding: 0.45rem; }
+.message { color: #7fe27f; }
+.error { color: #ff8383; }
+.muted { color: #bbb; }
+.danger { border-color: #8a3d3d; }
+.table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.chart-shell { overflow-x: auto; }
+.schedule-chart { width: 100%; min-width: 584px; height: auto; display: block; }
+.details dt { color: #bbb; margin-top: 0.5rem; }
+.details dd { margin-left: 0; margin-bottom: 0.35rem; word-break: break-word; }
+code { background: #0d0d0d; padding: 0.15rem 0.25rem; }
+.pin { font-size: 2.4rem; font-weight: bold; letter-spacing: 0.25rem; text-align: center; margin: 1rem 0; color: #7fe27f; }
+.actions form { display: inline-flex; }
+@media (max-width: 900px) { .split, .grid2 { grid-template-columns: 1fr; } }
+@media (max-width: 700px) {
+  body { font-size: 14px; }
+  .wrap { padding: 0.6rem; }
+  .header, .card, .tabs, .logout { padding: 0.65rem; }
+  .tab, .button, button { width: 100%; text-align: center; box-sizing: border-box; }
+  .tabs, .inline, .actions { flex-direction: column; align-items: stretch; }
+  .toolbar .button { width: 100%; }
+  .pin { font-size: 2rem; letter-spacing: 0.18rem; }
+}
+"#
+}
+
+fn script() -> &'static str {
+    r#"
+const pairingStatus = document.getElementById("pairing-status");
+if (pairingStatus) {
+  setInterval(async () => {
+    try {
+      const response = await fetch("/login/status", { credentials: "same-origin" });
+      const data = await response.json();
+      if (data.status === "approved") {
+        window.location.href = "/current";
+      } else if (data.status === "expired") {
+        pairingStatus.textContent = "Pairing expired. Reloading...";
+        window.location.reload();
+      }
+    } catch (_) {
+      pairingStatus.textContent = "Waiting for daemon...";
+    }
+  }, 1200);
+}
+
+async function subtleRefresh() {
+  try {
+    const response = await fetch(window.location.href, {
+      credentials: "same-origin",
+      headers: { "X-Requested-With": "AriaTUI-WebRefresh" }
+    });
+    const text = await response.text();
+    const doc = new DOMParser().parseFromString(text, "text/html");
+    const nextHeader = doc.getElementById("app-header");
+    const nextBody = doc.getElementById("page-body");
+    const currentHeader = document.getElementById("app-header");
+    const currentBody = document.getElementById("page-body");
+    if (!nextHeader || !nextBody || !currentHeader || !currentBody) {
+      window.location.href = "/login";
+      return;
+    }
+    currentHeader.innerHTML = nextHeader.innerHTML;
+    currentBody.innerHTML = nextBody.innerHTML;
+  } catch (_) {
+  }
+}
+
+if (document.body.dataset.autorefresh === "1") {
+  setInterval(() => {
+    if (!document.querySelector("input:focus, textarea:focus, select:focus")) {
+      subtleRefresh();
+    }
+  }, 1500);
+}
+"#
+}
+
+fn scheduled_eta_seconds(item: &DownloadItem, scheduler: &SchedulerSnapshot) -> Option<u64> {
+    if scheduler.mode != ManualOrScheduled::Scheduled {
+        return None;
+    }
+    let remaining_bytes = item.total_bytes.checked_sub(item.completed_bytes)?;
+    if remaining_bytes == 0 {
+        return Some(0);
+    }
+    if item.download_speed_bps == 0 {
+        return None;
+    }
+
+    let current_cap = min_limit(
+        scheduler.effective_limit_bps,
+        scheduler.usual_internet_speed_bps,
+    );
+    let speed_model = match current_cap {
+        Some(limit) if limit > 0 => {
+            SpeedModel::Utilization((item.download_speed_bps as f64 / limit as f64).clamp(0.0, 1.0))
+        }
+        _ => SpeedModel::Observed(item.download_speed_bps),
+    };
+
+    let now = chrono::Local::now();
+    let mut hour = now.hour() as usize;
+    let mut elapsed_seconds = 0u64;
+    let mut remaining = remaining_bytes as f64;
+    let seconds_past_hour = now.minute() as u64 * 60 + now.second() as u64;
+    let first_slot_seconds = (3600 - seconds_past_hour).max(1);
+
+    for step in 0..(24 * 365) {
+        let slot_seconds = if step == 0 { first_slot_seconds } else { 3600 };
+        let slot_speed = estimated_slot_speed_bps(
+            speed_model,
+            item.download_speed_bps,
+            min_limit(
+                scheduler.schedule_limits_bps[hour],
+                scheduler.usual_internet_speed_bps,
+            ),
+        );
+        if slot_speed > 0 {
+            let slot_capacity = slot_speed as f64 * slot_seconds as f64;
+            if slot_capacity >= remaining {
+                return Some(elapsed_seconds + (remaining / slot_speed as f64).ceil() as u64);
+            }
+            remaining -= slot_capacity;
+        }
+        elapsed_seconds += slot_seconds;
+        hour = (hour + 1) % 24;
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SpeedModel {
+    Utilization(f64),
+    Observed(u64),
+}
+
+fn estimated_slot_speed_bps(
+    model: SpeedModel,
+    current_speed_bps: u64,
+    scheduled_limit_bps: Option<u64>,
+) -> u64 {
+    match model {
+        SpeedModel::Utilization(ratio) => {
+            if ratio <= 0.0 {
+                0
+            } else {
+                match scheduled_limit_bps {
+                    Some(limit) => ((limit as f64 * ratio).round() as u64).max(1),
+                    None => current_speed_bps,
+                }
+            }
+        }
+        SpeedModel::Observed(speed) => match scheduled_limit_bps {
+            Some(limit) => speed.min(limit),
+            None => speed,
+        },
+    }
+}
+
+fn min_limit(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}

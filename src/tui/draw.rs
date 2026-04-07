@@ -4,12 +4,12 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Cell, Clear, List, ListItem, Paragraph, Row, Tabs, Wrap},
+    widgets::{Block, Cell, Clear, List, ListItem, Paragraph, Row, Tabs, Wrap},
 };
 
 use crate::{
-    daemon::{DownloadItem, DownloadStatus, Snapshot},
     daemon::snapshot::SchedulerSnapshot,
+    daemon::{DownloadItem, DownloadStatus, Snapshot},
     routing::{DownloadRoutingRule, describe_directory_input, match_rule, validate_rule},
     state::ManualOrScheduled,
     tui::{
@@ -22,6 +22,7 @@ use crate::{
         Percentage, describe_limit_input, format_bytes, format_bytes_per_sec, format_eta,
         format_limit,
     },
+    web::{validate_bind_address, validate_cookie_days},
     webhook::{WebhookPingMode, validate_discord_webhook_url, validate_ping_id},
 };
 
@@ -110,6 +111,7 @@ fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
         TabKind::Scheduler => draw_scheduler(frame, chunks[1], app),
         TabKind::Routing => draw_routing(frame, chunks[1], app),
         TabKind::Webhooks => draw_webhooks(frame, chunks[1], app),
+        TabKind::WebUi => draw_web_ui(frame, chunks[1], app),
     }
 }
 
@@ -149,7 +151,10 @@ fn draw_current(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
     frame.render_widget(table, layout[0]);
 
     if app.show_details {
-        frame.render_widget(details_paragraph(app.current_selected(), &app.snapshot.scheduler), layout[1]);
+        frame.render_widget(
+            details_paragraph(app.current_selected(), &app.snapshot.scheduler),
+            layout[1],
+        );
     }
 }
 
@@ -190,7 +195,10 @@ fn draw_history(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
     .block(bordered("History"));
     frame.render_widget(table, layout[0]);
     if app.show_details {
-        frame.render_widget(details_paragraph(app.history_selected(), &app.snapshot.scheduler), layout[1]);
+        frame.render_widget(
+            details_paragraph(app.history_selected(), &app.snapshot.scheduler),
+            layout[1],
+        );
     }
 }
 
@@ -206,10 +214,7 @@ fn draw_scheduler(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
         ])
         .split(area);
     let summary = Paragraph::new(Text::from(vec![
-        Line::from(format!(
-            "  Mode: {:?}",
-            app.snapshot.scheduler.mode
-        )),
+        Line::from(format!("  Mode: {:?}", app.snapshot.scheduler.mode)),
         Line::from(format!(
             "{}Manual limit: {}",
             if app.schedule_index == 0 { "> " } else { "  " },
@@ -366,7 +371,11 @@ fn draw_webhooks(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
     let body = vec![
         Line::from(format!(
             "Webhook configured: {}",
-            if app.snapshot.webhooks.enabled { "yes" } else { "no" }
+            if app.snapshot.webhooks.enabled {
+                "yes"
+            } else {
+                "no"
+            }
         )),
         Line::from(format!(
             "Discord webhook URL: {}",
@@ -389,6 +398,56 @@ fn draw_webhooks(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
     );
 }
 
+fn draw_web_ui(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
+    let lines = vec![
+        Line::from(format!(
+            "Enabled: {}",
+            if app.snapshot.web_ui.enabled {
+                "yes"
+            } else {
+                "no"
+            }
+        )),
+        Line::from(format!("Status: {:?}", app.snapshot.web_ui.status)),
+        Line::from(format!(
+            "Bind address: {}",
+            app.snapshot.web_ui.bind_address
+        )),
+        Line::from(format!("Port: {}", app.snapshot.web_ui.port)),
+        Line::from(format!("Cookie days: {}", app.snapshot.web_ui.cookie_days)),
+        Line::from(format!("URL: {}", app.snapshot.web_ui.url)),
+        Line::from(format!(
+            "Pending browser PINs: {}",
+            if app.snapshot.web_ui.pending_pair_pins.is_empty() {
+                "-".to_string()
+            } else {
+                app.snapshot.web_ui.pending_pair_pins.join(", ")
+            }
+        )),
+        Line::from(format!(
+            "Active browser sessions: {}",
+            app.snapshot.web_ui.active_session_count
+        )),
+        Line::from(format!(
+            "Last error: {}",
+            app.snapshot
+                .web_ui
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "-".into())
+        )),
+        Line::from("Open the login page in a browser to get a 4-digit PIN."),
+        Line::from("Space toggles enabled. Enter/e edits bind/port/cookie lifetime."),
+        Line::from("Press p to approve a pending browser PIN."),
+    ];
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(bordered("Web UI"))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
     let text = match app.tab {
         TabKind::Current => {
@@ -401,8 +460,9 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
         TabKind::Routing => {
             "q quit  arrows/vim select  a add  Enter/e edit  d delete  J/K reorder  t edit tester"
         }
-        TabKind::Webhooks => {
-            "q quit  Enter/e edit webhook settings  t trigger test notification"
+        TabKind::Webhooks => "q quit  Enter/e edit webhook settings  t trigger test notification",
+        TabKind::WebUi => {
+            "q quit  Space enable/disable  Enter/e edit listener settings  p approve browser PIN"
         }
     };
     frame.render_widget(Paragraph::new(text), area);
@@ -411,6 +471,10 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
 fn draw_modal(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
     let popup = centered_rect(68, 58, area);
     frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Black)),
+        popup,
+    );
     match app.modal.as_ref().expect("modal") {
         ModalState::AddUrl(form) => {
             let widget = Paragraph::new(form.value())
@@ -481,7 +545,10 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
             ) {
                 Ok(route) => format!(
                     "Will download to: {}",
-                    route.resolved_directory.join(form.selected_filename()).display()
+                    route
+                        .resolved_directory
+                        .join(form.selected_filename())
+                        .display()
                 ),
                 Err(error) => error.to_string(),
             };
@@ -620,6 +687,98 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
                 layout[5],
             );
         }
+        ModalState::ApproveWebUiPin(form) => {
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(4),
+                    Constraint::Length(3),
+                    Constraint::Length(2),
+                    Constraint::Min(1),
+                ])
+                .margin(1)
+                .split(popup);
+            frame.render_widget(
+                Paragraph::new("Enter the 4-digit PIN shown in the unauthenticated browser to approve that browser and grant it a saved session cookie.")
+                    .block(bordered("Approve Browser PIN"))
+                    .style(Style::default().bg(Color::Black))
+                    .wrap(Wrap { trim: false }),
+                popup,
+            );
+            frame.render_widget(&form.input, layout[1]);
+            let value = form.value();
+            let (message, color) =
+                if value.len() == 4 && value.chars().all(|ch| ch.is_ascii_digit()) {
+                    ("PIN format looks valid".to_string(), Color::Green)
+                } else {
+                    ("PIN must be exactly 4 digits".to_string(), Color::Red)
+                };
+            frame.render_widget(
+                Paragraph::new(message)
+                    .style(Style::default().fg(color).bg(Color::Black))
+                    .wrap(Wrap { trim: false }),
+                layout[2],
+            );
+        }
+        ModalState::EditWebUi(form) => {
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(4),
+                    Constraint::Length(3),
+                    Constraint::Length(3),
+                    Constraint::Length(3),
+                    Constraint::Length(2),
+                    Constraint::Length(2),
+                    Constraint::Min(1),
+                ])
+                .margin(1)
+                .split(popup);
+            frame.render_widget(
+                Paragraph::new("Configure the daemon-hosted web UI. Tab or Shift-Tab changes fields. Enter saves. Browsers log in by showing a 4-digit PIN, which you approve from the terminal UI.")
+                    .block(bordered("Web UI Settings"))
+                    .style(Style::default().bg(Color::Black))
+                    .wrap(Wrap { trim: false }),
+                popup,
+            );
+            frame.render_widget(&form.bind_address, layout[1]);
+            frame.render_widget(&form.port, layout[2]);
+            frame.render_widget(&form.cookie_days, layout[3]);
+            let (bind_address, port, cookie_days) = form.values();
+            let (bind_message, bind_color) = match validate_bind_address(&bind_address) {
+                Ok(_) => ("Bind address looks valid".to_string(), Color::Green),
+                Err(error) => (error.to_string(), Color::Red),
+            };
+            frame.render_widget(
+                Paragraph::new(bind_message)
+                    .style(Style::default().fg(bind_color).bg(Color::Black))
+                    .wrap(Wrap { trim: false }),
+                layout[4],
+            );
+            let port_valid = port.parse::<u16>().ok().filter(|value| *value > 0);
+            let cookie_valid = cookie_days
+                .parse::<u32>()
+                .ok()
+                .and_then(|days| validate_cookie_days(days).ok().map(|_| days));
+            let summary = match (port_valid, cookie_valid) {
+                (Some(port), Some(days)) => {
+                    format!("Will listen on port {port} with {days} day cookie persistence")
+                }
+                (None, _) => "Port must be a number between 1 and 65535".to_string(),
+                (_, None) => "Cookie days must be between 1 and 365".to_string(),
+            };
+            let color = if port_valid.is_some() && cookie_valid.is_some() {
+                Color::Green
+            } else {
+                Color::Red
+            };
+            frame.render_widget(
+                Paragraph::new(summary)
+                    .style(Style::default().fg(color).bg(Color::Black))
+                    .wrap(Wrap { trim: false }),
+                layout[5],
+            );
+        }
         ModalState::EditRange(form) => {
             let layout = Layout::default()
                 .direction(Direction::Vertical)
@@ -645,18 +804,9 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
             frame.render_widget(&form.start, layout[1]);
             frame.render_widget(&form.end, layout[2]);
             frame.render_widget(&form.limit, layout[3]);
-            frame.render_widget(
-                hour_status_paragraph(form.start.value(), false),
-                layout[4],
-            );
-            frame.render_widget(
-                hour_status_paragraph(form.end.value(), true),
-                layout[5],
-            );
-            frame.render_widget(
-                limit_status_paragraph(form.limit.value()),
-                layout[6],
-            );
+            frame.render_widget(hour_status_paragraph(form.start.value(), false), layout[4]);
+            frame.render_widget(hour_status_paragraph(form.end.value(), true), layout[5]);
+            frame.render_widget(limit_status_paragraph(form.limit.value()), layout[6]);
         }
         ModalState::EditRoutingRule { form, fallback, .. } => {
             let layout = Layout::default()
@@ -791,7 +941,10 @@ fn status_label(status: &DownloadStatus) -> &'static str {
     }
 }
 
-fn details_paragraph(item: Option<&DownloadItem>, scheduler: &SchedulerSnapshot) -> Paragraph<'static> {
+fn details_paragraph(
+    item: Option<&DownloadItem>,
+    scheduler: &SchedulerSnapshot,
+) -> Paragraph<'static> {
     let body = if let Some(item) = item {
         vec![
             Line::from(format!("Name: {}", item.name)),
@@ -880,15 +1033,14 @@ fn scheduled_eta_seconds(item: &DownloadItem, scheduler: &SchedulerSnapshot) -> 
 
     for step in 0..(24 * 365) {
         let slot_seconds = if step == 0 { first_slot_seconds } else { 3600 };
-        let slot_speed =
-            estimated_slot_speed_bps(
-                speed_model,
-                item.download_speed_bps,
-                min_limit(
-                    scheduler.schedule_limits_bps[hour],
-                    scheduler.usual_internet_speed_bps,
-                ),
-            );
+        let slot_speed = estimated_slot_speed_bps(
+            speed_model,
+            item.download_speed_bps,
+            min_limit(
+                scheduler.schedule_limits_bps[hour],
+                scheduler.usual_internet_speed_bps,
+            ),
+        );
         if slot_speed > 0 {
             let slot_capacity = slot_speed as f64 * slot_seconds as f64;
             if slot_capacity >= remaining {
