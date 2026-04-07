@@ -10,7 +10,7 @@ use axum_extra::extract::{
     CookieJar,
     cookie::{Cookie, SameSite},
 };
-use chrono::Timelike;
+use chrono::{Local, Timelike};
 use color_eyre::eyre::Result;
 use serde::{Deserialize, Serialize};
 use time::Duration as CookieDuration;
@@ -1504,7 +1504,7 @@ fn render_scheduler_page(snapshot: &Snapshot, error: Option<&str>) -> String {
 <p>Usual internet speed: {} &nbsp; <a class="button" href="/scheduler/usual">Edit</a></p>
 <p>Effective limit: {}</p>
 <p>Next change: {}</p>
-<pre class="graph">{}</pre>
+<div class="chart-shell">{}</div>
 </section>
 <section class="card">
 <div class="toolbar"><a class="button" href="/scheduler/range/new">New range</a></div>
@@ -1528,9 +1528,7 @@ fn render_scheduler_page(snapshot: &Snapshot, error: Option<&str>) -> String {
         esc(&format_limit(snapshot.scheduler.usual_internet_speed_bps)),
         esc(&format_limit(snapshot.scheduler.effective_limit_bps)),
         esc(&snapshot.scheduler.next_change_at_local),
-        esc(&schedule_graph_text(
-            &snapshot.scheduler.schedule_limits_bps
-        )),
+        render_schedule_svg(&snapshot.scheduler.schedule_limits_bps),
         rows,
     );
     render_shell(snapshot, WebTab::Scheduler, &body, true, "Scheduler")
@@ -1928,29 +1926,70 @@ fn scheduler_ranges(snapshot: &Snapshot) -> Vec<(usize, usize, Option<u64>)> {
     ranges
 }
 
-fn schedule_graph_text(limits: &[Option<u64>; 24]) -> String {
+fn render_schedule_svg(limits: &[Option<u64>; 24]) -> String {
     let finite = limits.iter().flatten().copied().collect::<Vec<_>>();
     let max_finite = finite.iter().copied().max().unwrap_or(1);
     let min_finite = finite.iter().copied().min().unwrap_or(max_finite);
-    let mut out = String::new();
-    out.push_str("Higher bars mean higher limits. Unlimited is full height.\n");
-    for row in (1..=8).rev() {
-        for limit in limits {
-            let height = match limit {
-                None => 8,
-                Some(value) if max_finite == min_finite => 4,
-                Some(value) => {
-                    let ratio = (*value - min_finite) as f64 / (max_finite - min_finite) as f64;
-                    (ratio * 7.0).round() as usize + 1
-                }
-            };
-            out.push(if height >= row { '█' } else { ' ' });
-            out.push(' ');
-        }
-        out.push('\n');
+    let current_hour = Local::now().hour() as usize;
+    let chart_top = 16.0;
+    let chart_height = 144.0;
+    let bar_width = 14.0;
+    let gap = 8.0;
+    let mut body = String::new();
+    body.push_str(
+        r#"<svg class="schedule-chart" viewBox="0 0 584 220" role="img" aria-label="Hourly scheduler limits chart">"#,
+    );
+    body.push_str(r##"<rect x="0" y="0" width="584" height="220" rx="10" fill="#101010"/>"##);
+    for grid in 0..=4 {
+        let y = chart_top + (chart_height / 4.0) * grid as f64;
+        let _ = write!(
+            body,
+            r##"<line x1="38" y1="{:.1}" x2="566" y2="{:.1}" stroke="#2b2b2b" stroke-width="1"/>"##,
+            y, y
+        );
     }
-    out.push_str("00 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18 19 20 21 22 23");
-    out
+    for (hour, limit) in limits.iter().enumerate() {
+        let x = 42.0 + hour as f64 * (bar_width + gap);
+        let normalized = match limit {
+            None => 1.0,
+            Some(_) if max_finite == min_finite => 0.55,
+            Some(value) => {
+                ((*value - min_finite) as f64 / (max_finite - min_finite) as f64 * 0.85) + 0.15
+            }
+        };
+        let bar_height = chart_height * normalized;
+        let y = chart_top + chart_height - bar_height;
+        let fill = if hour == current_hour {
+            "#f2c94c"
+        } else if limit.is_none() {
+            "#25c2a0"
+        } else {
+            "#4f8cff"
+        };
+        let _ = write!(
+            body,
+            r#"<g><rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" rx="3" fill="{}"><title>{:02}:00 - {}</title></rect></g>"#,
+            x,
+            y,
+            bar_width,
+            bar_height.max(2.0),
+            fill,
+            hour,
+            esc(&format_limit(*limit))
+        );
+        if hour % 3 == 0 {
+            let _ = write!(
+                body,
+                r##"<text x="{:.1}" y="188" text-anchor="middle" fill="#bdbdbd" font-size="11">{:02}</text>"##,
+                x + bar_width / 2.0,
+                hour
+            );
+        }
+    }
+    body.push_str(r##"<text x="18" y="18" fill="#bdbdbd" font-size="11">Higher bars mean higher limits. Unlimited uses full height.</text>"##);
+    body.push_str(r##"<text x="18" y="206" fill="#8f8f8f" font-size="11">Hours</text>"##);
+    body.push_str("</svg>");
+    body
 }
 
 fn prompt_candidate(resolved: &crate::daemon::ResolvedHttpUrl) -> Option<(&'static str, String)> {
@@ -2008,7 +2047,8 @@ input, select { width: 100%; box-sizing: border-box; background: #0f0f0f; color:
 .error { color: #ff8383; }
 .muted { color: #bbb; }
 .danger { border-color: #8a3d3d; }
-.graph { white-space: pre; overflow-x: auto; }
+.chart-shell { overflow-x: auto; }
+.schedule-chart { width: 100%; min-width: 584px; height: auto; display: block; }
 .details dt { color: #bbb; margin-top: 0.5rem; }
 .details dd { margin-left: 0; margin-bottom: 0.35rem; word-break: break-word; }
 code { background: #0d0d0d; padding: 0.15rem 0.25rem; }

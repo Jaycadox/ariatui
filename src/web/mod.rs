@@ -1,9 +1,15 @@
 pub mod server;
 
-use std::{net::IpAddr, time::Duration};
+use std::{
+    net::IpAddr,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use color_eyre::eyre::{Result, bail, eyre};
+use hmac::{Hmac, Mac};
 use rand::{RngExt, distr::Alphanumeric};
+use sha2::Sha256;
 use tokio::{net::TcpListener, sync::oneshot};
 use tracing::{error, info, warn};
 
@@ -15,6 +21,8 @@ use crate::daemon::{
 pub const AUTH_COOKIE_NAME: &str = "ariatui_auth";
 pub const PAIR_COOKIE_NAME: &str = "ariatui_pair";
 pub const PAIRING_TTL_SECS: u64 = 300;
+const SESSION_COOKIE_VERSION: &str = "v1";
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DesiredWebConfig {
@@ -146,9 +154,10 @@ pub async fn approve_pairing_pin(state: &DaemonState, pin: &str) -> Result<()> {
     if pin.len() != 4 || !pin.chars().all(|ch| ch.is_ascii_digit()) {
         return Err(eyre!("pin must be exactly 4 digits"));
     }
+    let persisted = state.app.state.read().await.clone();
     let expires_at = std::time::Instant::now()
-        + Duration::from_secs(state.app.state.read().await.web_ui_cookie_days as u64 * 86_400);
-    let session_token = generate_login_token();
+        + Duration::from_secs(persisted.web_ui_cookie_days as u64 * 86_400);
+    let session_token = issue_session_cookie_value(state, persisted.web_ui_cookie_days).await?;
     let mut pairings = state.web_pairings.lock().await;
     let Some(pairing) = pairings
         .values_mut()
@@ -168,11 +177,93 @@ pub async fn approve_pairing_pin(state: &DaemonState, pin: &str) -> Result<()> {
 
 pub async fn session_is_valid(state: &DaemonState, token: &str) -> bool {
     cleanup_expired_auth(state).await;
+    if verify_session_cookie_value(state, token).await {
+        return true;
+    }
     state.web_sessions.lock().await.contains_key(token)
 }
 
 pub async fn remove_session(state: &DaemonState, token: &str) {
     state.web_sessions.lock().await.remove(token);
+}
+
+pub async fn ensure_session_secret(state: &DaemonState) -> Result<String> {
+    let mut persisted = state.app.state.write().await;
+    if persisted.web_ui_session_secret.trim().is_empty() {
+        persisted.web_ui_session_secret = generate_login_token();
+        persisted.save(&state.app.paths.state_file)?;
+    }
+    Ok(persisted.web_ui_session_secret.clone())
+}
+
+pub async fn issue_session_cookie_value(state: &DaemonState, cookie_days: u32) -> Result<String> {
+    let secret = ensure_session_secret(state).await?;
+    let expires_at = SystemTime::now()
+        .checked_add(Duration::from_secs(cookie_days as u64 * 86_400))
+        .ok_or_else(|| eyre!("failed to calculate session expiry"))?
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| eyre!("system clock is before unix epoch"))?
+        .as_secs();
+    let nonce = generate_pair_request_id();
+    let payload = format!("{SESSION_COOKIE_VERSION}.{expires_at}.{nonce}");
+    let signature = sign_session_payload(&secret, &payload)?;
+    Ok(format!("{payload}.{signature}"))
+}
+
+pub async fn verify_session_cookie_value(state: &DaemonState, token: &str) -> bool {
+    let secret = {
+        let persisted = state.app.state.read().await;
+        persisted.web_ui_session_secret.clone()
+    };
+    if secret.trim().is_empty() {
+        return false;
+    }
+    verify_session_cookie_value_with_secret(&secret, token)
+}
+
+fn sign_session_payload(secret: &str, payload: &str) -> Result<String> {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .map_err(|_| eyre!("invalid session secret"))?;
+    mac.update(payload.as_bytes());
+    Ok(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
+}
+
+fn verify_session_cookie_value_with_secret(secret: &str, token: &str) -> bool {
+    let mut parts = token.split('.');
+    let Some(version) = parts.next() else {
+        return false;
+    };
+    let Some(expiry) = parts.next() else {
+        return false;
+    };
+    let Some(nonce) = parts.next() else {
+        return false;
+    };
+    let Some(signature) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() || version != SESSION_COOKIE_VERSION {
+        return false;
+    }
+    let Ok(expiry_unix) = expiry.parse::<u64>() else {
+        return false;
+    };
+    let now_unix = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(_) => return false,
+    };
+    if expiry_unix <= now_unix {
+        return false;
+    }
+    let payload = format!("{version}.{expiry}.{nonce}");
+    let Ok(signature_bytes) = URL_SAFE_NO_PAD.decode(signature.as_bytes()) else {
+        return false;
+    };
+    let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(payload.as_bytes());
+    mac.verify_slice(&signature_bytes).is_ok()
 }
 
 #[derive(Debug, Clone)]
