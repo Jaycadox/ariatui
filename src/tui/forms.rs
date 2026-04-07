@@ -21,7 +21,7 @@ impl AddUrlForm {
         if !initial.is_empty() {
             input.insert_str(initial);
         }
-        input.set_placeholder_text("https://example.com/file.iso");
+        input.set_placeholder_text("https://example.com/file.iso or magnet:?...");
         Self { input }
     }
 

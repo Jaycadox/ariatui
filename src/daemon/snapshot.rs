@@ -133,6 +133,11 @@ pub struct DownloadItem {
     pub name: String,
     pub primary_path: Option<String>,
     pub source_uri: Option<String>,
+    pub info_hash: Option<String>,
+    pub num_seeders: Option<u32>,
+    pub followed_by: Vec<String>,
+    pub belongs_to: Option<String>,
+    pub is_metadata_only: bool,
     pub total_bytes: u64,
     pub completed_bytes: u64,
     pub download_speed_bps: u64,
@@ -151,6 +156,7 @@ pub struct ResolvedHttpUrl {
     pub remote_filename: Option<String>,
     pub redirect_filename: Option<String>,
     pub final_url: Option<String>,
+    pub is_torrent: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

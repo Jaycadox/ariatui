@@ -13,6 +13,7 @@ use crate::{
         ApiEnvelope, ApiPayload, ApiRequest, ApiResponse, AppContext, DownloadItem,
         ResolvedHttpUrl, Snapshot,
     },
+    download_uri::{classify_download_uri, is_http_like_uri},
     routing::{DownloadRoutingRule, validate_directory_input, validate_rule},
     state::{CancelBehaviorPreference, ManualOrScheduled},
     tui::{
@@ -366,11 +367,11 @@ impl UiApp {
                 KeyCode::Esc => self.modal = None,
                 KeyCode::Enter => {
                     let value = form.value();
-                    if value.starts_with("http://") || value.starts_with("https://") {
+                    if classify_download_uri(&value).is_ok() {
                         self.resolve_add_url(value).await?;
                     } else {
                         self.modal = Some(ModalState::Error(
-                            "URL must start with http:// or https://".into(),
+                            "URI must use http, https, ftp, sftp, or magnet".into(),
                         ));
                     }
                 }
@@ -851,6 +852,15 @@ impl UiApp {
     }
 
     async fn resolve_add_url(&mut self, url: String) -> Result<()> {
+        if !is_http_like_uri(&url) {
+            self.issue(ApiRequest::AddHttpUrl {
+                url,
+                filename: None,
+            })
+            .await?;
+            self.modal = None;
+            return Ok(());
+        }
         match self
             .request_response(ApiRequest::ResolveHttpUrl { url: url.clone() })
             .await
@@ -882,6 +892,15 @@ impl UiApp {
     }
 
     async fn open_resolved_url(&mut self, resolved: ResolvedHttpUrl) -> Result<()> {
+        if resolved.is_torrent {
+            self.issue(ApiRequest::AddHttpUrl {
+                url: resolved.url,
+                filename: None,
+            })
+            .await?;
+            self.modal = None;
+            return Ok(());
+        }
         let prompt_candidate = resolved
             .remote_filename
             .clone()
@@ -892,7 +911,6 @@ impl UiApp {
                     .clone()
                     .map(|filename| ("redirect target", filename))
             });
-
         if let Some((label, remote_filename)) = prompt_candidate {
             self.modal = Some(ModalState::ChooseFilename(FilenameChoiceForm::new(
                 &resolved.url,

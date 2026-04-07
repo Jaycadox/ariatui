@@ -10,7 +10,7 @@ use axum_extra::extract::{
     CookieJar,
     cookie::{Cookie, SameSite},
 };
-use chrono::{Local, Timelike};
+use chrono::Timelike;
 use color_eyre::eyre::Result;
 use serde::{Deserialize, Serialize};
 use time::Duration as CookieDuration;
@@ -20,6 +20,7 @@ use crate::{
         ApiPayload, ApiRequest, DownloadItem, DownloadStatus, SharedDaemonState, Snapshot,
         snapshot::SchedulerSnapshot,
     },
+    download_uri::is_http_like_uri,
     routing::{DownloadRoutingRule, describe_directory_input, match_rule, validate_rule},
     state::{CancelBehaviorPreference, ManualOrScheduled},
     units::{self, Percentage, format_bytes, format_bytes_per_sec, format_eta, format_limit},
@@ -332,11 +333,30 @@ async fn add_url_resolve(
     if url.is_empty() {
         return Html(render_add_url_page(
             &snapshot,
-            Some("URL cannot be empty"),
+            Some("URI cannot be empty"),
             None,
             None,
         ))
         .into_response();
+    }
+
+    if !is_http_like_uri(&url) {
+        return match state
+            .execute(ApiRequest::AddHttpUrl {
+                url: url.clone(),
+                filename: None,
+            })
+            .await
+        {
+            Ok(_) => Redirect::to("/current").into_response(),
+            Err(error) => Html(render_add_url_page(
+                &snapshot,
+                Some(&error.to_string()),
+                None,
+                Some(&url),
+            ))
+            .into_response(),
+        };
     }
 
     match state
@@ -345,6 +365,24 @@ async fn add_url_resolve(
     {
         Ok(reply) => match reply.payload {
             Some(ApiPayload::ResolvedHttpUrl(resolved)) => {
+                if resolved.is_torrent {
+                    return match state
+                        .execute(ApiRequest::AddHttpUrl {
+                            url: resolved.url,
+                            filename: None,
+                        })
+                        .await
+                    {
+                        Ok(_) => Redirect::to("/current").into_response(),
+                        Err(error) => Html(render_add_url_page(
+                            &reply.snapshot,
+                            Some(&error.to_string()),
+                            None,
+                            Some(&url),
+                        ))
+                        .into_response(),
+                    };
+                }
                 if let Some((label, remote_filename)) = prompt_candidate(&resolved) {
                     Html(render_add_url_page(
                         &reply.snapshot,
@@ -1253,19 +1291,17 @@ fn render_current_page(
         let _ = write!(body, "<p class=\"error\">{}</p>", esc(error));
     }
     body.push_str(
-        r#"<div class="toolbar"><a class="button" href="/current/add">Add URL</a></div>"#,
+        r#"<div class="toolbar"><a class="button" href="/current/add">Add URI</a></div>"#,
     );
     body.push_str("<div class=\"split\">");
     let _ = write!(
         body,
         r#"<section class="card">
 <h2>Current downloads</h2>
-<div class="table-wrap">
 <table>
 <thead><tr><th>Status</th><th>Name</th><th>Progress</th><th>Done/Total</th><th>Speed</th><th>ETA</th><th>GID</th><th>Actions</th></tr></thead>
 <tbody>{}</tbody>
 </table>
-</div>
 </section>"#,
         rows
     );
@@ -1291,11 +1327,11 @@ fn render_add_url_page(
     let _ = write!(
         body,
         r#"<section class="card narrow-card">
-<h2>Add URL</h2>
+<h2>Add URI</h2>
 <form method="post" action="/current/add/resolve" class="stack">
-<label>HTTP or HTTPS URL</label>
-<input type="text" name="url" value="{}" placeholder="https://example.com/file.iso" />
-<div class="actions"><button type="submit">Resolve and add</button><a class="button" href="/current">Back</a></div>
+<label>HTTP, HTTPS, FTP, SFTP, or magnet URI</label>
+<input type="text" name="url" value="{}" placeholder="https://example.com/file.iso or magnet:?..." />
+<div class="actions"><button type="submit">Add</button><a class="button" href="/current">Back</a></div>
 </form>
 </section>"#,
         esc(initial_url.unwrap_or(""))
@@ -1338,7 +1374,7 @@ fn render_add_url_page(
             esc(&preview)
         );
     }
-    render_shell(snapshot, WebTab::Current, &body, false, "Add URL")
+    render_shell(snapshot, WebTab::Current, &body, false, "Add URI")
 }
 
 fn render_cancel_page(snapshot: &Snapshot, gid: &str, error: Option<&str>) -> String {
@@ -1410,12 +1446,10 @@ fn render_history_page(snapshot: &Snapshot, selected_gid: Option<&str>) -> Strin
         r#"<div class="split">
 <section class="card">
 <h2>History</h2>
-<div class="table-wrap">
 <table>
 <thead><tr><th>Status</th><th>Name</th><th>Size</th><th>Error</th><th>GID</th><th>Action</th></tr></thead>
 <tbody>{}</tbody>
 </table>
-</div>
 </section>
 <aside class="card"><h2>Details</h2>{}</aside>
 </div>"#,
@@ -1470,16 +1504,14 @@ fn render_scheduler_page(snapshot: &Snapshot, error: Option<&str>) -> String {
 <p>Usual internet speed: {} &nbsp; <a class="button" href="/scheduler/usual">Edit</a></p>
 <p>Effective limit: {}</p>
 <p>Next change: {}</p>
-<div class="chart-shell">{}</div>
+<pre class="graph">{}</pre>
 </section>
 <section class="card">
 <div class="toolbar"><a class="button" href="/scheduler/range/new">New range</a></div>
-<div class="table-wrap">
 <table>
 <thead><tr><th>Start</th><th>End</th><th>Limit</th><th>Actions</th></tr></thead>
 <tbody>{}</tbody>
 </table>
-</div>
 </section>
 </div>"#,
         if snapshot.scheduler.mode == ManualOrScheduled::Manual {
@@ -1496,7 +1528,9 @@ fn render_scheduler_page(snapshot: &Snapshot, error: Option<&str>) -> String {
         esc(&format_limit(snapshot.scheduler.usual_internet_speed_bps)),
         esc(&format_limit(snapshot.scheduler.effective_limit_bps)),
         esc(&snapshot.scheduler.next_change_at_local),
-        render_schedule_svg(&snapshot.scheduler.schedule_limits_bps),
+        esc(&schedule_graph_text(
+            &snapshot.scheduler.schedule_limits_bps
+        )),
         rows,
     );
     render_shell(snapshot, WebTab::Scheduler, &body, true, "Scheduler")
@@ -1624,12 +1658,10 @@ fn render_routing_page(
 <h2>Routing</h2>
 <p>Fallback folder: {}</p>
 <div class="toolbar"><a class="button" href="/routing/rule/new">Add rule</a></div>
-<div class="table-wrap">
 <table>
 <thead><tr><th>Type</th><th>Pattern</th><th>Directory</th><th>Actions</th></tr></thead>
 <tbody>{}</tbody>
 </table>
-</div>
 </section>
 <section class="card">
 <h2>Rule tester</h2>
@@ -1801,6 +1833,35 @@ fn render_download_details(item: Option<&DownloadItem>, scheduler: &SchedulerSna
     let Some(item) = item else {
         return "<p>No item selected.</p>".into();
     };
+    let mut extra = String::new();
+    if item.info_hash.is_some() || item.num_seeders.is_some() || item.belongs_to.is_some() {
+        let _ = write!(
+            extra,
+            r#"
+<dt>Torrent info hash</dt><dd>{}</dd>
+<dt>Peers</dt><dd>{}</dd>
+<dt>Seeders</dt><dd>{}</dd>"#,
+            esc(item.info_hash.as_deref().unwrap_or("-")),
+            esc(&item
+                .connections
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".into())),
+            esc(&item
+                .num_seeders
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".into())),
+        );
+        if item.is_metadata_only {
+            let _ = write!(
+                extra,
+                r#"<dt>Metadata follow-up GIDs</dt><dd>{}</dd>"#,
+                esc(&item.followed_by.join(", "))
+            );
+        }
+        if let Some(parent) = &item.belongs_to {
+            let _ = write!(extra, r#"<dt>Parent GID</dt><dd>{}</dd>"#, esc(parent));
+        }
+    }
     format!(
         r#"<dl class="details">
 <dt>Name</dt><dd>{}</dd>
@@ -1812,6 +1873,7 @@ fn render_download_details(item: Option<&DownloadItem>, scheduler: &SchedulerSna
 <dt>Path</dt><dd>{}</dd>
 <dt>Source</dt><dd>{}</dd>
 <dt>Error</dt><dd>{}</dd>
+{}
 </dl>"#,
         esc(&item.name),
         esc(&item.gid),
@@ -1823,6 +1885,7 @@ fn render_download_details(item: Option<&DownloadItem>, scheduler: &SchedulerSna
         esc(item.primary_path.as_deref().unwrap_or("-")),
         esc(item.source_uri.as_deref().unwrap_or("-")),
         esc(item.error_message.as_deref().unwrap_or("-")),
+        extra,
     )
 }
 
@@ -1865,70 +1928,29 @@ fn scheduler_ranges(snapshot: &Snapshot) -> Vec<(usize, usize, Option<u64>)> {
     ranges
 }
 
-fn render_schedule_svg(limits: &[Option<u64>; 24]) -> String {
+fn schedule_graph_text(limits: &[Option<u64>; 24]) -> String {
     let finite = limits.iter().flatten().copied().collect::<Vec<_>>();
     let max_finite = finite.iter().copied().max().unwrap_or(1);
     let min_finite = finite.iter().copied().min().unwrap_or(max_finite);
-    let current_hour = Local::now().hour() as usize;
-    let chart_top = 16.0;
-    let chart_height = 144.0;
-    let bar_width = 14.0;
-    let gap = 8.0;
-    let mut body = String::new();
-    body.push_str(
-        r#"<svg class="schedule-chart" viewBox="0 0 584 220" role="img" aria-label="Hourly scheduler limits chart">"#,
-    );
-    body.push_str(r##"<rect x="0" y="0" width="584" height="220" rx="10" fill="#101010"/>"##);
-    for grid in 0..=4 {
-        let y = chart_top + (chart_height / 4.0) * grid as f64;
-        let _ = write!(
-            body,
-            r##"<line x1="38" y1="{:.1}" x2="566" y2="{:.1}" stroke="#2b2b2b" stroke-width="1"/>"##,
-            y, y
-        );
-    }
-    for (hour, limit) in limits.iter().enumerate() {
-        let x = 42.0 + hour as f64 * (bar_width + gap);
-        let normalized = match limit {
-            None => 1.0,
-            Some(_) if max_finite == min_finite => 0.55,
-            Some(value) => {
-                ((*value - min_finite) as f64 / (max_finite - min_finite) as f64 * 0.85) + 0.15
-            }
-        };
-        let bar_height = chart_height * normalized;
-        let y = chart_top + chart_height - bar_height;
-        let fill = if hour == current_hour {
-            "#f2c94c"
-        } else if limit.is_none() {
-            "#25c2a0"
-        } else {
-            "#4f8cff"
-        };
-        let _ = write!(
-            body,
-            r#"<g><rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" rx="3" fill="{}"><title>{:02}:00 - {}</title></rect></g>"#,
-            x,
-            y,
-            bar_width,
-            bar_height.max(2.0),
-            fill,
-            hour,
-            esc(&format_limit(*limit))
-        );
-        if hour % 3 == 0 {
-            let _ = write!(
-                body,
-                r##"<text x="{:.1}" y="188" text-anchor="middle" fill="#bdbdbd" font-size="11">{:02}</text>"##,
-                x + bar_width / 2.0,
-                hour
-            );
+    let mut out = String::new();
+    out.push_str("Higher bars mean higher limits. Unlimited is full height.\n");
+    for row in (1..=8).rev() {
+        for limit in limits {
+            let height = match limit {
+                None => 8,
+                Some(value) if max_finite == min_finite => 4,
+                Some(value) => {
+                    let ratio = (*value - min_finite) as f64 / (max_finite - min_finite) as f64;
+                    (ratio * 7.0).round() as usize + 1
+                }
+            };
+            out.push(if height >= row { '█' } else { ' ' });
+            out.push(' ');
         }
+        out.push('\n');
     }
-    body.push_str(r##"<text x="18" y="18" fill="#bdbdbd" font-size="11">Higher bars mean higher limits. Unlimited uses full height.</text>"##);
-    body.push_str(r##"<text x="18" y="206" fill="#8f8f8f" font-size="11">Hours</text>"##);
-    body.push_str("</svg>");
-    body
+    out.push_str("00 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18 19 20 21 22 23");
+    out
 }
 
 fn prompt_candidate(resolved: &crate::daemon::ResolvedHttpUrl) -> Option<(&'static str, String)> {
@@ -1979,31 +2001,19 @@ body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 .stack { display: flex; flex-direction: column; gap: 0.6rem; }
 .inline, .actions { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
 .toolbar { margin-bottom: 0.75rem; }
-table { width: 100%; border-collapse: collapse; min-width: 720px; }
+table { width: 100%; border-collapse: collapse; }
 th, td { border-bottom: 1px solid #333; padding: 0.45rem; text-align: left; vertical-align: top; }
 input, select { width: 100%; box-sizing: border-box; background: #0f0f0f; color: #eee; border: 1px solid #555; padding: 0.45rem; }
 .message { color: #7fe27f; }
 .error { color: #ff8383; }
 .muted { color: #bbb; }
 .danger { border-color: #8a3d3d; }
-.table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-.chart-shell { overflow-x: auto; }
-.schedule-chart { width: 100%; min-width: 584px; height: auto; display: block; }
+.graph { white-space: pre; overflow-x: auto; }
 .details dt { color: #bbb; margin-top: 0.5rem; }
 .details dd { margin-left: 0; margin-bottom: 0.35rem; word-break: break-word; }
 code { background: #0d0d0d; padding: 0.15rem 0.25rem; }
 .pin { font-size: 2.4rem; font-weight: bold; letter-spacing: 0.25rem; text-align: center; margin: 1rem 0; color: #7fe27f; }
-.actions form { display: inline-flex; }
 @media (max-width: 900px) { .split, .grid2 { grid-template-columns: 1fr; } }
-@media (max-width: 700px) {
-  body { font-size: 14px; }
-  .wrap { padding: 0.6rem; }
-  .header, .card, .tabs, .logout { padding: 0.65rem; }
-  .tab, .button, button { width: 100%; text-align: center; box-sizing: border-box; }
-  .tabs, .inline, .actions { flex-direction: column; align-items: stretch; }
-  .toolbar .button { width: 100%; }
-  .pin { font-size: 2rem; letter-spacing: 0.18rem; }
-}
 "#
 }
 

@@ -3,6 +3,7 @@ mod bootstrap;
 mod cli;
 mod config;
 mod daemon;
+mod download_uri;
 mod paths;
 mod routing;
 mod rpc;

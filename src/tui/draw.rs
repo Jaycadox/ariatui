@@ -478,7 +478,7 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
     match app.modal.as_ref().expect("modal") {
         ModalState::AddUrl(form) => {
             let widget = Paragraph::new(form.value())
-                .block(bordered("Add URL"))
+                .block(bordered("Add URI"))
                 .style(Style::default().bg(Color::Black))
                 .wrap(Wrap { trim: false });
             frame.render_widget(widget, popup);
@@ -946,7 +946,7 @@ fn details_paragraph(
     scheduler: &SchedulerSnapshot,
 ) -> Paragraph<'static> {
     let body = if let Some(item) = item {
-        vec![
+        let mut lines = vec![
             Line::from(format!("Name: {}", item.name)),
             Line::from(format!("GID: {}", item.gid)),
             Line::from(format!(
@@ -975,7 +975,37 @@ fn details_paragraph(
                 "Error: {}",
                 item.error_message.clone().unwrap_or_else(|| "-".into())
             )),
-        ]
+        ];
+        if item.info_hash.is_some() || item.num_seeders.is_some() || item.belongs_to.is_some() {
+            lines.push(Line::from(""));
+            lines.push(Line::from("Torrent:"));
+            lines.push(Line::from(format!(
+                "Info hash: {}",
+                item.info_hash.clone().unwrap_or_else(|| "-".into())
+            )));
+            lines.push(Line::from(format!(
+                "Peers: {}",
+                item.connections
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".into())
+            )));
+            lines.push(Line::from(format!(
+                "Seeders: {}",
+                item.num_seeders
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".into())
+            )));
+            if item.is_metadata_only {
+                lines.push(Line::from(format!(
+                    "Metadata follow-up GIDs: {}",
+                    item.followed_by.join(", ")
+                )));
+            }
+            if let Some(parent) = &item.belongs_to {
+                lines.push(Line::from(format!("Parent GID: {parent}")));
+            }
+        }
+        lines
     } else {
         vec![Line::from("No item selected")]
     };

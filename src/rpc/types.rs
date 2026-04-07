@@ -57,6 +57,14 @@ pub struct Aria2Status {
     pub error_code: Option<String>,
     #[serde(rename = "errorMessage")]
     pub error_message: Option<String>,
+    #[serde(rename = "infoHash")]
+    pub info_hash: Option<String>,
+    #[serde(rename = "numSeeders")]
+    pub num_seeders: Option<String>,
+    #[serde(rename = "followedBy")]
+    pub followed_by: Option<Vec<String>>,
+    #[serde(rename = "belongsTo")]
+    pub belongs_to: Option<String>,
     pub files: Option<Vec<Aria2File>>,
     #[serde(rename = "bittorrent")]
     pub _bittorrent: Option<Value>,

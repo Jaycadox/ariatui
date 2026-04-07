@@ -1,15 +1,17 @@
 use std::{
     collections::{HashMap, HashSet},
+    path::Path,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::Local;
 use color_eyre::eyre::{Result, eyre};
 use reqwest::{
     StatusCode,
-    header::{CONTENT_DISPOSITION, RANGE},
+    header::{CONTENT_DISPOSITION, CONTENT_TYPE, RANGE},
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock};
@@ -24,6 +26,7 @@ use crate::{
             WebUiStatus, WebhookSnapshot,
         },
     },
+    download_uri::{DownloadUriKind, classify_download_uri, magnet_display_name},
     routing::{match_rule, normalize_rules},
     rpc::{
         client::Aria2RpcClient,
@@ -35,6 +38,8 @@ use crate::{
         webhook_enabled,
     },
 };
+
+const WEBHOOK_MIN_BYTES: u64 = 20 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct RuntimeAria2 {
@@ -180,7 +185,12 @@ impl DaemonState {
                     "connections",
                     "errorCode",
                     "errorMessage",
-                    "files"
+                    "infoHash",
+                    "numSeeders",
+                    "followedBy",
+                    "belongsTo",
+                    "files",
+                    "bittorrent"
                 ])],
             )
             .await?;
@@ -201,7 +211,12 @@ impl DaemonState {
                         "connections",
                         "errorCode",
                         "errorMessage",
-                        "files"
+                        "infoHash",
+                        "numSeeders",
+                        "followedBy",
+                        "belongsTo",
+                        "files",
+                        "bittorrent"
                     ]),
                 ],
             )
@@ -223,7 +238,12 @@ impl DaemonState {
                         "connections",
                         "errorCode",
                         "errorMessage",
-                        "files"
+                        "infoHash",
+                        "numSeeders",
+                        "followedBy",
+                        "belongsTo",
+                        "files",
+                        "bittorrent"
                     ]),
                 ],
             )
@@ -334,26 +354,49 @@ impl DaemonState {
             }
             crate::daemon::ApiRequest::AddHttpUrl { url, filename } => {
                 let state = self.app.state.read().await.clone();
-                let filename = validate_download_filename(
-                    filename.unwrap_or_else(|| filename_from_url(&url)).trim(),
-                )?;
+                let uri_kind = classify_download_uri(&url)?;
+                if matches!(uri_kind, DownloadUriKind::HttpLike)
+                    && self
+                        .try_add_remote_torrent(&url, &state.default_download_dir)
+                        .await?
+                {
+                    self.perform_refresh().await?;
+                    return Ok(ApiReply {
+                        snapshot: self.snapshot().await,
+                        payload,
+                    });
+                }
+                let routing_name = match uri_kind {
+                    DownloadUriKind::Magnet => filename
+                        .clone()
+                        .or_else(|| magnet_display_name(&url))
+                        .unwrap_or_else(|| "torrent".into()),
+                    DownloadUriKind::HttpLike => {
+                        filename.clone().unwrap_or_else(|| filename_from_url(&url))
+                    }
+                };
                 let route = match_rule(
                     &state.default_download_dir,
                     &state.download_rules,
-                    &filename,
+                    &routing_name,
                 )?;
                 tokio::fs::create_dir_all(&route.resolved_directory).await?;
+                let options = match uri_kind {
+                    DownloadUriKind::Magnet => json!({
+                        "dir": route.resolved_directory.display().to_string(),
+                    }),
+                    DownloadUriKind::HttpLike => {
+                        let filename = validate_download_filename(
+                            filename.unwrap_or_else(|| filename_from_url(&url)).trim(),
+                        )?;
+                        json!({
+                            "dir": route.resolved_directory.display().to_string(),
+                            "out": filename,
+                        })
+                    }
+                };
                 let _: String = self
-                    .call(
-                        "aria2.addUri",
-                        vec![
-                            json!([url]),
-                            json!({
-                                "dir": route.resolved_directory.display().to_string(),
-                                "out": filename,
-                            }),
-                        ],
-                    )
+                    .call("aria2.addUri", vec![json!([url]), options])
                     .await?;
                 self.perform_refresh().await?;
             }
@@ -596,6 +639,16 @@ impl DaemonState {
             .map(|filename| validate_download_filename(&filename))
             .transpose()?
             .filter(|filename| filename != &url_filename);
+        let is_torrent = is_torrent_target(
+            Some(&url_filename),
+            remote_filename.as_deref(),
+            redirect_filename.as_deref(),
+            response.url().as_str(),
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+        );
 
         Ok(ResolvedHttpUrl {
             url: url.to_string(),
@@ -603,7 +656,77 @@ impl DaemonState {
             remote_filename,
             redirect_filename,
             final_url: Some(response.url().to_string()),
+            is_torrent,
         })
+    }
+
+    async fn try_add_remote_torrent(&self, url: &str, default_download_dir: &str) -> Result<bool> {
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Ok(false);
+        }
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .timeout(Duration::from_secs(
+                self.app.config.daemon.rpc_request_timeout_secs.max(2),
+            ))
+            .build()?;
+
+        let head = match client.head(url).send().await {
+            Ok(response)
+                if response.status() == StatusCode::METHOD_NOT_ALLOWED
+                    || response.status() == StatusCode::NOT_IMPLEMENTED =>
+            {
+                None
+            }
+            Ok(response) => Some(response),
+            Err(_) => None,
+        };
+
+        let should_treat_as_torrent = if let Some(response) = head.as_ref() {
+            let url_filename = filename_from_url(url);
+            let redirect_filename = filename_from_final_url(response.url().as_str());
+            let remote_filename = filename_from_content_disposition(response);
+            is_torrent_target(
+                Some(&url_filename),
+                remote_filename.as_deref(),
+                redirect_filename.as_deref(),
+                response.url().as_str(),
+                response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+            )
+        } else {
+            is_torrent_name(url)
+        };
+
+        if !should_treat_as_torrent {
+            return Ok(false);
+        }
+
+        let torrent_bytes = client
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+        let torrent = STANDARD.encode(torrent_bytes);
+        let download_dir = expand_tilde(default_download_dir);
+        tokio::fs::create_dir_all(&download_dir).await?;
+        let _: String = self
+            .call(
+                "aria2.addTorrent",
+                vec![
+                    json!(torrent),
+                    json!([]),
+                    json!({
+                        "dir": download_dir.display().to_string(),
+                    }),
+                ],
+            )
+            .await?;
+        Ok(true)
     }
 
     async fn cancel_download(&self, gid: &str, delete_files: bool) -> Result<()> {
@@ -623,6 +746,10 @@ impl DaemonState {
                             "connections",
                             "errorCode",
                             "errorMessage",
+                            "infoHash",
+                            "numSeeders",
+                            "followedBy",
+                            "belongsTo",
                             "files"
                         ]),
                     ],
@@ -710,6 +837,7 @@ fn map_status(status: Aria2Status) -> DownloadItem {
     } else {
         None
     };
+    let bittorrent_name = bittorrent_name(status._bittorrent.as_ref());
     let primary_path = status
         .files
         .as_ref()
@@ -718,12 +846,23 @@ fn map_status(status: Aria2Status) -> DownloadItem {
         .files
         .as_ref()
         .and_then(|files| files.iter().find_map(preferred_uri));
-    let name = primary_path
-        .as_deref()
-        .and_then(|path| {
-            PathBuf::from(path)
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
+    let torrent_source_uri = status
+        .info_hash
+        .as_ref()
+        .map(|info_hash| format!("magnet:?xt=urn:btih:{info_hash}"));
+    let followed_by = status.followed_by.unwrap_or_default();
+    let is_metadata_only = total_bytes == 0
+        && !followed_by.is_empty()
+        && source_uri
+            .as_deref()
+            .is_some_and(|uri| uri.starts_with("magnet:"));
+    let name = bittorrent_name
+        .or_else(|| {
+            primary_path.as_deref().and_then(|path| {
+                PathBuf::from(path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+            })
         })
         .unwrap_or_else(|| source_uri.clone().unwrap_or_else(|| status.gid.clone()));
 
@@ -740,7 +879,12 @@ fn map_status(status: Aria2Status) -> DownloadItem {
         },
         name,
         primary_path,
-        source_uri,
+        source_uri: source_uri.or(torrent_source_uri),
+        info_hash: status.info_hash,
+        num_seeders: status.num_seeders.and_then(|v| v.parse().ok()),
+        followed_by,
+        belongs_to: status.belongs_to,
+        is_metadata_only,
         total_bytes,
         completed_bytes,
         download_speed_bps,
@@ -759,6 +903,16 @@ fn preferred_uri(file: &Aria2File) -> Option<String> {
         .find(|uri| uri.status == "used")
         .or_else(|| file.uris.as_ref()?.first())
         .map(|uri| uri.uri.clone())
+}
+
+fn bittorrent_name(value: Option<&Value>) -> Option<String> {
+    value?
+        .get("info")?
+        .get("name")?
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
 }
 
 fn filename_from_url(url: &str) -> String {
@@ -807,6 +961,45 @@ fn extract_filename_from_content_disposition(header: &str) -> Option<String> {
     None
 }
 
+fn is_torrent_name(value: &str) -> bool {
+    let path = if let Ok(url) = reqwest::Url::parse(value) {
+        url.path().to_string()
+    } else {
+        value.to_string()
+    };
+    Path::new(&path)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("torrent"))
+}
+
+fn is_torrent_target(
+    url_filename: Option<&str>,
+    remote_filename: Option<&str>,
+    redirect_filename: Option<&str>,
+    final_url: &str,
+    content_type: Option<&str>,
+) -> bool {
+    url_filename.is_some_and(is_torrent_name)
+        || remote_filename.is_some_and(is_torrent_name)
+        || redirect_filename.is_some_and(is_torrent_name)
+        || is_torrent_name(final_url)
+        || content_type
+            .map(|value| value.to_ascii_lowercase())
+            .is_some_and(|value| {
+                value.contains("application/x-bittorrent")
+                    || value.contains("application/x-torrent")
+            })
+}
+
+fn expand_tilde(value: &str) -> PathBuf {
+    if let Some(stripped) = value.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(stripped);
+        }
+    }
+    PathBuf::from(value)
+}
+
 fn validate_download_filename(input: &str) -> Result<String> {
     let filename = input.trim();
     if filename.is_empty() {
@@ -842,6 +1035,12 @@ async fn delete_paths(files: Vec<Aria2File>) -> Vec<String> {
 }
 
 fn is_notable_terminal_event(item: &DownloadItem) -> bool {
+    if item.is_metadata_only {
+        return false;
+    }
+    if item.total_bytes.max(item.completed_bytes) < WEBHOOK_MIN_BYTES {
+        return false;
+    }
     matches!(
         item.status,
         DownloadStatus::Complete | DownloadStatus::Error | DownloadStatus::Removed

@@ -60,6 +60,8 @@ pub async fn spawn_aria2(
             expand_tilde(&config.daemon.download_dir).display()
         ))
         .arg("--continue=true")
+        .arg("--rpc-save-upload-metadata=true")
+        .arg("--bt-save-metadata=true")
         .arg(format!(
             "--max-download-result={}",
             config.daemon.stopped_history_limit
