@@ -2,22 +2,23 @@ use ratatui::{
     style::{Color, Style},
     widgets::{Block, Borders},
 };
-use tui_textarea::TextArea;
+
+use crate::tui::input::InputField;
 
 #[derive(Debug)]
 pub struct AddUrlForm {
-    pub input: TextArea<'static>,
+    pub input: InputField,
 }
 
 impl AddUrlForm {
     pub fn new() -> Self {
-        let mut input = TextArea::default();
+        let mut input = InputField::new();
         input.set_placeholder_text("https://example.com/file.iso");
         Self { input }
     }
 
     pub fn value(&self) -> String {
-        self.input.lines().join("\n").trim().to_string()
+        self.input.value().to_string()
     }
 }
 
@@ -44,19 +45,19 @@ impl Default for CancelForm {
 
 #[derive(Debug)]
 pub struct SpeedForm {
-    pub input: TextArea<'static>,
+    pub input: InputField,
 }
 
 impl SpeedForm {
     pub fn new(initial: &str) -> Self {
-        let mut input = TextArea::default();
+        let mut input = InputField::new();
         input.insert_str(initial);
         input.set_block(field_block("Limit", true));
         Self { input }
     }
 
     pub fn value(&self) -> String {
-        self.input.lines().join("\n").trim().to_string()
+        self.input.value().to_string()
     }
 }
 
@@ -68,17 +69,17 @@ pub enum RoutingField {
 
 #[derive(Debug)]
 pub struct RoutingRuleForm {
-    pub pattern: TextArea<'static>,
-    pub directory: TextArea<'static>,
+    pub pattern: InputField,
+    pub directory: InputField,
     pub focus: RoutingField,
 }
 
 impl RoutingRuleForm {
     pub fn new(pattern: &str, directory: &str) -> Self {
-        let mut pattern_input = TextArea::default();
+        let mut pattern_input = InputField::new();
         pattern_input.insert_str(pattern);
 
-        let mut directory_input = TextArea::default();
+        let mut directory_input = InputField::new();
         directory_input.insert_str(directory);
 
         let mut form = Self {
@@ -92,8 +93,8 @@ impl RoutingRuleForm {
 
     pub fn values(&self) -> (String, String) {
         (
-            self.pattern.lines().join("\n").trim().to_string(),
-            self.directory.lines().join("\n").trim().to_string(),
+            self.pattern.value().to_string(),
+            self.directory.value().to_string(),
         )
     }
 
@@ -109,7 +110,7 @@ impl RoutingRuleForm {
         self.next_focus();
     }
 
-    pub fn active_input(&mut self) -> &mut TextArea<'static> {
+    pub fn active_input(&mut self) -> &mut InputField {
         match self.focus {
             RoutingField::Pattern => &mut self.pattern,
             RoutingField::Directory => &mut self.directory,
@@ -137,21 +138,21 @@ pub enum RangeField {
 
 #[derive(Debug)]
 pub struct RangeForm {
-    pub start: TextArea<'static>,
-    pub end: TextArea<'static>,
-    pub limit: TextArea<'static>,
+    pub start: InputField,
+    pub end: InputField,
+    pub limit: InputField,
     pub focus: RangeField,
 }
 
 impl RangeForm {
     pub fn new(start_hour: usize, end_hour: usize, limit: &str) -> Self {
-        let mut start = TextArea::default();
+        let mut start = InputField::new();
         start.insert_str(format!("{start_hour:02}"));
 
-        let mut end = TextArea::default();
+        let mut end = InputField::new();
         end.insert_str(format!("{end_hour:02}"));
 
-        let mut limit_input = TextArea::default();
+        let mut limit_input = InputField::new();
         limit_input.insert_str(limit);
 
         let mut form = Self {
@@ -166,9 +167,9 @@ impl RangeForm {
 
     pub fn values(&self) -> (String, String, String) {
         (
-            self.start.lines().join("\n").trim().to_string(),
-            self.end.lines().join("\n").trim().to_string(),
-            self.limit.lines().join("\n").trim().to_string(),
+            self.start.value().to_string(),
+            self.end.value().to_string(),
+            self.limit.value().to_string(),
         )
     }
 
@@ -190,7 +191,7 @@ impl RangeForm {
         self.update_blocks();
     }
 
-    pub fn active_input(&mut self) -> &mut TextArea<'static> {
+    pub fn active_input(&mut self) -> &mut InputField {
         match self.focus {
             RangeField::Start => &mut self.start,
             RangeField::End => &mut self.end,

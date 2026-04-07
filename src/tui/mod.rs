@@ -3,6 +3,7 @@ pub mod draw;
 pub mod event;
 pub mod focus;
 pub mod forms;
+pub mod input;
 pub mod widgets;
 
 use std::sync::Arc;

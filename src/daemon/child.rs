@@ -5,7 +5,7 @@ use std::{
 };
 
 use color_eyre::eyre::{Context, Result, bail};
-use rand::{Rng, distr::Alphanumeric};
+use rand::{RngExt, distr::Alphanumeric};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::{Child, Command},

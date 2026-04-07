@@ -7,7 +7,6 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
 };
-use tui_textarea::TextArea;
 
 use crate::{
     daemon::{ApiEnvelope, ApiRequest, ApiResponse, AppContext, DownloadItem, Snapshot},
@@ -21,6 +20,7 @@ use crate::{
             AddUrlForm, CancelChoice, CancelForm, RangeField, RangeForm, RoutingField,
             RoutingRuleForm, SpeedForm,
         },
+        input::InputField,
     },
     units,
 };
@@ -56,7 +56,7 @@ pub struct UiApp {
     pub history_index: usize,
     pub schedule_index: usize,
     pub routing_index: usize,
-    pub routing_test_input: TextArea<'static>,
+    pub routing_test_input: InputField,
     pub routing_test_editing: bool,
     pub modal: Option<ModalState>,
     next_request_id: u64,
@@ -92,7 +92,11 @@ impl UiApp {
     pub async fn run<B: ratatui::backend::Backend>(
         &mut self,
         terminal: &mut Terminal<B>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        <B as ratatui::backend::Backend>::Error:
+            std::error::Error + Send + Sync + 'static,
+    {
         let refresh = Duration::from_millis(self.app.config.ui.refresh_interval_ms);
         loop {
             terminal.draw(|frame| draw::draw(frame, self))?;
@@ -165,11 +169,7 @@ impl UiApp {
     }
 
     pub fn routing_test_value(&self) -> String {
-        self.routing_test_input
-            .lines()
-            .join("\n")
-            .trim()
-            .to_string()
+        self.routing_test_input.value().to_string()
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
@@ -719,8 +719,8 @@ fn parse_schedule_hour(input: &str, allow_24: bool) -> Result<usize> {
     Ok(hour)
 }
 
-fn routing_test_area(editing: bool) -> TextArea<'static> {
-    let mut input = TextArea::default();
+fn routing_test_area(editing: bool) -> InputField {
+    let mut input = InputField::new();
     input.set_placeholder_text("example-release.iso");
     let title = if editing {
         "Test Filename (editing)"

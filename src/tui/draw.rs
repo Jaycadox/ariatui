@@ -442,15 +442,15 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
             frame.render_widget(&form.end, layout[2]);
             frame.render_widget(&form.limit, layout[3]);
             frame.render_widget(
-                hour_status_paragraph(form.start.lines().join("\n").trim(), false),
+                hour_status_paragraph(form.start.value(), false),
                 layout[4],
             );
             frame.render_widget(
-                hour_status_paragraph(form.end.lines().join("\n").trim(), true),
+                hour_status_paragraph(form.end.value(), true),
                 layout[5],
             );
             frame.render_widget(
-                limit_status_paragraph(form.limit.lines().join("\n").trim()),
+                limit_status_paragraph(form.limit.value()),
                 layout[6],
             );
         }
