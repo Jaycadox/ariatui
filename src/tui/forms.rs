@@ -11,6 +11,11 @@ pub struct AddUrlForm {
     pub input: InputField,
 }
 
+#[derive(Debug)]
+pub struct SearchForm {
+    pub input: InputField,
+}
+
 impl AddUrlForm {
     pub fn new() -> Self {
         Self::with_value("")
@@ -22,6 +27,20 @@ impl AddUrlForm {
             input.insert_str(initial);
         }
         input.set_placeholder_text("https://example.com/file.iso or magnet:?...");
+        Self { input }
+    }
+
+    pub fn value(&self) -> String {
+        self.input.value().to_string()
+    }
+}
+
+impl SearchForm {
+    pub fn new(initial: &str) -> Self {
+        let mut input = InputField::new();
+        input.insert_str(initial);
+        input.set_placeholder_text("type to filter by name, gid, path, source...");
+        input.set_block(field_block("Search", true));
         Self { input }
     }
 

@@ -192,6 +192,13 @@ pub enum ApiRequest {
     RemoveHistory {
         gid: String,
     },
+    ChangePosition {
+        gid: String,
+        offset: i32,
+    },
+    PauseAll,
+    ResumeAll,
+    PurgeHistory,
     SetMode {
         mode: ManualOrScheduled,
     },

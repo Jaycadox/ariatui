@@ -423,6 +423,27 @@ impl DaemonState {
                     .await?;
                 self.perform_refresh().await?;
             }
+            crate::daemon::ApiRequest::ChangePosition { gid, offset } => {
+                let _: String = self
+                    .call(
+                        "aria2.changePosition",
+                        vec![json!(gid), json!(offset), json!("POS_CUR")],
+                    )
+                    .await?;
+                self.perform_refresh().await?;
+            }
+            crate::daemon::ApiRequest::PauseAll => {
+                let _: String = self.call("aria2.pauseAll", vec![]).await?;
+                self.perform_refresh().await?;
+            }
+            crate::daemon::ApiRequest::ResumeAll => {
+                let _: String = self.call("aria2.unpauseAll", vec![]).await?;
+                self.perform_refresh().await?;
+            }
+            crate::daemon::ApiRequest::PurgeHistory => {
+                let _: String = self.call("aria2.purgeDownloadResult", vec![]).await?;
+                self.perform_refresh().await?;
+            }
             crate::daemon::ApiRequest::SetMode { mode } => {
                 let mut state = self.app.state.write().await;
                 state.mode = mode;

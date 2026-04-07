@@ -21,6 +21,10 @@ use crate::{
         snapshot::SchedulerSnapshot,
     },
     download_uri::is_http_like_uri,
+    list_view::{
+        CurrentFilter, CurrentSort, HistoryFilter, HistorySort, current_visible_items,
+        history_visible_items,
+    },
     routing::{DownloadRoutingRule, describe_directory_input, match_rule, validate_rule},
     state::{CancelBehaviorPreference, ManualOrScheduled},
     units::{self, Percentage, format_bytes, format_bytes_per_sec, format_eta, format_limit},
@@ -38,9 +42,13 @@ pub fn router(state: SharedDaemonState) -> Router {
         .route("/login/status", get(login_status))
         .route("/logout", post(logout))
         .route("/current", get(current_page))
+        .route("/current/pause-all", post(pause_all_downloads))
+        .route("/current/resume-all", post(resume_all_downloads))
         .route("/current/add", get(add_url_page))
         .route("/current/add/resolve", post(add_url_resolve))
         .route("/current/add/confirm", post(add_url_confirm))
+        .route("/current/{gid}/move/up", post(move_download_up))
+        .route("/current/{gid}/move/down", post(move_download_down))
         .route("/current/{gid}/pause", post(pause_download))
         .route("/current/{gid}/resume", post(resume_download))
         .route(
@@ -48,6 +56,7 @@ pub fn router(state: SharedDaemonState) -> Router {
             get(cancel_page).post(cancel_submit),
         )
         .route("/history", get(history_page))
+        .route("/history/purge", post(purge_history))
         .route("/history/{gid}/remove", post(remove_history))
         .route("/scheduler", get(scheduler_page))
         .route(
@@ -125,6 +134,9 @@ impl WebTab {
 struct ItemQuery {
     selected: Option<String>,
     test: Option<String>,
+    search: Option<String>,
+    filter: Option<String>,
+    sort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,6 +210,44 @@ struct RulePath {
 #[derive(Debug, Serialize)]
 struct LoginStatusBody {
     status: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct CurrentListQuery {
+    selected: Option<String>,
+    search: String,
+    filter: CurrentFilter,
+    sort: CurrentSort,
+}
+
+impl CurrentListQuery {
+    fn from_query(query: &ItemQuery) -> Self {
+        Self {
+            selected: query.selected.clone(),
+            search: query.search.clone().unwrap_or_default().trim().to_string(),
+            filter: CurrentFilter::from_query(query.filter.as_deref().unwrap_or_default()),
+            sort: CurrentSort::from_query(query.sort.as_deref().unwrap_or_default()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HistoryListQuery {
+    selected: Option<String>,
+    search: String,
+    filter: HistoryFilter,
+    sort: HistorySort,
+}
+
+impl HistoryListQuery {
+    fn from_query(query: &ItemQuery) -> Self {
+        Self {
+            selected: query.selected.clone(),
+            search: query.search.clone().unwrap_or_default().trim().to_string(),
+            filter: HistoryFilter::from_query(query.filter.as_deref().unwrap_or_default()),
+            sort: HistorySort::from_query(query.sort.as_deref().unwrap_or_default()),
+        }
+    }
 }
 
 async fn root(State(state): State<SharedDaemonState>, jar: CookieJar) -> Response {
@@ -302,14 +352,32 @@ async fn current_page(
         return response;
     }
     let snapshot = state.snapshot().await;
-    Html(render_current_page(
-        &snapshot,
-        query.selected.as_deref(),
-        None,
-        None,
-        true,
-    ))
-    .into_response()
+    let list = CurrentListQuery::from_query(&query);
+    Html(render_current_page(&snapshot, &list, None, None, true)).into_response()
+}
+
+async fn pause_all_downloads(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Query(query): Query<ItemQuery>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let _ = state.execute(ApiRequest::PauseAll).await;
+    Redirect::to(&current_path(&query)).into_response()
+}
+
+async fn resume_all_downloads(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Query(query): Query<ItemQuery>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let _ = state.execute(ApiRequest::ResumeAll).await;
+    Redirect::to(&current_path(&query)).into_response()
 }
 
 async fn add_url_page(State(state): State<SharedDaemonState>, jar: CookieJar) -> Response {
@@ -481,24 +549,56 @@ async fn pause_download(
     State(state): State<SharedDaemonState>,
     jar: CookieJar,
     Path(gid): Path<String>,
+    Query(query): Query<ItemQuery>,
 ) -> Response {
     if let Some(response) = auth_redirect(&state, &jar).await {
         return response;
     }
     let _ = state.execute(ApiRequest::Pause { gid, force: true }).await;
-    Redirect::to("/current").into_response()
+    Redirect::to(&current_path(&query)).into_response()
 }
 
 async fn resume_download(
     State(state): State<SharedDaemonState>,
     jar: CookieJar,
     Path(gid): Path<String>,
+    Query(query): Query<ItemQuery>,
 ) -> Response {
     if let Some(response) = auth_redirect(&state, &jar).await {
         return response;
     }
     let _ = state.execute(ApiRequest::Resume { gid }).await;
-    Redirect::to("/current").into_response()
+    Redirect::to(&current_path(&query)).into_response()
+}
+
+async fn move_download_up(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Path(gid): Path<String>,
+    Query(query): Query<ItemQuery>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let _ = state
+        .execute(ApiRequest::ChangePosition { gid, offset: -1 })
+        .await;
+    Redirect::to(&current_path(&query)).into_response()
+}
+
+async fn move_download_down(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Path(gid): Path<String>,
+    Query(query): Query<ItemQuery>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let _ = state
+        .execute(ApiRequest::ChangePosition { gid, offset: 1 })
+        .await;
+    Redirect::to(&current_path(&query)).into_response()
 }
 
 async fn cancel_page(
@@ -517,6 +617,7 @@ async fn cancel_submit(
     State(state): State<SharedDaemonState>,
     jar: CookieJar,
     Path(gid): Path<String>,
+    Query(query): Query<ItemQuery>,
     Form(form): Form<CancelFormData>,
 ) -> Response {
     if let Some(response) = auth_redirect(&state, &jar).await {
@@ -543,7 +644,7 @@ async fn cancel_submit(
         })
         .await
     {
-        Ok(_) => Redirect::to("/current").into_response(),
+        Ok(_) => Redirect::to(&current_path(&query)).into_response(),
         Err(error) => {
             Html(render_cancel_page(&snapshot, "", Some(&error.to_string()))).into_response()
         }
@@ -559,19 +660,33 @@ async fn history_page(
         return response;
     }
     let snapshot = state.snapshot().await;
-    Html(render_history_page(&snapshot, query.selected.as_deref())).into_response()
+    let list = HistoryListQuery::from_query(&query);
+    Html(render_history_page(&snapshot, &list)).into_response()
 }
 
 async fn remove_history(
     State(state): State<SharedDaemonState>,
     jar: CookieJar,
     Path(gid): Path<String>,
+    Query(query): Query<ItemQuery>,
 ) -> Response {
     if let Some(response) = auth_redirect(&state, &jar).await {
         return response;
     }
     let _ = state.execute(ApiRequest::RemoveHistory { gid }).await;
-    Redirect::to("/history").into_response()
+    Redirect::to(&history_path(&query)).into_response()
+}
+
+async fn purge_history(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Query(query): Query<ItemQuery>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let _ = state.execute(ApiRequest::PurgeHistory).await;
+    Redirect::to(&history_path(&query)).into_response()
 }
 
 async fn scheduler_page(State(state): State<SharedDaemonState>, jar: CookieJar) -> Response {
@@ -1219,49 +1334,139 @@ fn render_header(snapshot: &Snapshot) -> String {
     )
 }
 
+fn selected_attr(selected: bool) -> &'static str {
+    if selected { "selected" } else { "" }
+}
+
+fn current_path(query: &ItemQuery) -> String {
+    let parsed = CurrentListQuery::from_query(query);
+    format!(
+        "/current{}",
+        current_query_suffix(
+            parsed.selected.as_deref(),
+            &parsed.search,
+            parsed.filter,
+            parsed.sort,
+        )
+    )
+}
+
+fn history_path(query: &ItemQuery) -> String {
+    let parsed = HistoryListQuery::from_query(query);
+    format!(
+        "/history{}",
+        history_query_suffix(
+            parsed.selected.as_deref(),
+            &parsed.search,
+            parsed.filter,
+            parsed.sort,
+        )
+    )
+}
+
+fn current_query_suffix(
+    selected_gid: Option<&str>,
+    search: &str,
+    filter: CurrentFilter,
+    sort: CurrentSort,
+) -> String {
+    query_suffix(&[
+        selected_gid.map(|value| ("selected", value.to_string())),
+        (!search.trim().is_empty()).then(|| ("search", search.trim().to_string())),
+        Some(("filter", filter.label().to_string())),
+        Some(("sort", sort.label().to_string())),
+    ])
+}
+
+fn history_query_suffix(
+    selected_gid: Option<&str>,
+    search: &str,
+    filter: HistoryFilter,
+    sort: HistorySort,
+) -> String {
+    query_suffix(&[
+        selected_gid.map(|value| ("selected", value.to_string())),
+        (!search.trim().is_empty()).then(|| ("search", search.trim().to_string())),
+        Some(("filter", filter.label().to_string())),
+        Some(("sort", sort.label().to_string())),
+    ])
+}
+
+fn query_suffix(entries: &[Option<(&str, String)>]) -> String {
+    let parts = entries
+        .iter()
+        .flatten()
+        .map(|(key, value)| format!("{key}={}", encode_query_value(value)))
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", parts.join("&"))
+    }
+}
+
+fn encode_query_value(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            let _ = write!(encoded, "%{:02X}", byte);
+        }
+    }
+    encoded
+}
+
 fn render_current_page(
     snapshot: &Snapshot,
-    selected_gid: Option<&str>,
+    query: &CurrentListQuery,
     message: Option<&str>,
     error: Option<&str>,
     auto_refresh: bool,
 ) -> String {
-    let selected = selected_gid
-        .and_then(|gid| {
-            snapshot
-                .current_downloads
-                .iter()
-                .find(|item| item.gid == gid)
-        })
-        .or_else(|| snapshot.current_downloads.first());
+    let visible = current_visible_items(
+        &snapshot.current_downloads,
+        &query.search,
+        query.filter,
+        query.sort,
+    );
+    let selected = query
+        .selected
+        .as_deref()
+        .and_then(|gid| visible.iter().copied().find(|item| item.gid == gid))
+        .or_else(|| visible.first().copied());
+    let selected_gid = selected.map(|item| item.gid.as_str());
     let mut rows = String::new();
-    for item in &snapshot.current_downloads {
+    for item in visible.iter().copied() {
         let selected_class = if Some(item.gid.as_str()) == selected_gid {
             "selected"
         } else {
             ""
         };
+        let item_query =
+            current_query_suffix(Some(&item.gid), &query.search, query.filter, query.sort);
         let actions = match item.status {
             DownloadStatus::Active => format!(
-                r#"<form method="post" action="/current/{}/pause"><button>Pause</button></form><a class="button danger" href="/current/{}/cancel">Cancel</a>"#,
-                esc(&item.gid),
-                esc(&item.gid)
+                r#"<form method="post" action="/current/{gid}/pause{query}"><button>Pause</button></form><a class="button danger" href="/current/{gid}/cancel{query}">Cancel</a>"#,
+                gid = esc(&item.gid),
+                query = esc(&item_query),
             ),
             DownloadStatus::Paused => format!(
-                r#"<form method="post" action="/current/{}/resume"><button>Resume</button></form><a class="button danger" href="/current/{}/cancel">Cancel</a>"#,
-                esc(&item.gid),
-                esc(&item.gid)
+                r#"<form method="post" action="/current/{gid}/resume{query}"><button>Resume</button></form><form method="post" action="/current/{gid}/move/up{query}"><button>Up</button></form><form method="post" action="/current/{gid}/move/down{query}"><button>Down</button></form><a class="button danger" href="/current/{gid}/cancel{query}">Cancel</a>"#,
+                gid = esc(&item.gid),
+                query = esc(&item_query),
             ),
             DownloadStatus::Waiting => format!(
-                r#"<a class="button danger" href="/current/{}/cancel">Cancel</a>"#,
-                esc(&item.gid)
+                r#"<form method="post" action="/current/{gid}/move/up{query}"><button>Up</button></form><form method="post" action="/current/{gid}/move/down{query}"><button>Down</button></form><a class="button danger" href="/current/{gid}/cancel{query}">Cancel</a>"#,
+                gid = esc(&item.gid),
+                query = esc(&item_query),
             ),
             _ => String::new(),
         };
         let _ = write!(
             rows,
             r#"<tr class="{selected_class}">
-<td><a href="/current?selected={}">{}</a></td>
+<td><a href="/current{}">{}</a></td>
 <td>{}</td>
 <td>{}</td>
 <td>{} / {}</td>
@@ -1270,7 +1475,12 @@ fn render_current_page(
 <td>{}</td>
 <td class="actions">{}</td>
 </tr>"#,
-            esc(&item.gid),
+            esc(&current_query_suffix(
+                Some(&item.gid),
+                &query.search,
+                query.filter,
+                query.sort,
+            )),
             esc(&status_label(&item.status)),
             esc(&item.name),
             esc(&progress_text(item)),
@@ -1290,18 +1500,58 @@ fn render_current_page(
     if let Some(error) = error {
         let _ = write!(body, "<p class=\"error\">{}</p>", esc(error));
     }
-    body.push_str(
-        r#"<div class="toolbar"><a class="button" href="/current/add">Add URI</a></div>"#,
+    let current_query = current_query_suffix(selected_gid, &query.search, query.filter, query.sort);
+    let _ = write!(
+        body,
+        r#"<div class="toolbar">
+<form method="get" action="/current" class="inline">
+<input type="text" name="search" value="{search}" placeholder="Search name, GID, path, source">
+<select name="filter">
+<option value="all" {filter_all}>All</option>
+<option value="active" {filter_active}>Active</option>
+<option value="waiting" {filter_waiting}>Waiting</option>
+<option value="paused" {filter_paused}>Paused</option>
+</select>
+<select name="sort">
+<option value="queue" {sort_queue}>Queue</option>
+<option value="name" {sort_name}>Name</option>
+<option value="progress" {sort_progress}>Progress</option>
+<option value="speed" {sort_speed}>Speed</option>
+<option value="eta" {sort_eta}>ETA</option>
+</select>
+<button type="submit">Apply</button>
+<a class="button" href="/current">Clear</a>
+</form>
+<form method="post" action="/current/pause-all{query}"><button>Pause all</button></form>
+<form method="post" action="/current/resume-all{query}"><button>Resume all</button></form>
+<a class="button" href="/current/add">Add URI</a>
+</div>
+<p class="muted">Visible {visible_count} of {total_count}. Up/Down reorder waiting or paused items.</p>"#,
+        search = esc(&query.search),
+        filter_all = selected_attr(query.filter == CurrentFilter::All),
+        filter_active = selected_attr(query.filter == CurrentFilter::Active),
+        filter_waiting = selected_attr(query.filter == CurrentFilter::Waiting),
+        filter_paused = selected_attr(query.filter == CurrentFilter::Paused),
+        sort_queue = selected_attr(query.sort == CurrentSort::Queue),
+        sort_name = selected_attr(query.sort == CurrentSort::Name),
+        sort_progress = selected_attr(query.sort == CurrentSort::Progress),
+        sort_speed = selected_attr(query.sort == CurrentSort::Speed),
+        sort_eta = selected_attr(query.sort == CurrentSort::Eta),
+        query = esc(&current_query),
+        visible_count = visible.len(),
+        total_count = snapshot.current_downloads.len(),
     );
     body.push_str("<div class=\"split\">");
     let _ = write!(
         body,
         r#"<section class="card">
 <h2>Current downloads</h2>
+<div class="table-wrap">
 <table>
 <thead><tr><th>Status</th><th>Name</th><th>Progress</th><th>Done/Total</th><th>Speed</th><th>ETA</th><th>GID</th><th>Actions</th></tr></thead>
 <tbody>{}</tbody>
 </table>
+</div>
 </section>"#,
         rows
     );
@@ -1412,49 +1662,92 @@ fn render_cancel_page(snapshot: &Snapshot, gid: &str, error: Option<&str>) -> St
     render_shell(snapshot, WebTab::Current, &body, false, "Cancel Download")
 }
 
-fn render_history_page(snapshot: &Snapshot, selected_gid: Option<&str>) -> String {
-    let selected = selected_gid
-        .and_then(|gid| {
-            snapshot
-                .history_downloads
-                .iter()
-                .find(|item| item.gid == gid)
-        })
-        .or_else(|| snapshot.history_downloads.first());
+fn render_history_page(snapshot: &Snapshot, query: &HistoryListQuery) -> String {
+    let visible = history_visible_items(
+        &snapshot.history_downloads,
+        &query.search,
+        query.filter,
+        query.sort,
+    );
+    let selected = query
+        .selected
+        .as_deref()
+        .and_then(|gid| visible.iter().copied().find(|item| item.gid == gid))
+        .or_else(|| visible.first().copied());
+    let selected_gid = selected.map(|item| item.gid.as_str());
     let mut rows = String::new();
-    for item in &snapshot.history_downloads {
+    for item in visible.iter().copied() {
+        let item_query =
+            history_query_suffix(Some(&item.gid), &query.search, query.filter, query.sort);
         let _ = write!(
             rows,
             r#"<tr>
-<td><a href="/history?selected={}">{}</a></td>
+<td><a href="/history{}">{}</a></td>
 <td>{}</td>
 <td>{}</td>
 <td>{}</td>
 <td>{}</td>
-<td><form method="post" action="/history/{}/remove"><button>Forget</button></form></td>
+<td><form method="post" action="/history/{}/remove{}"><button>Forget</button></form></td>
 </tr>"#,
-            esc(&item.gid),
+            esc(&item_query),
             esc(&status_label(&item.status)),
             esc(&item.name),
             esc(&format_bytes(item.total_bytes)),
             esc(item.error_code.as_deref().unwrap_or("-")),
             esc(&item.gid),
             esc(&item.gid),
+            esc(&item_query),
         );
     }
+    let history_query = history_query_suffix(selected_gid, &query.search, query.filter, query.sort);
     let body = format!(
-        r#"<div class="split">
+        r#"<div class="toolbar">
+<form method="get" action="/history" class="inline">
+<input type="text" name="search" value="{search}" placeholder="Search name, GID, path, source, error">
+<select name="filter">
+<option value="all" {filter_all}>All</option>
+<option value="complete" {filter_complete}>Complete</option>
+<option value="error" {filter_error}>Error</option>
+<option value="removed" {filter_removed}>Removed</option>
+</select>
+<select name="sort">
+<option value="recent" {sort_recent}>Recent</option>
+<option value="name" {sort_name}>Name</option>
+<option value="size" {sort_size}>Size</option>
+<option value="status" {sort_status}>Status</option>
+</select>
+<button type="submit">Apply</button>
+<a class="button" href="/history">Clear</a>
+</form>
+<form method="post" action="/history/purge{history_query}"><button class="danger">Clear history</button></form>
+</div>
+<p class="muted">Visible {visible_count} of {total_count} history items.</p>
+<div class="split">
 <section class="card">
 <h2>History</h2>
+<div class="table-wrap">
 <table>
 <thead><tr><th>Status</th><th>Name</th><th>Size</th><th>Error</th><th>GID</th><th>Action</th></tr></thead>
-<tbody>{}</tbody>
+<tbody>{rows}</tbody>
 </table>
+</div>
 </section>
-<aside class="card"><h2>Details</h2>{}</aside>
+<aside class="card"><h2>Details</h2>{details}</aside>
 </div>"#,
-        rows,
-        render_download_details(selected, &snapshot.scheduler)
+        search = esc(&query.search),
+        filter_all = selected_attr(query.filter == HistoryFilter::All),
+        filter_complete = selected_attr(query.filter == HistoryFilter::Complete),
+        filter_error = selected_attr(query.filter == HistoryFilter::Error),
+        filter_removed = selected_attr(query.filter == HistoryFilter::Removed),
+        sort_recent = selected_attr(query.sort == HistorySort::Recent),
+        sort_name = selected_attr(query.sort == HistorySort::Name),
+        sort_size = selected_attr(query.sort == HistorySort::Size),
+        sort_status = selected_attr(query.sort == HistorySort::Status),
+        history_query = esc(&history_query),
+        visible_count = visible.len(),
+        total_count = snapshot.history_downloads.len(),
+        rows = rows,
+        details = render_download_details(selected, &snapshot.scheduler)
     );
     render_shell(snapshot, WebTab::History, &body, true, "History")
 }
@@ -2040,6 +2333,7 @@ body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; ba
 .stack { display: flex; flex-direction: column; gap: 0.6rem; }
 .inline, .actions { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
 .toolbar { margin-bottom: 0.75rem; }
+.table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; }
 th, td { border-bottom: 1px solid #333; padding: 0.45rem; text-align: left; vertical-align: top; }
 input, select { width: 100%; box-sizing: border-box; background: #0f0f0f; color: #eee; border: 1px solid #555; padding: 0.45rem; }

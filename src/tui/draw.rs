@@ -117,9 +117,27 @@ fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
 
 fn draw_current(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
     let layout = split_main(area, app.show_details);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(8)])
+        .split(layout[0]);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "search: {}  filter: {}  sort: {}  visible: {}",
+            if app.current_search.is_empty() {
+                "-".into()
+            } else {
+                app.current_search.clone()
+            },
+            app.current_filter.label(),
+            app.current_sort.label(),
+            app.current_visible_items().len()
+        ))
+        .block(bordered("Current View")),
+        left[0],
+    );
     let rows = app
-        .snapshot
-        .current_downloads
+        .current_visible_items()
         .iter()
         .enumerate()
         .map(|(idx, item)| row_from_download(idx == app.current_index, item))
@@ -148,7 +166,7 @@ fn draw_current(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
         "GID",
     ]))
     .block(bordered("Current"));
-    frame.render_widget(table, layout[0]);
+    frame.render_widget(table, left[1]);
 
     if app.show_details {
         frame.render_widget(
@@ -160,9 +178,27 @@ fn draw_current(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
 
 fn draw_history(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
     let layout = split_main(area, app.show_details);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(8)])
+        .split(layout[0]);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "search: {}  filter: {}  sort: {}  visible: {}",
+            if app.history_search.is_empty() {
+                "-".into()
+            } else {
+                app.history_search.clone()
+            },
+            app.history_filter.label(),
+            app.history_sort.label(),
+            app.history_visible_items().len()
+        ))
+        .block(bordered("History View")),
+        left[0],
+    );
     let rows = app
-        .snapshot
-        .history_downloads
+        .history_visible_items()
         .iter()
         .enumerate()
         .map(|(idx, item)| {
@@ -193,7 +229,7 @@ fn draw_history(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
     )
     .header(Row::new(vec!["Status", "Name", "Size", "Error", "GID"]))
     .block(bordered("History"));
-    frame.render_widget(table, layout[0]);
+    frame.render_widget(table, left[1]);
     if app.show_details {
         frame.render_widget(
             details_paragraph(app.history_selected(), &app.snapshot.scheduler),
@@ -451,9 +487,11 @@ fn draw_web_ui(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
     let text = match app.tab {
         TabKind::Current => {
-            "q quit  Tab switch  arrows/vim move  a add  p pause  r resume  c cancel  Enter details"
+            "q quit  arrows/vim move  / search  f filter  s sort  a add  p/r single  P/R all  J/K reorder waiting  c cancel  Enter details"
         }
-        TabKind::History => "q quit  Tab switch  arrows/vim move  x forget result  Enter details",
+        TabKind::History => {
+            "q quit  arrows/vim move  / search  f filter  s sort  x forget selected  X clear history  Enter details"
+        }
         TabKind::Scheduler => {
             "q quit  arrows/vim select  m/Space mode  Enter/e edit  r new range  d/u clear range  manual/usual support: 10M, 10 mb/s, 1 kbps, unlimited"
         }
@@ -482,6 +520,21 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
                 .style(Style::default().bg(Color::Black))
                 .wrap(Wrap { trim: false });
             frame.render_widget(widget, popup);
+            frame.render_widget(&form.input, popup);
+        }
+        ModalState::Search { form, tab } => {
+            let title = match tab {
+                TabKind::Current => "Search Current",
+                TabKind::History => "Search History",
+                _ => "Search",
+            };
+            frame.render_widget(
+                Paragraph::new("Type a search query and press Enter to apply it. Leave it empty to clear the search.")
+                    .block(bordered(title))
+                    .style(Style::default().bg(Color::Black))
+                    .wrap(Wrap { trim: false }),
+                popup,
+            );
             frame.render_widget(&form.input, popup);
         }
         ModalState::ChooseFilename(form) => {

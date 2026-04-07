@@ -14,6 +14,10 @@ use crate::{
         ResolvedHttpUrl, Snapshot,
     },
     download_uri::{classify_download_uri, is_http_like_uri},
+    list_view::{
+        CurrentFilter, CurrentSort, HistoryFilter, HistorySort, current_visible_items,
+        history_visible_items,
+    },
     routing::{DownloadRoutingRule, validate_directory_input, validate_rule},
     state::{CancelBehaviorPreference, ManualOrScheduled},
     tui::{
@@ -22,7 +26,7 @@ use crate::{
         focus::TabKind,
         forms::{
             AddUrlForm, CancelChoice, CancelForm, FilenameChoice, FilenameChoiceForm, PinForm,
-            RangeField, RangeForm, RoutingField, RoutingRuleForm, SpeedForm, WebUiForm,
+            RangeField, RangeForm, RoutingField, RoutingRuleForm, SearchForm, SpeedForm, WebUiForm,
             WebhookForm,
         },
         input::InputField,
@@ -35,6 +39,10 @@ use crate::{
 #[derive(Debug)]
 pub enum ModalState {
     AddUrl(AddUrlForm),
+    Search {
+        form: SearchForm,
+        tab: TabKind,
+    },
     ChooseFilename(FilenameChoiceForm),
     Cancel(CancelForm),
     EditWebhooks(WebhookForm),
@@ -66,6 +74,12 @@ pub struct UiApp {
     pub show_details: bool,
     pub current_index: usize,
     pub history_index: usize,
+    pub current_search: String,
+    pub history_search: String,
+    pub current_filter: CurrentFilter,
+    pub history_filter: HistoryFilter,
+    pub current_sort: CurrentSort,
+    pub history_sort: HistorySort,
     pub schedule_index: usize,
     pub routing_index: usize,
     pub routing_test_input: InputField,
@@ -92,6 +106,12 @@ impl UiApp {
             tab: TabKind::Current,
             current_index: 0,
             history_index: 0,
+            current_search: String::new(),
+            history_search: String::new(),
+            current_filter: CurrentFilter::All,
+            history_filter: HistoryFilter::All,
+            current_sort: CurrentSort::Queue,
+            history_sort: HistorySort::Recent,
             schedule_index: 0,
             routing_index: 0,
             routing_test_input: routing_test_area(false),
@@ -124,11 +144,33 @@ impl UiApp {
     }
 
     pub fn current_selected(&self) -> Option<&DownloadItem> {
-        self.snapshot.current_downloads.get(self.current_index)
+        self.current_visible_items()
+            .get(self.current_index)
+            .copied()
     }
 
     pub fn history_selected(&self) -> Option<&DownloadItem> {
-        self.snapshot.history_downloads.get(self.history_index)
+        self.history_visible_items()
+            .get(self.history_index)
+            .copied()
+    }
+
+    pub fn current_visible_items(&self) -> Vec<&DownloadItem> {
+        current_visible_items(
+            &self.snapshot.current_downloads,
+            &self.current_search,
+            self.current_filter,
+            self.current_sort,
+        )
+    }
+
+    pub fn history_visible_items(&self) -> Vec<&DownloadItem> {
+        history_visible_items(
+            &self.snapshot.history_downloads,
+            &self.history_search,
+            self.history_filter,
+            self.history_sort,
+        )
     }
 
     pub fn scheduler_ranges(&self) -> Vec<ScheduleRange> {
@@ -204,6 +246,19 @@ impl UiApp {
         }
         match key.code {
             KeyCode::Char('q') => return Ok(true),
+            KeyCode::Char('/') => {
+                if matches!(self.tab, TabKind::Current | TabKind::History) {
+                    let initial = if self.tab == TabKind::Current {
+                        self.current_search.clone()
+                    } else {
+                        self.history_search.clone()
+                    };
+                    self.modal = Some(ModalState::Search {
+                        form: SearchForm::new(&initial),
+                        tab: self.tab,
+                    });
+                }
+            }
             KeyCode::Tab => self.tab = self.tab.next(),
             KeyCode::Left | KeyCode::Char('h') => self.tab = self.tab.previous(),
             KeyCode::Right | KeyCode::Char('l') => self.tab = self.tab.next(),
@@ -287,6 +342,11 @@ impl UiApp {
                     }
                 }
             }
+            KeyCode::Char('X') => {
+                if self.tab == TabKind::History {
+                    self.issue(ApiRequest::PurgeHistory).await?;
+                }
+            }
             KeyCode::Char('m') | KeyCode::Char(' ') => {
                 if self.tab == TabKind::Scheduler {
                     let next = match self.snapshot.scheduler.mode {
@@ -318,6 +378,24 @@ impl UiApp {
                     self.open_web_ui_editor();
                 }
             }
+            KeyCode::Char('f') => {
+                if self.tab == TabKind::Current {
+                    self.current_filter = self.current_filter.cycle();
+                    self.normalize_indices();
+                } else if self.tab == TabKind::History {
+                    self.history_filter = self.history_filter.cycle();
+                    self.normalize_indices();
+                }
+            }
+            KeyCode::Char('s') => {
+                if self.tab == TabKind::Current {
+                    self.current_sort = self.current_sort.cycle();
+                    self.normalize_indices();
+                } else if self.tab == TabKind::History {
+                    self.history_sort = self.history_sort.cycle();
+                    self.normalize_indices();
+                }
+            }
             KeyCode::Char('u') => {
                 if self.tab == TabKind::Scheduler {
                     if self.schedule_index == 0 {
@@ -339,13 +417,27 @@ impl UiApp {
                 }
             }
             KeyCode::Char('J') => {
-                if self.tab == TabKind::Routing {
+                if self.tab == TabKind::Current {
+                    self.move_selected_download(1).await?;
+                } else if self.tab == TabKind::Routing {
                     self.move_selected_rule(1).await?;
                 }
             }
             KeyCode::Char('K') => {
-                if self.tab == TabKind::Routing {
+                if self.tab == TabKind::Current {
+                    self.move_selected_download(-1).await?;
+                } else if self.tab == TabKind::Routing {
                     self.move_selected_rule(-1).await?;
+                }
+            }
+            KeyCode::Char('P') => {
+                if self.tab == TabKind::Current {
+                    self.issue(ApiRequest::PauseAll).await?;
+                }
+            }
+            KeyCode::Char('R') => {
+                if self.tab == TabKind::Current {
+                    self.issue(ApiRequest::ResumeAll).await?;
                 }
             }
             KeyCode::Char('t') => {
@@ -374,6 +466,22 @@ impl UiApp {
                             "URI must use http, https, ftp, sftp, or magnet".into(),
                         ));
                     }
+                }
+                _ => {
+                    form.input.input(key);
+                }
+            },
+            ModalState::Search { form, tab } => match key.code {
+                KeyCode::Esc => self.modal = None,
+                KeyCode::Enter => {
+                    let value = form.value();
+                    match tab {
+                        TabKind::Current => self.current_search = value,
+                        TabKind::History => self.history_search = value,
+                        _ => {}
+                    }
+                    self.normalize_indices();
+                    self.modal = None;
                 }
                 _ => {
                     form.input.input(key);
@@ -623,16 +731,14 @@ impl UiApp {
 
     fn move_selection(&mut self, delta: isize) {
         match self.tab {
-            TabKind::Current => move_index(
-                &mut self.current_index,
-                self.snapshot.current_downloads.len(),
-                delta,
-            ),
-            TabKind::History => move_index(
-                &mut self.history_index,
-                self.snapshot.history_downloads.len(),
-                delta,
-            ),
+            TabKind::Current => {
+                let len = self.current_visible_items().len();
+                move_index(&mut self.current_index, len, delta);
+            }
+            TabKind::History => {
+                let len = self.history_visible_items().len();
+                move_index(&mut self.history_index, len, delta);
+            }
             TabKind::Scheduler => {
                 let scheduler_items = self.scheduler_ranges().len() + 2;
                 move_index(&mut self.schedule_index, scheduler_items, delta);
@@ -710,16 +816,10 @@ impl UiApp {
 
     fn normalize_indices(&mut self) {
         let scheduler_items = self.scheduler_ranges().len() + 2;
-        move_index(
-            &mut self.current_index,
-            self.snapshot.current_downloads.len().max(1),
-            0,
-        );
-        move_index(
-            &mut self.history_index,
-            self.snapshot.history_downloads.len().max(1),
-            0,
-        );
+        let current_len = self.current_visible_items().len().max(1);
+        let history_len = self.history_visible_items().len().max(1);
+        move_index(&mut self.current_index, current_len, 0);
+        move_index(&mut self.history_index, history_len, 0);
         move_index(&mut self.schedule_index, scheduler_items, 0);
         let routing_len = self.routing_rules().len().max(1);
         move_index(&mut self.routing_index, routing_len, 0);
@@ -849,6 +949,23 @@ impl UiApp {
         .await?;
         self.routing_index = new_index;
         Ok(())
+    }
+
+    async fn move_selected_download(&mut self, delta: i32) -> Result<()> {
+        let Some(item) = self.current_selected() else {
+            return Ok(());
+        };
+        if !matches!(
+            item.status,
+            crate::daemon::DownloadStatus::Waiting | crate::daemon::DownloadStatus::Paused
+        ) {
+            return Ok(());
+        }
+        self.issue(ApiRequest::ChangePosition {
+            gid: item.gid.clone(),
+            offset: delta,
+        })
+        .await
     }
 
     async fn resolve_add_url(&mut self, url: String) -> Result<()> {
