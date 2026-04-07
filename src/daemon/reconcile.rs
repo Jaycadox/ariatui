@@ -216,6 +216,7 @@ impl DaemonState {
         snapshot.scheduler = SchedulerSnapshot {
             mode: state.mode,
             manual_limit_bps: state.manual_limit_bps()?,
+            usual_internet_speed_bps: state.usual_internet_speed_bps()?,
             schedule_limits_bps: resolved.schedule_limits_bps,
             effective_limit_bps: resolved.effective_limit_bps,
             current_hour: resolved.current_hour,
@@ -341,6 +342,13 @@ impl DaemonState {
             crate::daemon::ApiRequest::SetManualLimit { limit_bps } => {
                 let mut state = self.app.state.write().await;
                 state.manual_limit = units::format_limit(limit_bps);
+                state.save(&self.app.paths.state_file)?;
+                drop(state);
+                self.perform_refresh().await?;
+            }
+            crate::daemon::ApiRequest::SetUsualInternetSpeed { limit_bps } => {
+                let mut state = self.app.state.write().await;
+                state.usual_internet_speed = units::format_limit(limit_bps);
                 state.save(&self.app.paths.state_file)?;
                 drop(state);
                 self.perform_refresh().await?;

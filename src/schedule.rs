@@ -41,6 +41,7 @@ mod tests {
         let state = PersistedState {
             mode: ManualOrScheduled::Scheduled,
             manual_limit: "1M".into(),
+            usual_internet_speed: "unlimited".into(),
             remembered_cancel_behavior: Default::default(),
             schedule: (0..24).map(|i| format!("{}K", i + 1)).collect(),
             default_download_dir: "~/Downloads".into(),

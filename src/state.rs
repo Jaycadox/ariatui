@@ -31,6 +31,7 @@ pub enum CancelBehaviorPreference {
 pub struct PersistedState {
     pub mode: ManualOrScheduled,
     pub manual_limit: String,
+    pub usual_internet_speed: String,
     pub remembered_cancel_behavior: CancelBehaviorPreference,
     pub schedule: Vec<String>,
     pub default_download_dir: String,
@@ -42,6 +43,7 @@ impl Default for PersistedState {
         Self {
             mode: ManualOrScheduled::Manual,
             manual_limit: "unlimited".into(),
+            usual_internet_speed: "unlimited".into(),
             remembered_cancel_behavior: CancelBehaviorPreference::Ask,
             schedule: vec!["unlimited".into(); 24],
             default_download_dir: "~/Downloads".into(),
@@ -78,6 +80,10 @@ impl PersistedState {
         units::parse_limit(&self.manual_limit)
     }
 
+    pub fn usual_internet_speed_bps(&self) -> Result<Option<u64>> {
+        units::parse_limit(&self.usual_internet_speed)
+    }
+
     pub fn schedule_bps(&self) -> Result<[Option<u64>; 24]> {
         let parsed: Vec<Option<u64>> = self
             .schedule
@@ -94,6 +100,7 @@ impl PersistedState {
             bail!("schedule must contain exactly 24 entries");
         }
         self.manual_limit_bps()?;
+        self.usual_internet_speed_bps()?;
         self.schedule_bps()?;
         validate_rules(&self.default_download_dir, &self.download_rules)?;
         Ok(())

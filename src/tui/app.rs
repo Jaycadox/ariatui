@@ -34,6 +34,7 @@ pub enum ModalState {
     ChooseFilename(FilenameChoiceForm),
     Cancel(CancelForm),
     EditManual(SpeedForm),
+    EditUsualInternetSpeed(SpeedForm),
     EditRange(RangeForm),
     EditRoutingRule {
         form: RoutingRuleForm,
@@ -155,11 +156,11 @@ impl UiApp {
     }
 
     pub fn selected_schedule_range(&self) -> Option<ScheduleRange> {
-        if self.schedule_index == 0 {
+        if self.schedule_index < 2 {
             None
         } else {
             self.scheduler_ranges()
-                .get(self.schedule_index - 1)
+                .get(self.schedule_index - 2)
                 .cloned()
         }
     }
@@ -293,13 +294,16 @@ impl UiApp {
                     if self.schedule_index == 0 {
                         self.issue(ApiRequest::SetManualLimit { limit_bps: None })
                             .await?;
+                    } else if self.schedule_index == 1 {
+                        self.issue(ApiRequest::SetUsualInternetSpeed { limit_bps: None })
+                            .await?;
                     } else {
                         self.set_selected_range_limit(None).await?;
                     }
                 }
             }
             KeyCode::Char('d') => {
-                if self.tab == TabKind::Scheduler && self.schedule_index > 0 {
+                if self.tab == TabKind::Scheduler && self.schedule_index > 1 {
                     self.set_selected_range_limit(None).await?;
                 } else if self.tab == TabKind::Routing {
                     self.delete_selected_rule().await?;
@@ -417,6 +421,18 @@ impl UiApp {
                     form.input.input(key);
                 }
             },
+            ModalState::EditUsualInternetSpeed(form) => match key.code {
+                KeyCode::Esc => self.modal = None,
+                KeyCode::Enter => {
+                    let limit = units::parse_limit(&form.value())?;
+                    self.issue(ApiRequest::SetUsualInternetSpeed { limit_bps: limit })
+                        .await?;
+                    self.modal = None;
+                }
+                _ => {
+                    form.input.input(key);
+                }
+            },
             ModalState::EditRange(form) => match key.code {
                 KeyCode::Esc => self.modal = None,
                 KeyCode::Tab => form.next_focus(),
@@ -522,7 +538,7 @@ impl UiApp {
                 delta,
             ),
             TabKind::Scheduler => {
-                let scheduler_items = self.scheduler_ranges().len() + 1;
+                let scheduler_items = self.scheduler_ranges().len() + 2;
                 move_index(&mut self.schedule_index, scheduler_items, delta);
             }
             TabKind::Routing => {
@@ -596,7 +612,7 @@ impl UiApp {
     }
 
     fn normalize_indices(&mut self) {
-        let scheduler_items = self.scheduler_ranges().len() + 1;
+        let scheduler_items = self.scheduler_ranges().len() + 2;
         move_index(
             &mut self.current_index,
             self.snapshot.current_downloads.len().max(1),
@@ -616,6 +632,9 @@ impl UiApp {
         if self.schedule_index == 0 {
             let initial = units::format_limit(self.snapshot.scheduler.manual_limit_bps);
             self.modal = Some(ModalState::EditManual(SpeedForm::new(&initial)));
+        } else if self.schedule_index == 1 {
+            let initial = units::format_limit(self.snapshot.scheduler.usual_internet_speed_bps);
+            self.modal = Some(ModalState::EditUsualInternetSpeed(SpeedForm::new(&initial)));
         } else if let Some(range) = self.selected_schedule_range() {
             self.modal = Some(ModalState::EditRange(RangeForm::new(
                 range.start_hour,

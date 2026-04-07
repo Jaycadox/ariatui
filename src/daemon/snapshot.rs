@@ -54,6 +54,7 @@ pub struct Aria2ChildStatus {
 pub struct SchedulerSnapshot {
     pub mode: ManualOrScheduled,
     pub manual_limit_bps: Option<u64>,
+    pub usual_internet_speed_bps: Option<u64>,
     pub schedule_limits_bps: [Option<u64>; 24],
     pub effective_limit_bps: Option<u64>,
     pub current_hour: u8,
@@ -155,6 +156,9 @@ pub enum ApiRequest {
     SetManualLimit {
         limit_bps: Option<u64>,
     },
+    SetUsualInternetSpeed {
+        limit_bps: Option<u64>,
+    },
     SetSchedule {
         limits_bps: Vec<Option<u64>>,
     },
@@ -222,6 +226,7 @@ impl Snapshot {
             scheduler: SchedulerSnapshot {
                 mode: ManualOrScheduled::Manual,
                 manual_limit_bps: None,
+                usual_internet_speed_bps: None,
                 schedule_limits_bps: [None; 24],
                 effective_limit_bps: None,
                 current_hour: 0,
@@ -261,6 +266,7 @@ impl Default for SchedulerSnapshot {
         Self {
             mode: ManualOrScheduled::Manual,
             manual_limit_bps: None,
+            usual_internet_speed_bps: None,
             schedule_limits_bps: [None; 24],
             effective_limit_bps: None,
             current_hour: 0,

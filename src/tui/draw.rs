@@ -1,3 +1,4 @@
+use chrono::{Local, Timelike};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -8,7 +9,9 @@ use ratatui::{
 
 use crate::{
     daemon::{DownloadItem, DownloadStatus, Snapshot},
+    daemon::snapshot::SchedulerSnapshot,
     routing::{DownloadRoutingRule, describe_directory_input, match_rule, validate_rule},
+    state::ManualOrScheduled,
     tui::{
         app::{ModalState, ScheduleRange, UiApp},
         focus::TabKind,
@@ -144,7 +147,7 @@ fn draw_current(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
     frame.render_widget(table, layout[0]);
 
     if app.show_details {
-        frame.render_widget(details_paragraph(app.current_selected()), layout[1]);
+        frame.render_widget(details_paragraph(app.current_selected(), &app.snapshot.scheduler), layout[1]);
     }
 }
 
@@ -185,7 +188,7 @@ fn draw_history(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
     .block(bordered("History"));
     frame.render_widget(table, layout[0]);
     if app.show_details {
-        frame.render_widget(details_paragraph(app.history_selected()), layout[1]);
+        frame.render_widget(details_paragraph(app.history_selected(), &app.snapshot.scheduler), layout[1]);
     }
 }
 
@@ -195,21 +198,28 @@ fn draw_scheduler(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(6),
             Constraint::Length(11),
             Constraint::Min(8),
         ])
         .split(area);
     let summary = Paragraph::new(Text::from(vec![
         Line::from(format!(
-            "{}Mode: {:?}",
-            if app.schedule_index == 0 { "> " } else { "  " },
+            "  Mode: {:?}",
             app.snapshot.scheduler.mode
         )),
         Line::from(format!(
-            "{}Manual limit: {} | Effective: {}",
+            "{}Manual limit: {}",
             if app.schedule_index == 0 { "> " } else { "  " },
             format_limit(app.snapshot.scheduler.manual_limit_bps),
+        )),
+        Line::from(format!(
+            "{}Usual internet speed: {}",
+            if app.schedule_index == 1 { "> " } else { "  " },
+            format_limit(app.snapshot.scheduler.usual_internet_speed_bps),
+        )),
+        Line::from(format!(
+            "  Effective scheduler limit: {}",
             format_limit(app.snapshot.scheduler.effective_limit_bps)
         )),
     ]))
@@ -227,7 +237,7 @@ fn draw_scheduler(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
         .iter()
         .enumerate()
         .map(|(idx, range)| {
-            let style = if idx + 1 == app.schedule_index {
+            let style = if idx + 2 == app.schedule_index {
                 Style::default().bg(Color::DarkGray)
             } else {
                 Style::default()
@@ -345,7 +355,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
         }
         TabKind::History => "q quit  Tab switch  arrows/vim move  x forget result  Enter details",
         TabKind::Scheduler => {
-            "q quit  arrows/vim select  m/Space mode  Enter/e edit  r new range  d/u clear range  examples: 10M, 10 mb/s, 1 kbps, unlimited"
+            "q quit  arrows/vim select  m/Space mode  Enter/e edit  r new range  d/u clear range  manual/usual support: 10M, 10 mb/s, 1 kbps, unlimited"
         }
         TabKind::Routing => {
             "q quit  arrows/vim select  a add  Enter/e edit  d delete  J/K reorder  t edit tester"
@@ -482,6 +492,27 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
             frame.render_widget(
                 Paragraph::new("Set the manual limit. Accepted examples: 10M, 10 mb/s, 10mbps, 10mpbs, 1 kbps, unlimited.")
                     .block(bordered("Manual Limit"))
+                    .style(Style::default().bg(Color::Black))
+                    .wrap(Wrap { trim: false }),
+                popup,
+            );
+            frame.render_widget(&form.input, layout[1]);
+            frame.render_widget(limit_status_paragraph(&form.value()), layout[2]);
+        }
+        ModalState::EditUsualInternetSpeed(form) => {
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(4),
+                    Constraint::Length(3),
+                    Constraint::Length(2),
+                    Constraint::Min(1),
+                ])
+                .margin(1)
+                .split(popup);
+            frame.render_widget(
+                Paragraph::new("Set your usual real-world download speed. Scheduled ETA uses this as the ceiling for unlimited slots and any scheduled limit above it. Accepted examples: 10M, 10 mb/s, 1 kbps, unlimited.")
+                    .block(bordered("Usual Internet Speed"))
                     .style(Style::default().bg(Color::Black))
                     .wrap(Wrap { trim: false }),
                 popup,
@@ -660,7 +691,7 @@ fn status_label(status: &DownloadStatus) -> &'static str {
     }
 }
 
-fn details_paragraph(item: Option<&DownloadItem>) -> Paragraph<'static> {
+fn details_paragraph(item: Option<&DownloadItem>, scheduler: &SchedulerSnapshot) -> Paragraph<'static> {
     let body = if let Some(item) = item {
         vec![
             Line::from(format!("Name: {}", item.name)),
@@ -675,6 +706,10 @@ fn details_paragraph(item: Option<&DownloadItem>) -> Paragraph<'static> {
                 format_bytes_per_sec(item.download_speed_bps)
             )),
             Line::from(format!("ETA: {}", format_eta(item.eta_seconds))),
+            Line::from(format!(
+                "Scheduled ETA: {}",
+                format_eta(scheduled_eta_seconds(item, scheduler))
+            )),
             Line::from(format!(
                 "Path: {}",
                 item.primary_path.clone().unwrap_or_else(|| "-".into())
@@ -694,6 +729,116 @@ fn details_paragraph(item: Option<&DownloadItem>) -> Paragraph<'static> {
     Paragraph::new(Text::from(body))
         .block(bordered("Details"))
         .wrap(Wrap { trim: false })
+}
+
+fn scheduled_eta_seconds(item: &DownloadItem, scheduler: &SchedulerSnapshot) -> Option<u64> {
+    if scheduler.mode != ManualOrScheduled::Scheduled {
+        return None;
+    }
+
+    let remaining_bytes = item.total_bytes.checked_sub(item.completed_bytes)?;
+    if remaining_bytes == 0 {
+        return Some(0);
+    }
+    if item.download_speed_bps == 0 {
+        return None;
+    }
+
+    let current_cap = min_limit(
+        scheduler.effective_limit_bps,
+        scheduler.usual_internet_speed_bps,
+    );
+
+    let speed_model = match current_cap {
+        Some(limit) if limit > 0 => {
+            SpeedModel::Utilization((item.download_speed_bps as f64 / limit as f64).clamp(0.0, 1.0))
+        }
+        _ => SpeedModel::Observed(item.download_speed_bps),
+    };
+
+    let daily_capacity = scheduler
+        .schedule_limits_bps
+        .iter()
+        .map(|limit| {
+            estimated_slot_speed_bps(
+                speed_model,
+                item.download_speed_bps,
+                min_limit(*limit, scheduler.usual_internet_speed_bps),
+            ) * 3600
+        })
+        .sum::<u64>();
+    if daily_capacity == 0 {
+        return None;
+    }
+
+    let now = Local::now();
+    let mut hour = now.hour() as usize;
+    let mut elapsed_seconds = 0u64;
+    let mut remaining = remaining_bytes as f64;
+    let seconds_past_hour = now.minute() as u64 * 60 + now.second() as u64;
+    let first_slot_seconds = (3600 - seconds_past_hour).max(1);
+
+    for step in 0..(24 * 365) {
+        let slot_seconds = if step == 0 { first_slot_seconds } else { 3600 };
+        let slot_speed =
+            estimated_slot_speed_bps(
+                speed_model,
+                item.download_speed_bps,
+                min_limit(
+                    scheduler.schedule_limits_bps[hour],
+                    scheduler.usual_internet_speed_bps,
+                ),
+            );
+        if slot_speed > 0 {
+            let slot_capacity = slot_speed as f64 * slot_seconds as f64;
+            if slot_capacity >= remaining {
+                return Some(elapsed_seconds + (remaining / slot_speed as f64).ceil() as u64);
+            }
+            remaining -= slot_capacity;
+        }
+        elapsed_seconds += slot_seconds;
+        hour = (hour + 1) % 24;
+    }
+
+    None
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SpeedModel {
+    Utilization(f64),
+    Observed(u64),
+}
+
+fn estimated_slot_speed_bps(
+    model: SpeedModel,
+    current_speed_bps: u64,
+    scheduled_limit_bps: Option<u64>,
+) -> u64 {
+    match model {
+        SpeedModel::Utilization(ratio) => {
+            if ratio <= 0.0 {
+                0
+            } else {
+                match scheduled_limit_bps {
+                    Some(limit) => ((limit as f64 * ratio).round() as u64).max(1),
+                    None => current_speed_bps,
+                }
+            }
+        }
+        SpeedModel::Observed(speed) => match scheduled_limit_bps {
+            Some(limit) => speed.min(limit),
+            None => speed,
+        },
+    }
+}
+
+fn min_limit(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
