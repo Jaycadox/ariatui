@@ -386,8 +386,8 @@ impl UiApp {
             },
             ModalState::EditRange(form) => match key.code {
                 KeyCode::Esc => self.modal = None,
-                KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => form.next_focus(),
-                KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => form.previous_focus(),
+                KeyCode::Tab => form.next_focus(),
+                KeyCode::BackTab => form.previous_focus(),
                 KeyCode::Enter => {
                     if form.focus != RangeField::Limit {
                         form.next_focus();
@@ -418,8 +418,8 @@ impl UiApp {
                 fallback,
             } => match key.code {
                 KeyCode::Esc => self.modal = None,
-                KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => form.next_focus(),
-                KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => form.previous_focus(),
+                KeyCode::Tab => form.next_focus(),
+                KeyCode::BackTab => form.previous_focus(),
                 KeyCode::Enter => {
                     if form.focus != RoutingField::Directory {
                         form.next_focus();

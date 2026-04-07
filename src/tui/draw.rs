@@ -432,7 +432,7 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
                 .margin(1)
                 .split(popup);
             frame.render_widget(
-                Paragraph::new("Set an inclusive start hour and exclusive end hour. Tab or Left/Right changes fields. Enter commits from the Limit field. Limit examples: 10M, 10 mb/s, 10mbps, 1 kbps, unlimited.")
+                Paragraph::new("Set an inclusive start hour and exclusive end hour. Tab or Shift-Tab changes fields. Arrow keys move inside the active text field. Enter commits from the Limit field. Limit examples: 10M, 10 mb/s, 10mbps, 1 kbps, unlimited.")
                     .block(bordered("Range Editor"))
                     .style(Style::default().bg(Color::Black))
                     .wrap(Wrap { trim: false }),
