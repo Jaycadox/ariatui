@@ -12,13 +12,85 @@ pub struct AddUrlForm {
 
 impl AddUrlForm {
     pub fn new() -> Self {
+        Self::with_value("")
+    }
+
+    pub fn with_value(initial: &str) -> Self {
         let mut input = InputField::new();
+        if !initial.is_empty() {
+            input.insert_str(initial);
+        }
         input.set_placeholder_text("https://example.com/file.iso");
         Self { input }
     }
 
     pub fn value(&self) -> String {
         self.input.value().to_string()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilenameChoice {
+    Url,
+    Remote,
+    Custom,
+}
+
+#[derive(Debug)]
+pub struct FilenameChoiceForm {
+    pub url: String,
+    pub url_filename: String,
+    pub remote_filename: String,
+    pub remote_label: String,
+    pub custom: InputField,
+    pub selection: FilenameChoice,
+}
+
+impl FilenameChoiceForm {
+    pub fn new(url: &str, url_filename: &str, remote_label: &str, remote_filename: &str) -> Self {
+        let mut custom = InputField::new();
+        custom.insert_str(remote_filename);
+        custom.set_placeholder_text("custom-file-name.bin");
+        custom.set_block(field_block("Custom Name", false));
+        Self {
+            url: url.to_string(),
+            url_filename: url_filename.to_string(),
+            remote_filename: remote_filename.to_string(),
+            remote_label: remote_label.to_string(),
+            custom,
+            selection: FilenameChoice::Remote,
+        }
+    }
+
+    pub fn next_selection(&mut self) {
+        self.selection = match self.selection {
+            FilenameChoice::Url => FilenameChoice::Remote,
+            FilenameChoice::Remote => FilenameChoice::Custom,
+            FilenameChoice::Custom => FilenameChoice::Url,
+        };
+        self.update_block();
+    }
+
+    pub fn previous_selection(&mut self) {
+        self.selection = match self.selection {
+            FilenameChoice::Url => FilenameChoice::Custom,
+            FilenameChoice::Remote => FilenameChoice::Url,
+            FilenameChoice::Custom => FilenameChoice::Remote,
+        };
+        self.update_block();
+    }
+
+    pub fn selected_filename(&self) -> String {
+        match self.selection {
+            FilenameChoice::Url => self.url_filename.clone(),
+            FilenameChoice::Remote => self.remote_filename.clone(),
+            FilenameChoice::Custom => self.custom.value().to_string(),
+        }
+    }
+
+    pub fn update_block(&mut self) {
+        self.custom
+            .set_block(field_block("Custom Name", self.selection == FilenameChoice::Custom));
     }
 }
 

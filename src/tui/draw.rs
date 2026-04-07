@@ -12,6 +12,7 @@ use crate::{
     tui::{
         app::{ModalState, ScheduleRange, UiApp},
         focus::TabKind,
+        forms::FilenameChoice,
         widgets::bordered,
     },
     units::{
@@ -364,6 +365,78 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
                 .wrap(Wrap { trim: false });
             frame.render_widget(widget, popup);
             frame.render_widget(&form.input, popup);
+        }
+        ModalState::ChooseFilename(form) => {
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(5),
+                    Constraint::Length(2),
+                    Constraint::Length(2),
+                    Constraint::Length(3),
+                    Constraint::Length(3),
+                    Constraint::Min(2),
+                ])
+                .margin(1)
+                .split(popup);
+            frame.render_widget(
+                Paragraph::new("The filename in the URL and the filename suggested by the server differ. Choose which name to use, or enter your own custom name.")
+                    .block(bordered("Choose Filename"))
+                    .style(Style::default().bg(Color::Black))
+                    .wrap(Wrap { trim: false }),
+                popup,
+            );
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "{} Use URL filename: {}",
+                    if form.selection == FilenameChoice::Url {
+                        "[x]"
+                    } else {
+                        "[ ]"
+                    },
+                    form.url_filename
+                ))
+                .style(Style::default().bg(Color::Black)),
+                layout[1],
+            );
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "{} Use {}: {}",
+                    if form.selection == FilenameChoice::Remote {
+                        "[x]"
+                    } else {
+                        "[ ]"
+                    },
+                    form.remote_label,
+                    form.remote_filename
+                ))
+                .style(Style::default().bg(Color::Black)),
+                layout[2],
+            );
+            frame.render_widget(&form.custom, layout[3]);
+            frame.render_widget(
+                Paragraph::new(format!("Selected filename: {}", form.selected_filename()))
+                    .style(Style::default().bg(Color::Black))
+                    .wrap(Wrap { trim: false }),
+                layout[4],
+            );
+            let preview = match match_rule(
+                &app.snapshot.routing.default_download_dir,
+                &app.snapshot.routing.rules,
+                &form.selected_filename(),
+            ) {
+                Ok(route) => format!(
+                    "Will download to: {}",
+                    route.resolved_directory.join(form.selected_filename()).display()
+                ),
+                Err(error) => error.to_string(),
+            };
+            frame.render_widget(
+                Paragraph::new(preview)
+                    .style(Style::default().bg(Color::Black))
+                    .wrap(Wrap { trim: false }),
+                layout[5],
+            );
         }
         ModalState::Cancel(form) => {
             let lines = vec![

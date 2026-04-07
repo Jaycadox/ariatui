@@ -15,8 +15,8 @@ use crate::{config::AppConfig, paths::AppPaths, state::PersistedState};
 pub use self::{
     reconcile::{DaemonState, SharedDaemonState},
     snapshot::{
-        ApiEnvelope, ApiError, ApiRequest, ApiResponse, ChildLifecycle, DownloadItem,
-        DownloadStatus, Snapshot,
+        ApiEnvelope, ApiError, ApiPayload, ApiRequest, ApiResponse, ChildLifecycle, DownloadItem,
+        DownloadStatus, ResolvedHttpUrl, Snapshot,
     },
 };
 

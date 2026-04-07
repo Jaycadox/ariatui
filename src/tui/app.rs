@@ -9,7 +9,10 @@ use tokio::{
 };
 
 use crate::{
-    daemon::{ApiEnvelope, ApiRequest, ApiResponse, AppContext, DownloadItem, Snapshot},
+    daemon::{
+        ApiEnvelope, ApiPayload, ApiRequest, ApiResponse, AppContext, DownloadItem,
+        ResolvedHttpUrl, Snapshot,
+    },
     routing::{DownloadRoutingRule, validate_directory_input, validate_rule},
     state::{CancelBehaviorPreference, ManualOrScheduled},
     tui::{
@@ -17,8 +20,8 @@ use crate::{
         event::{UiEvent, next_event},
         focus::TabKind,
         forms::{
-            AddUrlForm, CancelChoice, CancelForm, RangeField, RangeForm, RoutingField,
-            RoutingRuleForm, SpeedForm,
+            AddUrlForm, CancelChoice, CancelForm, FilenameChoice, FilenameChoiceForm,
+            RangeField, RangeForm, RoutingField, RoutingRuleForm, SpeedForm,
         },
         input::InputField,
     },
@@ -28,6 +31,7 @@ use crate::{
 #[derive(Debug)]
 pub enum ModalState {
     AddUrl(AddUrlForm),
+    ChooseFilename(FilenameChoiceForm),
     Cancel(CancelForm),
     EditManual(SpeedForm),
     EditRange(RangeForm),
@@ -329,8 +333,7 @@ impl UiApp {
                 KeyCode::Enter => {
                     let value = form.value();
                     if value.starts_with("http://") || value.starts_with("https://") {
-                        self.issue(ApiRequest::AddHttpUrl { url: value }).await?;
-                        self.modal = None;
+                        self.resolve_add_url(value).await?;
                     } else {
                         self.modal = Some(ModalState::Error(
                             "URL must start with http:// or https://".into(),
@@ -339,6 +342,36 @@ impl UiApp {
                 }
                 _ => {
                     form.input.input(key);
+                }
+            },
+            ModalState::ChooseFilename(form) => match key.code {
+                KeyCode::Esc => {
+                    self.modal = Some(ModalState::AddUrl(AddUrlForm::with_value(&form.url)));
+                }
+                KeyCode::Up => form.previous_selection(),
+                KeyCode::Down => form.next_selection(),
+                KeyCode::Tab => form.next_selection(),
+                KeyCode::BackTab => form.previous_selection(),
+                KeyCode::Enter => {
+                    let filename = form.selected_filename();
+                    if filename.is_empty() {
+                        self.modal = Some(ModalState::Error(
+                            "Filename cannot be empty".into(),
+                        ));
+                    } else {
+                        let url = form.url.clone();
+                        self.issue(ApiRequest::AddHttpUrl {
+                            url,
+                            filename: Some(filename),
+                        })
+                        .await?;
+                        self.modal = None;
+                    }
+                }
+                _ => {
+                    if form.selection == FilenameChoice::Custom {
+                        form.custom.input(key);
+                    }
                 }
             },
             ModalState::Cancel(form) => match key.code {
@@ -524,6 +557,15 @@ impl UiApp {
     }
 
     async fn issue(&mut self, request: ApiRequest) -> Result<()> {
+        let response = self.request_response(request).await?;
+        if let Some(snapshot) = response.result {
+            self.snapshot = snapshot;
+            self.normalize_indices();
+        }
+        Ok(())
+    }
+
+    async fn request_response(&mut self, request: ApiRequest) -> Result<ApiResponse> {
         let mut stream = UnixStream::connect(&self.app.paths.socket_path)
             .await
             .map_err(|error| eyre!("failed to connect to daemon: {error}"))?;
@@ -550,11 +592,7 @@ impl UiApp {
                     .unwrap_or_else(|| "daemon request failed".into())
             ));
         }
-        if let Some(snapshot) = response.result {
-            self.snapshot = snapshot;
-            self.normalize_indices();
-        }
-        Ok(())
+        Ok(response)
     }
 
     fn normalize_indices(&mut self) {
@@ -675,6 +713,68 @@ impl UiApp {
         .await?;
         self.routing_index = new_index;
         Ok(())
+    }
+
+    async fn resolve_add_url(&mut self, url: String) -> Result<()> {
+        match self
+            .request_response(ApiRequest::ResolveHttpUrl { url: url.clone() })
+            .await
+        {
+            Ok(response) => match response.payload {
+                Some(ApiPayload::ResolvedHttpUrl(resolved)) => {
+                    self.open_resolved_url(resolved).await
+                }
+                _ => {
+                    self.issue(ApiRequest::AddHttpUrl {
+                        url,
+                        filename: None,
+                    })
+                    .await?;
+                    self.modal = None;
+                    Ok(())
+                }
+            },
+            Err(_) => {
+                self.issue(ApiRequest::AddHttpUrl {
+                    url,
+                    filename: None,
+                })
+                .await?;
+                self.modal = None;
+                Ok(())
+            }
+        }
+    }
+
+    async fn open_resolved_url(&mut self, resolved: ResolvedHttpUrl) -> Result<()> {
+        let prompt_candidate = resolved
+            .remote_filename
+            .clone()
+            .map(|filename| ("server filename", filename))
+            .or_else(|| {
+                resolved
+                    .redirect_filename
+                    .clone()
+                    .map(|filename| ("redirect target", filename))
+            });
+
+        if let Some((label, remote_filename)) = prompt_candidate {
+            self.modal = Some(ModalState::ChooseFilename(FilenameChoiceForm::new(
+                &resolved.url,
+                &resolved.url_filename,
+                label,
+                &remote_filename,
+            )));
+            Ok(())
+        } else {
+            self.issue(ApiRequest::AddHttpUrl {
+                url: resolved.url,
+                filename: Some(resolved.url_filename),
+            })
+            .await?;
+            self.modal = None;
+            Ok(())
+        }
     }
 
     fn update_routing_test_block(&mut self) {

@@ -2,6 +2,10 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use chrono::Local;
 use color_eyre::eyre::{Result, eyre};
+use reqwest::{
+    StatusCode,
+    header::{CONTENT_DISPOSITION, RANGE},
+};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, warn};
@@ -10,8 +14,8 @@ use crate::{
     daemon::{
         AppContext, child,
         snapshot::{
-            Aria2ChildStatus, ChildLifecycle, DownloadItem, DownloadStatus, GlobalStats,
-            RoutingSnapshot, SchedulerSnapshot, Snapshot,
+            ApiPayload, ApiReply, Aria2ChildStatus, ChildLifecycle, DownloadItem, DownloadStatus,
+            GlobalStats, ResolvedHttpUrl, RoutingSnapshot, SchedulerSnapshot, Snapshot,
         },
     },
     routing::{match_rule, normalize_rules},
@@ -272,12 +276,18 @@ impl DaemonState {
         Ok(())
     }
 
-    pub async fn execute(&self, request: crate::daemon::ApiRequest) -> Result<Snapshot> {
+    pub async fn execute(&self, request: crate::daemon::ApiRequest) -> Result<ApiReply> {
+        let mut payload = None;
         match request {
             crate::daemon::ApiRequest::Ping | crate::daemon::ApiRequest::GetSnapshot => {}
-            crate::daemon::ApiRequest::AddHttpUrl { url } => {
+            crate::daemon::ApiRequest::ResolveHttpUrl { url } => {
+                payload = Some(ApiPayload::ResolvedHttpUrl(self.resolve_http_url(&url).await?));
+            }
+            crate::daemon::ApiRequest::AddHttpUrl { url, filename } => {
                 let state = self.app.state.read().await.clone();
-                let filename = filename_from_url(&url);
+                let filename = validate_download_filename(
+                    filename.unwrap_or_else(|| filename_from_url(&url)).trim(),
+                )?;
                 let route = match_rule(
                     &state.default_download_dir,
                     &state.download_rules,
@@ -289,7 +299,10 @@ impl DaemonState {
                         "aria2.addUri",
                         vec![
                             json!([url]),
-                            json!({ "dir": route.resolved_directory.display().to_string() }),
+                            json!({
+                                "dir": route.resolved_directory.display().to_string(),
+                                "out": filename,
+                            }),
                         ],
                     )
                     .await?;
@@ -361,7 +374,47 @@ impl DaemonState {
                 self.perform_refresh().await?;
             }
         }
-        Ok(self.snapshot().await)
+        Ok(ApiReply {
+            snapshot: self.snapshot().await,
+            payload,
+        })
+    }
+
+    async fn resolve_http_url(&self, url: &str) -> Result<ResolvedHttpUrl> {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .timeout(Duration::from_secs(
+                self.app.config.daemon.rpc_request_timeout_secs.max(2),
+            ))
+            .build()?;
+        let response = match client.head(url).send().await {
+            Ok(response)
+                if response.status() == StatusCode::METHOD_NOT_ALLOWED
+                    || response.status() == StatusCode::NOT_IMPLEMENTED =>
+            {
+                client.get(url).header(RANGE, "bytes=0-0").send().await?
+            }
+            Ok(response) => response,
+            Err(_) => client.get(url).header(RANGE, "bytes=0-0").send().await?,
+        };
+
+        let url_filename = filename_from_url(url);
+        let redirect_filename = filename_from_final_url(response.url().as_str())
+            .map(|filename| validate_download_filename(&filename))
+            .transpose()?
+            .filter(|filename| filename != &url_filename);
+        let remote_filename = filename_from_content_disposition(&response)
+            .map(|filename| validate_download_filename(&filename))
+            .transpose()?
+            .filter(|filename| filename != &url_filename);
+
+        Ok(ResolvedHttpUrl {
+            url: url.to_string(),
+            url_filename,
+            remote_filename,
+            redirect_filename,
+            final_url: Some(response.url().to_string()),
+        })
     }
 
     async fn cancel_download(&self, gid: &str, delete_files: bool) -> Result<()> {
@@ -528,7 +581,55 @@ fn filename_from_url(url: &str) -> String {
                 .and_then(|segments| segments.filter(|segment| !segment.is_empty()).last())
                 .map(str::to_string)
         })
-        .unwrap_or_else(|| url.to_string())
+        .filter(|segment| !segment.trim().is_empty())
+        .unwrap_or_else(|| "download".into())
+}
+
+fn filename_from_final_url(url: &str) -> Option<String> {
+    let filename = filename_from_url(url);
+    if filename == "download" {
+        None
+    } else {
+        Some(filename)
+    }
+}
+
+fn filename_from_content_disposition(response: &reqwest::Response) -> Option<String> {
+    let header = response.headers().get(CONTENT_DISPOSITION)?.to_str().ok()?;
+    extract_filename_from_content_disposition(header)
+}
+
+fn extract_filename_from_content_disposition(header: &str) -> Option<String> {
+    for part in header.split(';').map(str::trim) {
+        if let Some(value) = part.strip_prefix("filename*=") {
+            let value = value.split("''").last().unwrap_or(value);
+            let value = value.trim_matches('"').trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+        if let Some(value) = part.strip_prefix("filename=") {
+            let value = value.trim_matches('"').trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn validate_download_filename(input: &str) -> Result<String> {
+    let filename = input.trim();
+    if filename.is_empty() {
+        return Err(eyre!("filename cannot be empty"));
+    }
+    if matches!(filename, "." | "..") {
+        return Err(eyre!("filename cannot be '.' or '..'"));
+    }
+    if filename.contains('/') || filename.contains('\\') || filename.contains('\0') {
+        return Err(eyre!("filename must not contain path separators"));
+    }
+    Ok(filename.to_string())
 }
 
 async fn delete_paths(files: Vec<Aria2File>) -> Vec<String> {

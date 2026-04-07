@@ -37,16 +37,18 @@ async fn handle_client(state: SharedDaemonState, stream: UnixStream) -> Result<(
     while let Some(line) = lines.next_line().await? {
         let envelope: ApiEnvelope = serde_json::from_str(&line)?;
         let response = match state.execute(envelope.request).await {
-            Ok(snapshot) => ApiResponse {
+            Ok(reply) => ApiResponse {
                 id: envelope.id,
                 ok: true,
-                result: Some(snapshot),
+                result: Some(reply.snapshot),
+                payload: reply.payload,
                 error: None,
             },
             Err(error) => ApiResponse {
                 id: envelope.id,
                 ok: false,
                 result: None,
+                payload: None,
                 error: Some(ApiError {
                     message: error.to_string(),
                 }),

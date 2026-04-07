@@ -106,13 +106,34 @@ pub struct DownloadItem {
     pub error_message: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ResolvedHttpUrl {
+    pub url: String,
+    pub url_filename: String,
+    pub remote_filename: Option<String>,
+    pub redirect_filename: Option<String>,
+    pub final_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum ApiPayload {
+    ResolvedHttpUrl(ResolvedHttpUrl),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum ApiRequest {
     Ping,
     GetSnapshot,
+    ResolveHttpUrl {
+        url: String,
+    },
     AddHttpUrl {
         url: String,
+        #[serde(default)]
+        filename: Option<String>,
     },
     Pause {
         gid: String,
@@ -158,12 +179,20 @@ pub struct ApiResponse {
     pub id: String,
     pub ok: bool,
     pub result: Option<Snapshot>,
+    #[serde(default)]
+    pub payload: Option<ApiPayload>,
     pub error: Option<ApiError>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiError {
     pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApiReply {
+    pub snapshot: Snapshot,
+    pub payload: Option<ApiPayload>,
 }
 
 impl Snapshot {
