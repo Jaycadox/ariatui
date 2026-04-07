@@ -4,6 +4,7 @@ use ratatui::{
 };
 
 use crate::tui::input::InputField;
+use crate::webhook::WebhookPingMode;
 
 #[derive(Debug)]
 pub struct AddUrlForm {
@@ -118,6 +119,86 @@ impl Default for CancelForm {
 #[derive(Debug)]
 pub struct SpeedForm {
     pub input: InputField,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebhookField {
+    Url,
+    PingId,
+}
+
+#[derive(Debug)]
+pub struct WebhookForm {
+    pub url: InputField,
+    pub ping_id: InputField,
+    pub ping_mode: WebhookPingMode,
+    pub focus: WebhookField,
+}
+
+impl WebhookForm {
+    pub fn new(url: &str, ping_mode: WebhookPingMode, ping_id: &str) -> Self {
+        let mut url_input = InputField::new();
+        url_input.insert_str(url);
+        url_input.set_placeholder_text("https://discord.com/api/webhooks/...");
+
+        let mut ping_id_input = InputField::new();
+        ping_id_input.insert_str(ping_id);
+        ping_id_input.set_placeholder_text("123456789012345678");
+
+        let mut form = Self {
+            url: url_input,
+            ping_id: ping_id_input,
+            ping_mode,
+            focus: WebhookField::Url,
+        };
+        form.update_blocks();
+        form
+    }
+
+    pub fn next_focus(&mut self) {
+        self.focus = match self.focus {
+            WebhookField::Url => WebhookField::PingId,
+            WebhookField::PingId => WebhookField::Url,
+        };
+        self.update_blocks();
+    }
+
+    pub fn previous_focus(&mut self) {
+        self.next_focus();
+    }
+
+    pub fn cycle_ping_mode(&mut self) {
+        self.ping_mode = match self.ping_mode {
+            WebhookPingMode::None => WebhookPingMode::Everyone,
+            WebhookPingMode::Everyone => WebhookPingMode::SpecificId,
+            WebhookPingMode::SpecificId => WebhookPingMode::None,
+        };
+        self.update_blocks();
+    }
+
+    pub fn active_input(&mut self) -> &mut InputField {
+        match self.focus {
+            WebhookField::Url => &mut self.url,
+            WebhookField::PingId => &mut self.ping_id,
+        }
+    }
+
+    pub fn values(&self) -> (String, WebhookPingMode, String) {
+        (
+            self.url.value().to_string(),
+            self.ping_mode,
+            self.ping_id.value().to_string(),
+        )
+    }
+
+    fn update_blocks(&mut self) {
+        self.url
+            .set_block(field_block("Discord Webhook URL", self.focus == WebhookField::Url));
+        self.ping_id.set_block(field_block(
+            "Specific User/Role ID",
+            self.focus == WebhookField::PingId,
+        ));
+    }
 }
 
 impl SpeedForm {

@@ -21,11 +21,12 @@ use crate::{
         focus::TabKind,
         forms::{
             AddUrlForm, CancelChoice, CancelForm, FilenameChoice, FilenameChoiceForm,
-            RangeField, RangeForm, RoutingField, RoutingRuleForm, SpeedForm,
+            RangeField, RangeForm, RoutingField, RoutingRuleForm, SpeedForm, WebhookForm,
         },
         input::InputField,
     },
     units,
+    webhook::{validate_discord_webhook_url, validate_ping_id},
 };
 
 #[derive(Debug)]
@@ -33,6 +34,7 @@ pub enum ModalState {
     AddUrl(AddUrlForm),
     ChooseFilename(FilenameChoiceForm),
     Cancel(CancelForm),
+    EditWebhooks(WebhookForm),
     EditManual(SpeedForm),
     EditUsualInternetSpeed(SpeedForm),
     EditRange(RangeForm),
@@ -208,6 +210,8 @@ impl UiApp {
                     self.open_scheduler_editor();
                 } else if self.tab == TabKind::Routing {
                     self.open_routing_editor();
+                } else if self.tab == TabKind::Webhooks {
+                    self.open_webhooks_editor();
                 } else {
                     self.show_details = !self.show_details;
                 }
@@ -287,6 +291,8 @@ impl UiApp {
             KeyCode::Char('e') => {
                 if self.tab == TabKind::Scheduler {
                     self.open_scheduler_editor();
+                } else if self.tab == TabKind::Webhooks {
+                    self.open_webhooks_editor();
                 }
             }
             KeyCode::Char('u') => {
@@ -323,6 +329,8 @@ impl UiApp {
                 if self.tab == TabKind::Routing {
                     self.routing_test_editing = true;
                     self.update_routing_test_block();
+                } else if self.tab == TabKind::Webhooks {
+                    self.issue(ApiRequest::TriggerWebhookTest).await?;
                 }
             }
             _ => {}
@@ -408,6 +416,27 @@ impl UiApp {
                     self.modal = None;
                 }
                 _ => {}
+            },
+            ModalState::EditWebhooks(form) => match key.code {
+                KeyCode::Esc => self.modal = None,
+                KeyCode::Tab => form.next_focus(),
+                KeyCode::BackTab => form.previous_focus(),
+                KeyCode::Char(' ') => form.cycle_ping_mode(),
+                KeyCode::Enter => {
+                    let (discord_webhook_url, ping_mode, ping_id) = form.values();
+                    validate_discord_webhook_url(&discord_webhook_url)?;
+                    let validated_ping_id = validate_ping_id(ping_mode, Some(&ping_id))?;
+                    self.issue(ApiRequest::SetWebhookSettings {
+                        discord_webhook_url,
+                        ping_mode,
+                        ping_id: validated_ping_id,
+                    })
+                    .await?;
+                    self.modal = None;
+                }
+                _ => {
+                    form.active_input().input(key);
+                }
             },
             ModalState::EditManual(form) => match key.code {
                 KeyCode::Esc => self.modal = None,
@@ -545,6 +574,7 @@ impl UiApp {
                 let routing_len = self.routing_rules().len();
                 move_index(&mut self.routing_index, routing_len, delta);
             }
+            TabKind::Webhooks => {}
         }
     }
 
@@ -642,6 +672,14 @@ impl UiApp {
                 &units::format_limit(range.limit_bps),
             )));
         }
+    }
+
+    fn open_webhooks_editor(&mut self) {
+        self.modal = Some(ModalState::EditWebhooks(WebhookForm::new(
+            &self.snapshot.webhooks.discord_webhook_url,
+            self.snapshot.webhooks.ping_mode,
+            self.snapshot.webhooks.ping_id.as_deref().unwrap_or_default(),
+        )));
     }
 
     fn open_new_range_editor(&mut self) {

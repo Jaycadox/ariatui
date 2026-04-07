@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     routing::DownloadRoutingRule,
     state::{CancelBehaviorPreference, ManualOrScheduled},
+    webhook::WebhookPingMode,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +22,7 @@ pub struct Snapshot {
     pub aria2_status: Aria2ChildStatus,
     pub scheduler: SchedulerSnapshot,
     pub routing: RoutingSnapshot,
+    pub webhooks: WebhookSnapshot,
     pub global: GlobalStats,
     pub current_downloads: Vec<DownloadItem>,
     pub history_downloads: Vec<DownloadItem>,
@@ -67,6 +69,15 @@ pub struct SchedulerSnapshot {
 pub struct RoutingSnapshot {
     pub default_download_dir: String,
     pub rules: Vec<DownloadRoutingRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebhookSnapshot {
+    pub discord_webhook_url: String,
+    pub enabled: bool,
+    pub ping_mode: WebhookPingMode,
+    pub ping_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -166,6 +177,12 @@ pub enum ApiRequest {
         default_download_dir: String,
         rules: Vec<DownloadRoutingRule>,
     },
+    SetWebhookSettings {
+        discord_webhook_url: String,
+        ping_mode: WebhookPingMode,
+        ping_id: Option<String>,
+    },
+    TriggerWebhookTest,
     SetRememberedCancelBehavior {
         behavior: CancelBehaviorPreference,
     },
@@ -240,6 +257,7 @@ impl Snapshot {
                     directory: "~/Downloads".into(),
                 }],
             },
+            webhooks: WebhookSnapshot::default(),
             global: GlobalStats::default(),
             current_downloads: Vec::new(),
             history_downloads: Vec::new(),
@@ -284,6 +302,17 @@ impl Default for RoutingSnapshot {
                 pattern: "*".into(),
                 directory: "~/Downloads".into(),
             }],
+        }
+    }
+}
+
+impl Default for WebhookSnapshot {
+    fn default() -> Self {
+        Self {
+            discord_webhook_url: String::new(),
+            enabled: false,
+            ping_mode: WebhookPingMode::None,
+            ping_id: None,
         }
     }
 }

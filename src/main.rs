@@ -11,6 +11,7 @@ mod startup;
 mod state;
 mod tui;
 mod units;
+mod webhook;
 
 use std::sync::Arc;
 

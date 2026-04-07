@@ -49,6 +49,9 @@ mod tests {
                 pattern: "*".into(),
                 directory: "~/Downloads".into(),
             }],
+            discord_webhook_url: String::new(),
+            webhook_ping_mode: crate::webhook::WebhookPingMode::None,
+            webhook_ping_id: String::new(),
         };
         let now = Local.with_ymd_and_hms(2026, 4, 7, 10, 30, 0).unwrap();
         let resolved = resolve(now, &state).expect("resolve");

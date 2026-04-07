@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 
 use chrono::Local;
 use color_eyre::eyre::{Result, eyre};
@@ -16,6 +16,7 @@ use crate::{
         snapshot::{
             ApiPayload, ApiReply, Aria2ChildStatus, ChildLifecycle, DownloadItem, DownloadStatus,
             GlobalStats, ResolvedHttpUrl, RoutingSnapshot, SchedulerSnapshot, Snapshot,
+            WebhookSnapshot,
         },
     },
     routing::{match_rule, normalize_rules},
@@ -24,6 +25,7 @@ use crate::{
         types::{Aria2File, Aria2GlobalStat, Aria2Status},
     },
     schedule, units,
+    webhook::{WebhookPingMode, mention_prefix, validate_discord_webhook_url, validate_ping_id, webhook_enabled},
 };
 
 #[derive(Debug)]
@@ -39,6 +41,9 @@ pub struct DaemonState {
     pub snapshot: RwLock<Snapshot>,
     pub desired_limit_bps: RwLock<Option<u64>>,
     pub log_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    pub seen_terminal_events: Mutex<HashSet<String>>,
+    pub notifications_initialized: Mutex<bool>,
+    pub last_notified_restart_count: Mutex<u32>,
 }
 
 pub type SharedDaemonState = Arc<DaemonState>;
@@ -66,6 +71,9 @@ impl DaemonState {
             snapshot: RwLock::new(snapshot),
             desired_limit_bps: RwLock::new(None),
             log_task: Mutex::new(None),
+            seen_terminal_events: Mutex::new(HashSet::new()),
+            notifications_initialized: Mutex::new(false),
+            last_notified_restart_count: Mutex::new(0),
         })
     }
 
@@ -227,6 +235,12 @@ impl DaemonState {
             default_download_dir: state.default_download_dir.clone(),
             rules: normalize_rules(&state.default_download_dir, &state.download_rules),
         };
+        snapshot.webhooks = WebhookSnapshot {
+            discord_webhook_url: state.discord_webhook_url.clone(),
+            enabled: webhook_enabled(&state.discord_webhook_url),
+            ping_mode: state.webhook_ping_mode,
+            ping_id: validate_ping_id(state.webhook_ping_mode, Some(&state.webhook_ping_id))?,
+        };
         snapshot.global = parse_global(global);
         snapshot.current_downloads = active
             .into_iter()
@@ -236,6 +250,7 @@ impl DaemonState {
         snapshot.history_downloads = stopped.into_iter().map(map_status).collect();
         let snapshot_copy = snapshot.clone();
         drop(snapshot);
+        self.process_webhook_events(&snapshot_copy).await;
         self.write_snapshot_cache(&snapshot_copy).await;
 
         Ok(())
@@ -374,6 +389,25 @@ impl DaemonState {
                 drop(state);
                 self.perform_refresh().await?;
             }
+            crate::daemon::ApiRequest::SetWebhookSettings {
+                discord_webhook_url,
+                ping_mode,
+                ping_id,
+            } => {
+                validate_discord_webhook_url(&discord_webhook_url)?;
+                let validated_ping_id = validate_ping_id(ping_mode, ping_id.as_deref())?;
+                let mut state = self.app.state.write().await;
+                state.discord_webhook_url = discord_webhook_url;
+                state.webhook_ping_mode = ping_mode;
+                state.webhook_ping_id = validated_ping_id.unwrap_or_default();
+                state.save(&self.app.paths.state_file)?;
+                drop(state);
+                self.perform_refresh().await?;
+            }
+            crate::daemon::ApiRequest::TriggerWebhookTest => {
+                self.send_test_webhook().await?;
+                self.perform_refresh().await?;
+            }
             crate::daemon::ApiRequest::SetRememberedCancelBehavior { behavior } => {
                 let mut state = self.app.state.write().await;
                 state.remembered_cancel_behavior = behavior;
@@ -386,6 +420,95 @@ impl DaemonState {
             snapshot: self.snapshot().await,
             payload,
         })
+    }
+
+    async fn process_webhook_events(&self, snapshot: &Snapshot) {
+        let settings = snapshot.webhooks.clone();
+        if !settings.enabled {
+            return;
+        }
+
+        let mut initialized = self.notifications_initialized.lock().await;
+        let mut seen = self.seen_terminal_events.lock().await;
+        if !*initialized {
+            for item in &snapshot.history_downloads {
+                seen.insert(event_key(item));
+            }
+            *self.last_notified_restart_count.lock().await = snapshot.aria2_status.restart_count;
+            *initialized = true;
+            return;
+        }
+
+        let new_events = snapshot
+            .history_downloads
+            .iter()
+            .filter(|item| is_notable_terminal_event(item))
+            .filter(|item| seen.insert(event_key(item)))
+            .cloned()
+            .collect::<Vec<_>>();
+        drop(seen);
+        drop(initialized);
+
+        for item in new_events {
+            self.spawn_webhook_message(
+                settings.clone(),
+                webhook_title_for_item(&item),
+                webhook_body_for_item(&item),
+            );
+        }
+
+        let mut last_restart = self.last_notified_restart_count.lock().await;
+        if snapshot.aria2_status.restart_count > *last_restart {
+            *last_restart = snapshot.aria2_status.restart_count;
+            self.spawn_webhook_message(
+                settings,
+                "AriaTUI: aria2 restarted".into(),
+                format!(
+                    "The managed aria2c process restarted.\nRestart count: {}\nLast exit: {}\nLast error: {}",
+                    snapshot.aria2_status.restart_count,
+                    snapshot
+                        .aria2_status
+                        .last_exit
+                        .clone()
+                        .unwrap_or_else(|| "-".into()),
+                    snapshot
+                        .aria2_status
+                        .last_error
+                        .clone()
+                        .unwrap_or_else(|| "-".into())
+                ),
+            );
+        }
+    }
+
+    async fn send_test_webhook(&self) -> Result<()> {
+        let state = self.app.state.read().await.clone();
+        validate_discord_webhook_url(&state.discord_webhook_url)?;
+        let ping_id = validate_ping_id(state.webhook_ping_mode, Some(&state.webhook_ping_id))?;
+        let settings = WebhookSnapshot {
+            discord_webhook_url: state.discord_webhook_url,
+            enabled: true,
+            ping_mode: state.webhook_ping_mode,
+            ping_id,
+        };
+        post_discord_webhook(
+            settings,
+            "AriaTUI test notification".into(),
+            "Dummy event: a test download finished successfully.\nName: example-release.iso\nSize: 1.4 GiB\nPath: ~/Downloads/example-release.iso\nSource: https://example.com/example-release.iso".into(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    fn spawn_webhook_message(&self, settings: WebhookSnapshot, title: String, description: String) {
+        if !settings.enabled {
+            return;
+        }
+        tokio::spawn(async move {
+            if let Err(error) = post_discord_webhook(settings, title, description).await {
+                warn!("failed to send webhook notification: {error}");
+            }
+        });
     }
 
     async fn resolve_http_url(&self, url: &str) -> Result<ResolvedHttpUrl> {
@@ -658,6 +781,125 @@ async fn delete_paths(files: Vec<Aria2File>) -> Vec<String> {
         }
     }
     warnings
+}
+
+fn is_notable_terminal_event(item: &DownloadItem) -> bool {
+    matches!(
+        item.status,
+        DownloadStatus::Complete | DownloadStatus::Error | DownloadStatus::Removed
+    )
+}
+
+fn event_key(item: &DownloadItem) -> String {
+    format!(
+        "{}:{:?}:{}",
+        item.gid,
+        item.status,
+        item.error_code.clone().unwrap_or_default()
+    )
+}
+
+fn webhook_title_for_item(item: &DownloadItem) -> String {
+    match item.status {
+        DownloadStatus::Complete => "Download completed".into(),
+        DownloadStatus::Error => "Download failed".into(),
+        DownloadStatus::Removed => "Download removed".into(),
+        _ => "Download update".into(),
+    }
+}
+
+fn webhook_body_for_item(item: &DownloadItem) -> String {
+    format!(
+        "Status: {}\nName: {}\nGID: {}\nDownloaded: {} / {}\nFinal speed: {}\nPath: {}\nSource: {}\nError code: {}\nError: {}",
+        status_name(&item.status),
+        item.name,
+        item.gid,
+        bytes_human(item.completed_bytes),
+        bytes_human(item.total_bytes),
+        bytes_human_per_sec(item.download_speed_bps),
+        item.primary_path.clone().unwrap_or_else(|| "-".into()),
+        item.source_uri.clone().unwrap_or_else(|| "-".into()),
+        item.error_code.clone().unwrap_or_else(|| "-".into()),
+        item.error_message.clone().unwrap_or_else(|| "-".into()),
+    )
+}
+
+fn status_name(status: &DownloadStatus) -> &'static str {
+    match status {
+        DownloadStatus::Active => "active",
+        DownloadStatus::Waiting => "waiting",
+        DownloadStatus::Paused => "paused",
+        DownloadStatus::Complete => "complete",
+        DownloadStatus::Error => "error",
+        DownloadStatus::Removed => "removed",
+        DownloadStatus::Unknown => "unknown",
+    }
+}
+
+async fn post_discord_webhook(
+    settings: WebhookSnapshot,
+    title: String,
+    description: String,
+) -> Result<()> {
+    let mention = mention_prefix(settings.ping_mode, settings.ping_id.as_deref());
+    let content = format!("{mention}**{title}**");
+    let body = json!({
+        "content": content,
+        "allowed_mentions": allowed_mentions_json(settings.ping_mode, settings.ping_id.as_deref()),
+        "embeds": [
+            {
+                "title": title,
+                "description": description,
+                "color": 0x2ecc71u32,
+            }
+        ]
+    });
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let response = client
+        .post(settings.discord_webhook_url)
+        .json(&body)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Err(eyre!("webhook returned {}", response.status()));
+    }
+    Ok(())
+}
+
+fn allowed_mentions_json(mode: WebhookPingMode, ping_id: Option<&str>) -> Value {
+    match mode {
+        WebhookPingMode::None => json!({ "parse": [] }),
+        WebhookPingMode::Everyone => json!({ "parse": ["everyone"] }),
+        WebhookPingMode::SpecificId => {
+            let id = ping_id.unwrap_or_default();
+            json!({
+                "parse": [],
+                "users": [id],
+                "roles": [id],
+            })
+        }
+    }
+}
+
+fn bytes_human(value: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = value as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", value as u64, UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn bytes_human_per_sec(value: u64) -> String {
+    format!("{}/s", bytes_human(value))
 }
 
 trait IfEmptyThen {

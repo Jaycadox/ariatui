@@ -7,6 +7,7 @@ use crate::{
     paths::AppPaths,
     routing::{DownloadRoutingRule, validate_rules},
     units,
+    webhook::{WebhookPingMode, validate_discord_webhook_url, validate_ping_id},
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -36,6 +37,9 @@ pub struct PersistedState {
     pub schedule: Vec<String>,
     pub default_download_dir: String,
     pub download_rules: Vec<DownloadRoutingRule>,
+    pub discord_webhook_url: String,
+    pub webhook_ping_mode: WebhookPingMode,
+    pub webhook_ping_id: String,
 }
 
 impl Default for PersistedState {
@@ -51,6 +55,9 @@ impl Default for PersistedState {
                 pattern: "*".into(),
                 directory: "~/Downloads".into(),
             }],
+            discord_webhook_url: String::new(),
+            webhook_ping_mode: WebhookPingMode::None,
+            webhook_ping_id: String::new(),
         }
     }
 }
@@ -103,6 +110,8 @@ impl PersistedState {
         self.usual_internet_speed_bps()?;
         self.schedule_bps()?;
         validate_rules(&self.default_download_dir, &self.download_rules)?;
+        validate_discord_webhook_url(&self.discord_webhook_url)?;
+        let _ = validate_ping_id(self.webhook_ping_mode, Some(&self.webhook_ping_id))?;
         Ok(())
     }
 }

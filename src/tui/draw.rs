@@ -22,6 +22,7 @@ use crate::{
         Percentage, describe_limit_input, format_bytes, format_bytes_per_sec, format_eta,
         format_limit,
     },
+    webhook::{WebhookPingMode, validate_discord_webhook_url, validate_ping_id},
 };
 
 pub fn draw(frame: &mut Frame<'_>, app: &UiApp) {
@@ -108,6 +109,7 @@ fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
         TabKind::History => draw_history(frame, chunks[1], app),
         TabKind::Scheduler => draw_scheduler(frame, chunks[1], app),
         TabKind::Routing => draw_routing(frame, chunks[1], app),
+        TabKind::Webhooks => draw_webhooks(frame, chunks[1], app),
     }
 }
 
@@ -348,6 +350,45 @@ fn draw_routing(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
     );
 }
 
+fn draw_webhooks(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
+    let ping_label = match app.snapshot.webhooks.ping_mode {
+        WebhookPingMode::None => "no ping".to_string(),
+        WebhookPingMode::Everyone => "@everyone".to_string(),
+        WebhookPingMode::SpecificId => format!(
+            "specific id {}",
+            app.snapshot
+                .webhooks
+                .ping_id
+                .clone()
+                .unwrap_or_else(|| "-".into())
+        ),
+    };
+    let body = vec![
+        Line::from(format!(
+            "Webhook configured: {}",
+            if app.snapshot.webhooks.enabled { "yes" } else { "no" }
+        )),
+        Line::from(format!(
+            "Discord webhook URL: {}",
+            if app.snapshot.webhooks.discord_webhook_url.trim().is_empty() {
+                "-".into()
+            } else {
+                app.snapshot.webhooks.discord_webhook_url.clone()
+            }
+        )),
+        Line::from(format!("Ping mode: {ping_label}")),
+        Line::from("Events: completed, failed, removed, aria2 restart"),
+        Line::from("Press e or Enter to edit settings."),
+        Line::from("Press t to send a dummy completed-download notification."),
+    ];
+    frame.render_widget(
+        Paragraph::new(Text::from(body))
+            .block(bordered("Webhooks"))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
     let text = match app.tab {
         TabKind::Current => {
@@ -359,6 +400,9 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
         }
         TabKind::Routing => {
             "q quit  arrows/vim select  a add  Enter/e edit  d delete  J/K reorder  t edit tester"
+        }
+        TabKind::Webhooks => {
+            "q quit  Enter/e edit webhook settings  t trigger test notification"
         }
     };
     frame.render_widget(Paragraph::new(text), area);
@@ -519,6 +563,62 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
             );
             frame.render_widget(&form.input, layout[1]);
             frame.render_widget(limit_status_paragraph(&form.value()), layout[2]);
+        }
+        ModalState::EditWebhooks(form) => {
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(4),
+                    Constraint::Length(3),
+                    Constraint::Length(2),
+                    Constraint::Length(3),
+                    Constraint::Length(2),
+                    Constraint::Length(2),
+                    Constraint::Min(1),
+                ])
+                .margin(1)
+                .split(popup);
+            frame.render_widget(
+                Paragraph::new("Configure a Discord webhook for notable events. Space cycles ping mode. Tab or Shift-Tab changes fields. Enter saves. Specific-id mode tries both user and role mention styles for the provided numeric id.")
+                    .block(bordered("Webhook Settings"))
+                    .style(Style::default().bg(Color::Black))
+                    .wrap(Wrap { trim: false }),
+                popup,
+            );
+            frame.render_widget(&form.url, layout[1]);
+            let ping_mode_label = match form.ping_mode {
+                WebhookPingMode::None => "none",
+                WebhookPingMode::Everyone => "@everyone",
+                WebhookPingMode::SpecificId => "specific id",
+            };
+            frame.render_widget(
+                Paragraph::new(format!("Ping mode: {ping_mode_label}"))
+                    .style(Style::default().bg(Color::Black)),
+                layout[2],
+            );
+            frame.render_widget(&form.ping_id, layout[3]);
+            let (url_message, url_color) = match validate_discord_webhook_url(form.url.value()) {
+                Ok(()) => ("Webhook URL looks valid".to_string(), Color::Green),
+                Err(error) => (error.to_string(), Color::Red),
+            };
+            frame.render_widget(
+                Paragraph::new(url_message)
+                    .style(Style::default().fg(url_color).bg(Color::Black))
+                    .wrap(Wrap { trim: false }),
+                layout[4],
+            );
+            let (_, ping_mode, ping_id) = form.values();
+            let (ping_message, ping_color) = match validate_ping_id(ping_mode, Some(&ping_id)) {
+                Ok(Some(id)) => (format!("Will ping ID: {id}"), Color::Green),
+                Ok(None) => ("Ping configuration OK".to_string(), Color::Green),
+                Err(error) => (error.to_string(), Color::Red),
+            };
+            frame.render_widget(
+                Paragraph::new(ping_message)
+                    .style(Style::default().fg(ping_color).bg(Color::Black))
+                    .wrap(Wrap { trim: false }),
+                layout[5],
+            );
         }
         ModalState::EditRange(form) => {
             let layout = Layout::default()
