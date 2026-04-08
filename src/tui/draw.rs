@@ -1128,6 +1128,10 @@ fn details_paragraph(item: Option<&DownloadItem>, snapshot: &Snapshot) -> Paragr
                 "Speed: {}",
                 format_bytes_per_sec(item.download_speed_bps)
             )),
+            Line::from(format!(
+                "Realtime speed: {}",
+                format_bytes_per_sec(item.realtime_download_speed_bps)
+            )),
             Line::from(format!("ETA: {}", format_eta(item.eta_seconds))),
             Line::from(format!(
                 "Projected Scheduled ETA: {}",

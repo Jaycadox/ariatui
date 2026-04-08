@@ -2295,6 +2295,7 @@ fn render_download_details(item: Option<&DownloadItem>, snapshot: &Snapshot) -> 
 <dt>GID</dt><dd>{}</dd>
 <dt>Progress</dt><dd>{} / {}</dd>
 <dt>Speed</dt><dd>{}</dd>
+<dt>Realtime speed</dt><dd>{}</dd>
 <dt>ETA</dt><dd>{}</dd>
 <dt>Projected Scheduled ETA</dt><dd>{}</dd>
 <dt>Projected speed now</dt><dd>{}</dd>
@@ -2309,6 +2310,7 @@ fn render_download_details(item: Option<&DownloadItem>, snapshot: &Snapshot) -> 
         esc(&format_bytes(item.completed_bytes)),
         esc(&format_bytes(item.total_bytes)),
         esc(&format_bytes_per_sec(item.download_speed_bps)),
+        esc(&format_bytes_per_sec(item.realtime_download_speed_bps)),
         esc(&format_eta(item.eta_seconds)),
         esc(&format_eta(projected_eta)),
         esc(&projected_speed),

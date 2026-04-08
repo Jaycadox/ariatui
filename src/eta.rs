@@ -122,11 +122,9 @@ pub(crate) fn project_scheduled_eta(
             snapshot.scheduler.schedule_limits_bps[hour],
             effective_usual_speed_bps,
         );
-        let aggregate_speed_bps = estimated_aggregate_speed_bps(
-            aggregate_model,
-            observed_total_speed_bps_u64,
-            slot_cap,
-        ) as f64;
+        let aggregate_speed_bps =
+            estimated_aggregate_speed_bps(aggregate_model, observed_total_speed_bps_u64, slot_cap)
+                as f64;
         if aggregate_speed_bps <= 0.0 {
             elapsed_seconds += seconds_until_boundary;
             hour = (hour + 1) % 24;
@@ -355,6 +353,7 @@ mod tests {
             total_bytes: remaining_bytes,
             completed_bytes: 0,
             download_speed_bps: speed_bps,
+            realtime_download_speed_bps: speed_bps,
             upload_speed_bps: 0,
             eta_seconds: Some(remaining_bytes / speed_bps.max(1)),
             connections: None,

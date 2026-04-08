@@ -296,6 +296,7 @@ mod tests {
             total_bytes,
             completed_bytes: total_bytes / 2,
             download_speed_bps: total_bytes,
+            realtime_download_speed_bps: total_bytes,
             upload_speed_bps: 0,
             eta_seconds: Some(10),
             connections: Some(4),

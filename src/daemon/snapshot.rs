@@ -152,6 +152,8 @@ pub struct DownloadItem {
     pub total_bytes: u64,
     pub completed_bytes: u64,
     pub download_speed_bps: u64,
+    #[serde(default)]
+    pub realtime_download_speed_bps: u64,
     pub upload_speed_bps: u64,
     pub eta_seconds: Option<u64>,
     pub connections: Option<u32>,

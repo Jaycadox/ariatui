@@ -10,6 +10,7 @@ mod paths;
 mod routing;
 mod rpc;
 mod schedule;
+mod speed;
 mod startup;
 mod state;
 mod tui;

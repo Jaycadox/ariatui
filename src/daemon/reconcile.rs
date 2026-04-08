@@ -33,6 +33,7 @@ use crate::{
         types::{Aria2File, Aria2GlobalStat, Aria2Status},
     },
     schedule,
+    speed::RollingSpeedTracker,
     state::validate_torrent_size_mib,
     units, web,
     webhook::{
@@ -55,6 +56,7 @@ pub struct DaemonState {
     pub runtime: Mutex<Option<RuntimeAria2>>,
     pub snapshot: RwLock<Snapshot>,
     pub desired_limit_bps: RwLock<Option<u64>>,
+    pub speed_tracker: Mutex<RollingSpeedTracker>,
     pub log_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub seen_terminal_events: Mutex<HashSet<String>>,
     pub notifications_initialized: Mutex<bool>,
@@ -94,6 +96,7 @@ impl DaemonState {
             runtime: Mutex::new(None),
             snapshot: RwLock::new(snapshot),
             desired_limit_bps: RwLock::new(None),
+            speed_tracker: Mutex::new(RollingSpeedTracker::default()),
             log_task: Mutex::new(None),
             seen_terminal_events: Mutex::new(HashSet::new()),
             notifications_initialized: Mutex::new(false),
@@ -168,6 +171,7 @@ impl DaemonState {
     pub async fn perform_refresh(&self) -> Result<()> {
         self.ensure_runtime().await?;
         self.check_child_exit().await?;
+        let refresh_started = Instant::now();
         let runtime = self.runtime.lock().await;
         let runtime = runtime
             .as_ref()
@@ -301,11 +305,16 @@ impl DaemonState {
         snapshot.web_ui.pending_pair_pins = pending_pair_pins;
         snapshot.web_ui.active_session_count = active_session_count;
         snapshot.global = parse_global(global);
-        snapshot.current_downloads = active
+        let mut current_downloads: Vec<DownloadItem> = active
             .into_iter()
             .chain(waiting.into_iter())
             .map(map_status)
             .collect();
+        self.speed_tracker
+            .lock()
+            .await
+            .refresh(refresh_started, &mut current_downloads);
+        snapshot.current_downloads = current_downloads;
         snapshot.history_downloads = stopped.into_iter().map(map_status).collect();
         let snapshot_copy = snapshot.clone();
         drop(snapshot);
@@ -941,6 +950,7 @@ fn map_status(status: Aria2Status) -> DownloadItem {
         total_bytes,
         completed_bytes,
         download_speed_bps,
+        realtime_download_speed_bps: download_speed_bps,
         upload_speed_bps: status.upload_speed.parse().unwrap_or(0),
         eta_seconds,
         connections: status.connections.and_then(|v| v.parse().ok()),
