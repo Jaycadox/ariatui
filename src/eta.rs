@@ -85,16 +85,25 @@ pub(crate) fn project_scheduled_eta(
     if observed_total_speed_bps <= 0.0 {
         return None;
     }
+    let observed_total_speed_bps_u64 = observed_total_speed_bps.round() as u64;
+    let effective_usual_speed_bps = if snapshot.scheduler.effective_limit_bps.is_some() {
+        snapshot
+            .scheduler
+            .usual_internet_speed_bps
+            .map(|usual| usual.max(observed_total_speed_bps_u64))
+    } else {
+        None
+    };
 
     let current_cap = min_limit(
         snapshot.scheduler.effective_limit_bps,
-        snapshot.scheduler.usual_internet_speed_bps,
+        effective_usual_speed_bps,
     );
     let aggregate_model = match current_cap {
         Some(limit) if limit > 0 => AggregateSpeedModel::Utilization(
             (observed_total_speed_bps / limit as f64).clamp(0.0, 1.0),
         ),
-        _ => AggregateSpeedModel::Observed(observed_total_speed_bps.round() as u64),
+        _ => AggregateSpeedModel::Observed(observed_total_speed_bps_u64),
     };
 
     let mut projected_now_speed_bps = None;
@@ -111,11 +120,11 @@ pub(crate) fn project_scheduled_eta(
         }
         let slot_cap = min_limit(
             snapshot.scheduler.schedule_limits_bps[hour],
-            snapshot.scheduler.usual_internet_speed_bps,
+            effective_usual_speed_bps,
         );
         let aggregate_speed_bps = estimated_aggregate_speed_bps(
             aggregate_model,
-            observed_total_speed_bps as u64,
+            observed_total_speed_bps_u64,
             slot_cap,
         ) as f64;
         if aggregate_speed_bps <= 0.0 {
@@ -509,6 +518,36 @@ mod tests {
         ));
         assert_eq!(projection.phases[1].projected_aggregate_speed_bps, 500);
         assert_eq!(projection.phases[1].projected_item_speed_bps, 200);
+    }
+
+    #[test]
+    fn observed_total_above_usual_speed_is_not_clamped_down() {
+        let now = Local.with_ymd_and_hms(2026, 4, 9, 10, 0, 0).unwrap();
+        let schedule = [Some(3_000); 24];
+        let selected = active_item("alpha.iso", 4_400, 2_200);
+        let snapshot = snapshot_with(Some(3_000), Some(1_800), schedule, vec![selected.clone()]);
+
+        let projection = project_scheduled_eta(now, &snapshot, &selected).expect("projection");
+
+        assert_eq!(projection.projected_now_speed_bps, 2_200);
+        assert_eq!(projection.phases[0].projected_aggregate_speed_bps, 2_200);
+        assert_eq!(projection.phases[0].projected_item_speed_bps, 2_200);
+        assert_eq!(projection.eta_seconds, 2);
+    }
+
+    #[test]
+    fn unlimited_current_cap_ignores_usual_speed_entirely() {
+        let now = Local.with_ymd_and_hms(2026, 4, 9, 10, 0, 0).unwrap();
+        let schedule = [Some(3_000); 24];
+        let selected = active_item("alpha.iso", 4_400, 2_200);
+        let snapshot = snapshot_with(None, Some(1_800), schedule, vec![selected.clone()]);
+
+        let projection = project_scheduled_eta(now, &snapshot, &selected).expect("projection");
+
+        assert_eq!(projection.projected_now_speed_bps, 2_200);
+        assert_eq!(projection.phases[0].projected_aggregate_speed_bps, 2_200);
+        assert_eq!(projection.phases[0].projected_item_speed_bps, 2_200);
+        assert_eq!(projection.eta_seconds, 2);
     }
 
     #[test]
