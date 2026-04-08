@@ -10,17 +10,15 @@ use axum_extra::extract::{
     CookieJar,
     cookie::{Cookie, SameSite},
 };
-use chrono::{Local, Timelike};
+use chrono::{Duration, Local, Timelike};
 use color_eyre::eyre::Result;
 use serde::{Deserialize, Serialize};
 use time::Duration as CookieDuration;
 
 use crate::{
-    daemon::{
-        ApiPayload, ApiRequest, DownloadItem, DownloadStatus, SharedDaemonState, Snapshot,
-        snapshot::SchedulerSnapshot,
-    },
+    daemon::{ApiPayload, ApiRequest, DownloadItem, DownloadStatus, SharedDaemonState, Snapshot},
     download_uri::is_http_like_uri,
+    eta::{ProjectionPhaseEnd, ScheduledEtaPhase, ScheduledEtaProjection, project_scheduled_eta},
     list_view::{
         CurrentFilter, CurrentSort, HistoryFilter, HistorySort, current_visible_items,
         history_visible_items,
@@ -1623,7 +1621,7 @@ fn render_current_page(
     let _ = write!(
         body,
         r#"<aside class="card"><h2>Details</h2>{}</aside>"#,
-        render_download_details(selected, &snapshot.scheduler)
+        render_download_details(selected, snapshot)
     );
     body.push_str("</div>");
     render_shell(snapshot, WebTab::Current, &body, auto_refresh, "Current")
@@ -1812,7 +1810,7 @@ fn render_history_page(snapshot: &Snapshot, query: &HistoryListQuery) -> String 
         visible_count = visible.len(),
         total_count = snapshot.history_downloads.len(),
         rows = rows,
-        details = render_download_details(selected, &snapshot.scheduler)
+        details = render_download_details(selected, snapshot)
     );
     render_shell(snapshot, WebTab::History, &body, true, "History")
 }
@@ -2239,10 +2237,12 @@ fn render_disabled_message() -> String {
     )
 }
 
-fn render_download_details(item: Option<&DownloadItem>, scheduler: &SchedulerSnapshot) -> String {
+fn render_download_details(item: Option<&DownloadItem>, snapshot: &Snapshot) -> String {
     let Some(item) = item else {
         return "<p>No item selected.</p>".into();
     };
+    let now = Local::now();
+    let projection = project_scheduled_eta(now, snapshot, item);
     let mut extra = String::new();
     if item.info_hash.is_some() || item.num_seeders.is_some() || item.belongs_to.is_some() {
         let _ = write!(
@@ -2272,6 +2272,29 @@ fn render_download_details(item: Option<&DownloadItem>, scheduler: &SchedulerSna
             let _ = write!(extra, r#"<dt>Parent GID</dt><dd>{}</dd>"#, esc(parent));
         }
     }
+    let projected_eta = projection.as_ref().map(|projection| projection.eta_seconds);
+    let projected_speed = projection
+        .as_ref()
+        .map(|projection| format_bytes_per_sec(projection.projected_now_speed_bps))
+        .unwrap_or_else(|| "--".into());
+    let projected_phase_count = projection
+        .as_ref()
+        .map(|projection| {
+            if projection.phase_count > projection.phases.len() {
+                format!(
+                    "{} shown of {}",
+                    projection.phases.len(),
+                    projection.phase_count
+                )
+            } else {
+                projection.phase_count.to_string()
+            }
+        })
+        .unwrap_or_else(|| "--".into());
+    let projection_visual = projection
+        .as_ref()
+        .map(|projection| render_projection_visuals(now, projection))
+        .unwrap_or_default();
     format!(
         r#"<dl class="details">
 <dt>Name</dt><dd>{}</dd>
@@ -2279,24 +2302,188 @@ fn render_download_details(item: Option<&DownloadItem>, scheduler: &SchedulerSna
 <dt>Progress</dt><dd>{} / {}</dd>
 <dt>Speed</dt><dd>{}</dd>
 <dt>ETA</dt><dd>{}</dd>
-<dt>Scheduled ETA</dt><dd>{}</dd>
+<dt>Projected Scheduled ETA</dt><dd>{}</dd>
+<dt>Projected speed now</dt><dd>{}</dd>
+<dt>Projection phases</dt><dd>{}</dd>
 <dt>Path</dt><dd>{}</dd>
 <dt>Source</dt><dd>{}</dd>
 <dt>Error</dt><dd>{}</dd>
 {}
-</dl>"#,
+</dl>{}"#,
         esc(&item.name),
         esc(&item.gid),
         esc(&format_bytes(item.completed_bytes)),
         esc(&format_bytes(item.total_bytes)),
         esc(&format_bytes_per_sec(item.download_speed_bps)),
         esc(&format_eta(item.eta_seconds)),
-        esc(&format_eta(scheduled_eta_seconds(item, scheduler))),
+        esc(&format_eta(projected_eta)),
+        esc(&projected_speed),
+        esc(&projected_phase_count),
         esc(item.primary_path.as_deref().unwrap_or("-")),
         esc(item.source_uri.as_deref().unwrap_or("-")),
         esc(item.error_message.as_deref().unwrap_or("-")),
         extra,
+        projection_visual,
     )
+}
+
+fn render_projection_visuals(
+    now: chrono::DateTime<Local>,
+    projection: &ScheduledEtaProjection,
+) -> String {
+    if projection.phases.is_empty() {
+        return String::new();
+    }
+    format!(
+        r#"<div class="projection-shell">{timeline}<ul class="phase-list">{phases}</ul></div>"#,
+        timeline = render_projection_timeline(now, projection),
+        phases = render_projection_phase_list(now, projection),
+    )
+}
+
+fn render_projection_timeline(
+    now: chrono::DateTime<Local>,
+    projection: &ScheduledEtaProjection,
+) -> String {
+    let total_duration = projection
+        .phases
+        .iter()
+        .map(|phase| phase.duration_seconds.max(1))
+        .sum::<u64>()
+        .max(1);
+    let view_width = 580.0;
+    let mut x = 0.0;
+    let mut body = String::new();
+    body.push_str(
+        r#"<svg class="projection-chart" viewBox="0 0 580 92" role="img" aria-label="Projected scheduled ETA phases">"#,
+    );
+    body.push_str(r##"<rect x="0" y="0" width="580" height="92" rx="10" fill="#101010"/>"##);
+    for phase in &projection.phases {
+        let width =
+            ((phase.duration_seconds.max(1) as f64 / total_duration as f64) * view_width).max(2.0);
+        let fill = match &phase.end {
+            ProjectionPhaseEnd::HourBoundary => "#4f8cff",
+            ProjectionPhaseEnd::PeerCompleted { .. } => "#25c2a0",
+            ProjectionPhaseEnd::SelectedCompleted => "#f2c94c",
+        };
+        let tooltip = format!(
+            "{} | {} | {} | {}",
+            phase_range_label(now, phase),
+            format_bytes_per_sec(phase.projected_item_speed_bps),
+            peer_summary(phase),
+            phase_event_summary(phase)
+        );
+        let _ = write!(
+            body,
+            r#"<g><rect x="{x:.1}" y="18" width="{width:.1}" height="32" rx="4" fill="{fill}"><title>{title}</title></rect>"#,
+            x = x,
+            width = width,
+            fill = fill,
+            title = esc(&tooltip),
+        );
+        if width >= 86.0 {
+            let _ = write!(
+                body,
+                r##"<text x="{:.1}" y="38" text-anchor="middle" fill="#101010" font-size="11">{}</text>"##,
+                x + width / 2.0,
+                esc(&format_bytes_per_sec(phase.projected_item_speed_bps))
+            );
+        }
+        body.push_str("</g>");
+        x += width;
+    }
+    body.push_str(r##"<text x="16" y="72" fill="#bdbdbd" font-size="11">Blue: schedule change · Green: peer finished · Gold: selected download finished</text>"##);
+    body.push_str("</svg>");
+    body
+}
+
+fn render_projection_phase_list(
+    now: chrono::DateTime<Local>,
+    projection: &ScheduledEtaProjection,
+) -> String {
+    let shown_phase_count = projection.phases.len().min(3);
+    let mut body = String::new();
+    for phase in projection.phases.iter().take(shown_phase_count) {
+        let _ = write!(
+            body,
+            "<li>{} &nbsp; {} &nbsp; {}</li>",
+            esc(&phase_range_label(now, phase)),
+            esc(&format_bytes_per_sec(phase.projected_item_speed_bps)),
+            esc(&phase_summary(phase))
+        );
+    }
+    if projection.phase_count > shown_phase_count {
+        let _ = write!(
+            body,
+            "<li>+{} more projected phases</li>",
+            projection.phase_count - shown_phase_count
+        );
+    }
+    body
+}
+
+fn phase_range_label(now: chrono::DateTime<Local>, phase: &ScheduledEtaPhase) -> String {
+    let start = if phase.start_offset_seconds == 0 {
+        "now".into()
+    } else {
+        phase_clock_label(now, phase.start_offset_seconds)
+    };
+    let end = match &phase.end {
+        ProjectionPhaseEnd::SelectedCompleted => "done".into(),
+        _ => phase_clock_label(now, phase.start_offset_seconds + phase.duration_seconds),
+    };
+    format!("{start}-{end}")
+}
+
+fn phase_clock_label(now: chrono::DateTime<Local>, offset_seconds: u64) -> String {
+    let timestamp = now + Duration::seconds(offset_seconds as i64);
+    if timestamp.date_naive() == now.date_naive() {
+        timestamp.format("%H:%M").to_string()
+    } else {
+        timestamp.format("%a %H:%M").to_string()
+    }
+}
+
+fn phase_summary(phase: &ScheduledEtaPhase) -> String {
+    let sharing = format!(
+        "of {} aggregate, {}",
+        format_bytes_per_sec(phase.projected_aggregate_speed_bps),
+        peer_summary(phase)
+    );
+    match &phase.end {
+        ProjectionPhaseEnd::HourBoundary => format!("{sharing} until schedule change"),
+        ProjectionPhaseEnd::PeerCompleted { name } => format!("{sharing} until {name} finished"),
+        ProjectionPhaseEnd::SelectedCompleted => sharing,
+    }
+}
+
+fn phase_event_summary(phase: &ScheduledEtaPhase) -> &'static str {
+    match &phase.end {
+        ProjectionPhaseEnd::HourBoundary => "schedule change",
+        ProjectionPhaseEnd::PeerCompleted { .. } => "peer finished",
+        ProjectionPhaseEnd::SelectedCompleted => "selected download finished",
+    }
+}
+
+fn peer_summary(phase: &ScheduledEtaPhase) -> String {
+    if phase.peer_count == 0 {
+        "full observed share".into()
+    } else {
+        format!("shared with {}", peer_names_summary(phase))
+    }
+}
+
+fn peer_names_summary(phase: &ScheduledEtaPhase) -> String {
+    let shown = phase.peer_names.iter().take(2).cloned().collect::<Vec<_>>();
+    let mut summary = shown.join(", ");
+    let remaining = phase.peer_count.saturating_sub(shown.len());
+    if remaining > 0 {
+        if !summary.is_empty() {
+            summary.push_str(", ");
+        }
+        summary.push_str(&format!("+{remaining} more"));
+    }
+    summary
 }
 
 fn progress_text(item: &DownloadItem) -> String {
@@ -2464,6 +2651,10 @@ input, select { width: 100%; box-sizing: border-box; background: #0f0f0f; color:
 .schedule-chart { width: 100%; min-width: 584px; height: auto; display: block; }
 .details dt { color: #bbb; margin-top: 0.5rem; }
 .details dd { margin-left: 0; margin-bottom: 0.35rem; word-break: break-word; }
+.projection-shell { margin-top: 0.9rem; }
+.projection-chart { width: 100%; height: auto; display: block; margin-bottom: 0.6rem; }
+.phase-list { margin: 0; padding-left: 1.25rem; color: #ddd; }
+.phase-list li { margin-bottom: 0.3rem; }
 code { background: #0d0d0d; padding: 0.15rem 0.25rem; }
 .pin { font-size: 2.4rem; font-weight: bold; letter-spacing: 0.25rem; text-align: center; margin: 1rem 0; color: #7fe27f; }
 @media (max-width: 900px) { .split, .grid2 { grid-template-columns: 1fr; } }
@@ -2520,95 +2711,4 @@ if (document.body.dataset.autorefresh === "1") {
   }, 1500);
 }
 "#
-}
-
-fn scheduled_eta_seconds(item: &DownloadItem, scheduler: &SchedulerSnapshot) -> Option<u64> {
-    if scheduler.mode != ManualOrScheduled::Scheduled {
-        return None;
-    }
-    let remaining_bytes = item.total_bytes.checked_sub(item.completed_bytes)?;
-    if remaining_bytes == 0 {
-        return Some(0);
-    }
-    if item.download_speed_bps == 0 {
-        return None;
-    }
-
-    let current_cap = min_limit(
-        scheduler.effective_limit_bps,
-        scheduler.usual_internet_speed_bps,
-    );
-    let speed_model = match current_cap {
-        Some(limit) if limit > 0 => {
-            SpeedModel::Utilization((item.download_speed_bps as f64 / limit as f64).clamp(0.0, 1.0))
-        }
-        _ => SpeedModel::Observed(item.download_speed_bps),
-    };
-
-    let now = chrono::Local::now();
-    let mut hour = now.hour() as usize;
-    let mut elapsed_seconds = 0u64;
-    let mut remaining = remaining_bytes as f64;
-    let seconds_past_hour = now.minute() as u64 * 60 + now.second() as u64;
-    let first_slot_seconds = (3600 - seconds_past_hour).max(1);
-
-    for step in 0..(24 * 365) {
-        let slot_seconds = if step == 0 { first_slot_seconds } else { 3600 };
-        let slot_speed = estimated_slot_speed_bps(
-            speed_model,
-            item.download_speed_bps,
-            min_limit(
-                scheduler.schedule_limits_bps[hour],
-                scheduler.usual_internet_speed_bps,
-            ),
-        );
-        if slot_speed > 0 {
-            let slot_capacity = slot_speed as f64 * slot_seconds as f64;
-            if slot_capacity >= remaining {
-                return Some(elapsed_seconds + (remaining / slot_speed as f64).ceil() as u64);
-            }
-            remaining -= slot_capacity;
-        }
-        elapsed_seconds += slot_seconds;
-        hour = (hour + 1) % 24;
-    }
-    None
-}
-
-#[derive(Debug, Clone, Copy)]
-enum SpeedModel {
-    Utilization(f64),
-    Observed(u64),
-}
-
-fn estimated_slot_speed_bps(
-    model: SpeedModel,
-    current_speed_bps: u64,
-    scheduled_limit_bps: Option<u64>,
-) -> u64 {
-    match model {
-        SpeedModel::Utilization(ratio) => {
-            if ratio <= 0.0 {
-                0
-            } else {
-                match scheduled_limit_bps {
-                    Some(limit) => ((limit as f64 * ratio).round() as u64).max(1),
-                    None => current_speed_bps,
-                }
-            }
-        }
-        SpeedModel::Observed(speed) => match scheduled_limit_bps {
-            Some(limit) => speed.min(limit),
-            None => speed,
-        },
-    }
-}
-
-fn min_limit(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-    match (left, right) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    }
 }

@@ -1,4 +1,4 @@
-use chrono::{Local, Timelike};
+use chrono::{Duration, Local};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -8,10 +8,10 @@ use ratatui::{
 };
 
 use crate::{
-    daemon::snapshot::SchedulerSnapshot,
     daemon::{DownloadItem, DownloadStatus, Snapshot},
+    eta::{ProjectionPhaseEnd, ScheduledEtaPhase, project_scheduled_eta},
     routing::{DownloadRoutingRule, describe_directory_input, match_rule, validate_rule},
-    state::{ManualOrScheduled, TorrentStreamingMode, validate_torrent_size_mib},
+    state::{TorrentStreamingMode, validate_torrent_size_mib},
     tui::{
         app::{ModalState, ScheduleRange, UiApp},
         focus::TabKind,
@@ -171,7 +171,7 @@ fn draw_current(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
 
     if app.show_details {
         frame.render_widget(
-            details_paragraph(app.current_selected(), &app.snapshot.scheduler),
+            details_paragraph(app.current_selected(), &app.snapshot),
             layout[1],
         );
     }
@@ -233,7 +233,7 @@ fn draw_history(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
     frame.render_widget(table, left[1]);
     if app.show_details {
         frame.render_widget(
-            details_paragraph(app.history_selected(), &app.snapshot.scheduler),
+            details_paragraph(app.history_selected(), &app.snapshot),
             layout[1],
         );
     }
@@ -1112,11 +1112,10 @@ fn status_label(status: &DownloadStatus) -> &'static str {
     }
 }
 
-fn details_paragraph(
-    item: Option<&DownloadItem>,
-    scheduler: &SchedulerSnapshot,
-) -> Paragraph<'static> {
+fn details_paragraph(item: Option<&DownloadItem>, snapshot: &Snapshot) -> Paragraph<'static> {
     let body = if let Some(item) = item {
+        let now = Local::now();
+        let projection = project_scheduled_eta(now, snapshot, item);
         let mut lines = vec![
             Line::from(format!("Name: {}", item.name)),
             Line::from(format!("GID: {}", item.gid)),
@@ -1131,8 +1130,8 @@ fn details_paragraph(
             )),
             Line::from(format!("ETA: {}", format_eta(item.eta_seconds))),
             Line::from(format!(
-                "Scheduled ETA: {}",
-                format_eta(scheduled_eta_seconds(item, scheduler))
+                "Projected Scheduled ETA: {}",
+                format_eta(projection.as_ref().map(|projection| projection.eta_seconds))
             )),
             Line::from(format!(
                 "Path: {}",
@@ -1147,6 +1146,25 @@ fn details_paragraph(
                 item.error_message.clone().unwrap_or_else(|| "-".into())
             )),
         ];
+        if let Some(projection) = projection.as_ref() {
+            let shown_phase_count = projection.phases.len().min(3);
+            lines.push(Line::from(""));
+            lines.push(Line::from("Bandwidth phases:"));
+            for phase in projection.phases.iter().take(shown_phase_count) {
+                lines.push(Line::from(format!(
+                    "{}  {}  {}",
+                    phase_range_label(now, phase),
+                    format_bytes_per_sec(phase.projected_item_speed_bps),
+                    phase_summary(phase)
+                )));
+            }
+            if projection.phase_count > shown_phase_count {
+                lines.push(Line::from(format!(
+                    "+{} more projected phases",
+                    projection.phase_count - shown_phase_count
+                )));
+            }
+        }
         if item.info_hash.is_some() || item.num_seeders.is_some() || item.belongs_to.is_some() {
             lines.push(Line::from(""));
             lines.push(Line::from("Torrent:"));
@@ -1185,113 +1203,60 @@ fn details_paragraph(
         .wrap(Wrap { trim: false })
 }
 
-fn scheduled_eta_seconds(item: &DownloadItem, scheduler: &SchedulerSnapshot) -> Option<u64> {
-    if scheduler.mode != ManualOrScheduled::Scheduled {
-        return None;
-    }
-
-    let remaining_bytes = item.total_bytes.checked_sub(item.completed_bytes)?;
-    if remaining_bytes == 0 {
-        return Some(0);
-    }
-    if item.download_speed_bps == 0 {
-        return None;
-    }
-
-    let current_cap = min_limit(
-        scheduler.effective_limit_bps,
-        scheduler.usual_internet_speed_bps,
-    );
-
-    let speed_model = match current_cap {
-        Some(limit) if limit > 0 => {
-            SpeedModel::Utilization((item.download_speed_bps as f64 / limit as f64).clamp(0.0, 1.0))
-        }
-        _ => SpeedModel::Observed(item.download_speed_bps),
+fn phase_range_label(now: chrono::DateTime<Local>, phase: &ScheduledEtaPhase) -> String {
+    let start = if phase.start_offset_seconds == 0 {
+        "now".into()
+    } else {
+        phase_clock_label(now, phase.start_offset_seconds)
     };
+    let end = match &phase.end {
+        ProjectionPhaseEnd::SelectedCompleted => "done".into(),
+        _ => phase_clock_label(now, phase.start_offset_seconds + phase.duration_seconds),
+    };
+    format!("{start}-{end}")
+}
 
-    let daily_capacity = scheduler
-        .schedule_limits_bps
-        .iter()
-        .map(|limit| {
-            estimated_slot_speed_bps(
-                speed_model,
-                item.download_speed_bps,
-                min_limit(*limit, scheduler.usual_internet_speed_bps),
-            ) * 3600
-        })
-        .sum::<u64>();
-    if daily_capacity == 0 {
-        return None;
+fn phase_clock_label(now: chrono::DateTime<Local>, offset_seconds: u64) -> String {
+    let timestamp = now + Duration::seconds(offset_seconds as i64);
+    if timestamp.date_naive() == now.date_naive() {
+        timestamp.format("%H:%M").to_string()
+    } else {
+        timestamp.format("%a %H:%M").to_string()
     }
+}
 
-    let now = Local::now();
-    let mut hour = now.hour() as usize;
-    let mut elapsed_seconds = 0u64;
-    let mut remaining = remaining_bytes as f64;
-    let seconds_past_hour = now.minute() as u64 * 60 + now.second() as u64;
-    let first_slot_seconds = (3600 - seconds_past_hour).max(1);
+fn phase_summary(phase: &ScheduledEtaPhase) -> String {
+    let sharing = format!(
+        "of {} aggregate, {}",
+        format_bytes_per_sec(phase.projected_aggregate_speed_bps),
+        peer_summary(phase)
+    );
+    match &phase.end {
+        ProjectionPhaseEnd::HourBoundary => format!("{sharing} until schedule change"),
+        ProjectionPhaseEnd::PeerCompleted { name } => format!("{sharing} until {name} finished"),
+        ProjectionPhaseEnd::SelectedCompleted => sharing,
+    }
+}
 
-    for step in 0..(24 * 365) {
-        let slot_seconds = if step == 0 { first_slot_seconds } else { 3600 };
-        let slot_speed = estimated_slot_speed_bps(
-            speed_model,
-            item.download_speed_bps,
-            min_limit(
-                scheduler.schedule_limits_bps[hour],
-                scheduler.usual_internet_speed_bps,
-            ),
-        );
-        if slot_speed > 0 {
-            let slot_capacity = slot_speed as f64 * slot_seconds as f64;
-            if slot_capacity >= remaining {
-                return Some(elapsed_seconds + (remaining / slot_speed as f64).ceil() as u64);
-            }
-            remaining -= slot_capacity;
+fn peer_summary(phase: &ScheduledEtaPhase) -> String {
+    if phase.peer_count == 0 {
+        "full observed share".into()
+    } else {
+        format!("shared with {}", peer_names_summary(phase))
+    }
+}
+
+fn peer_names_summary(phase: &ScheduledEtaPhase) -> String {
+    let shown = phase.peer_names.iter().take(2).cloned().collect::<Vec<_>>();
+    let mut summary = shown.join(", ");
+    let remaining = phase.peer_count.saturating_sub(shown.len());
+    if remaining > 0 {
+        if !summary.is_empty() {
+            summary.push_str(", ");
         }
-        elapsed_seconds += slot_seconds;
-        hour = (hour + 1) % 24;
+        summary.push_str(&format!("+{remaining} more"));
     }
-
-    None
-}
-
-#[derive(Debug, Clone, Copy)]
-enum SpeedModel {
-    Utilization(f64),
-    Observed(u64),
-}
-
-fn estimated_slot_speed_bps(
-    model: SpeedModel,
-    current_speed_bps: u64,
-    scheduled_limit_bps: Option<u64>,
-) -> u64 {
-    match model {
-        SpeedModel::Utilization(ratio) => {
-            if ratio <= 0.0 {
-                0
-            } else {
-                match scheduled_limit_bps {
-                    Some(limit) => ((limit as f64 * ratio).round() as u64).max(1),
-                    None => current_speed_bps,
-                }
-            }
-        }
-        SpeedModel::Observed(speed) => match scheduled_limit_bps {
-            Some(limit) => speed.min(limit),
-            None => speed,
-        },
-    }
-}
-
-fn min_limit(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-    match (left, right) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    }
+    summary
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

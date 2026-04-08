@@ -4,6 +4,7 @@ mod cli;
 mod config;
 mod daemon;
 mod download_uri;
+mod eta;
 mod list_view;
 mod paths;
 mod routing;
