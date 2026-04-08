@@ -3,7 +3,6 @@ use chrono::{DateTime, Local, Timelike};
 use crate::daemon::{DownloadItem, DownloadStatus, Snapshot};
 use crate::state::ManualOrScheduled;
 
-const MAX_STORED_PHASES: usize = 6;
 const HORIZON_SECONDS: u64 = 24 * 365 * 3600;
 const PEER_NAME_LIMIT: usize = 3;
 const EPSILON: f64 = 1e-9;
@@ -213,17 +212,15 @@ pub(crate) fn project_scheduled_eta(
         };
 
         phase_count += 1;
-        if phases.len() < MAX_STORED_PHASES {
-            phases.push(ScheduledEtaPhase {
-                start_offset_seconds: elapsed_seconds.ceil() as u64,
-                duration_seconds: phase_duration_seconds.ceil().max(1.0) as u64,
-                projected_item_speed_bps: round_speed(selected_speed_bps),
-                projected_aggregate_speed_bps: round_speed(aggregate_speed_bps),
-                peer_count,
-                peer_names,
-                end: end.clone(),
-            });
-        }
+        phases.push(ScheduledEtaPhase {
+            start_offset_seconds: elapsed_seconds.ceil() as u64,
+            duration_seconds: phase_duration_seconds.ceil().max(1.0) as u64,
+            projected_item_speed_bps: round_speed(selected_speed_bps),
+            projected_aggregate_speed_bps: round_speed(aggregate_speed_bps),
+            peer_count,
+            peer_names,
+            end: end.clone(),
+        });
 
         elapsed_seconds += phase_duration_seconds;
         if selected_completed {

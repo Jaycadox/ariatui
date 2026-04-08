@@ -20,7 +20,9 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub enum BootstrapAction {
-    StartUi { initial_snapshot: Box<Option<Snapshot>> },
+    StartUi {
+        initial_snapshot: Box<Option<Snapshot>>,
+    },
     Exit,
 }
 

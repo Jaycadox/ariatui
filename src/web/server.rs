@@ -2283,17 +2283,7 @@ fn render_download_details(item: Option<&DownloadItem>, snapshot: &Snapshot) -> 
         .unwrap_or_else(|| "--".into());
     let projected_phase_count = projection
         .as_ref()
-        .map(|projection| {
-            if projection.phase_count > projection.phases.len() {
-                format!(
-                    "{} shown of {}",
-                    projection.phases.len(),
-                    projection.phase_count
-                )
-            } else {
-                projection.phase_count.to_string()
-            }
-        })
+        .map(|projection| projection.phase_count.to_string())
         .unwrap_or_else(|| "--".into());
     let projection_visual = projection
         .as_ref()
@@ -2405,22 +2395,14 @@ fn render_projection_phase_list(
     now: chrono::DateTime<Local>,
     projection: &ScheduledEtaProjection,
 ) -> String {
-    let shown_phase_count = projection.phases.len().min(3);
     let mut body = String::new();
-    for phase in projection.phases.iter().take(shown_phase_count) {
+    for phase in &projection.phases {
         let _ = write!(
             body,
             "<li>{} &nbsp; {} &nbsp; {}</li>",
             esc(&phase_range_label(now, phase)),
             esc(&format_bytes_per_sec(phase.projected_item_speed_bps)),
             esc(&phase_summary(phase))
-        );
-    }
-    if projection.phase_count > shown_phase_count {
-        let _ = write!(
-            body,
-            "<li>+{} more projected phases</li>",
-            projection.phase_count - shown_phase_count
         );
     }
     body

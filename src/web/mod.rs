@@ -291,9 +291,7 @@ pub async fn supervise(state: SharedDaemonState) -> Result<()> {
             let should_restart = keep.as_ref().is_some_and(|server| {
                 !desired.enabled || server.config != desired || server.task.is_finished()
             });
-            if should_restart
-                && let Some(server) = keep.take()
-            {
+            if should_restart && let Some(server) = keep.take() {
                 let _ = server.shutdown.send(());
                 if server.task.is_finished() {
                     match server.task.await {

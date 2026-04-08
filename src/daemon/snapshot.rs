@@ -382,7 +382,6 @@ impl Default for WebhookSnapshot {
     }
 }
 
-
 impl Default for WebUiSnapshot {
     fn default() -> Self {
         Self {
