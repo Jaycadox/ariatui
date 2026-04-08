@@ -232,6 +232,16 @@ pub(crate) fn project_scheduled_eta(
             });
         }
 
+        let transferred_weight = completed_indexes
+            .iter()
+            .copied()
+            .filter(|index| *index != selected_index)
+            .filter_map(|index| downloads.get(index).map(|download| download.weight))
+            .sum::<f64>();
+        if transferred_weight > 0.0 {
+            downloads[selected_index].weight += transferred_weight;
+        }
+
         for &index in completed_indexes.iter().rev() {
             downloads.remove(index);
         }
@@ -475,6 +485,30 @@ mod tests {
         assert_eq!(projection.phases[0].projected_aggregate_speed_bps, 300);
         assert_eq!(projection.phases[1].projected_aggregate_speed_bps, 150);
         assert_eq!(projection.phases[1].projected_item_speed_bps, 50);
+    }
+
+    #[test]
+    fn finishing_peer_transfers_its_speed_to_selected_download() {
+        let now = Local.with_ymd_and_hms(2026, 4, 9, 10, 0, 0).unwrap();
+        let schedule = [Some(500); 24];
+        let selected = active_item("alpha.iso", 1_000, 100);
+        let fast_peer = active_item("beta.iso", 100, 100);
+        let steady_peer = active_item("gamma.iso", 10_000, 300);
+        let snapshot = snapshot_with(
+            Some(500),
+            None,
+            schedule,
+            vec![selected.clone(), fast_peer, steady_peer],
+        );
+
+        let projection = project_scheduled_eta(now, &snapshot, &selected).expect("projection");
+
+        assert!(matches!(
+            projection.phases[0].end,
+            ProjectionPhaseEnd::PeerCompleted { ref name } if name == "beta.iso"
+        ));
+        assert_eq!(projection.phases[1].projected_aggregate_speed_bps, 500);
+        assert_eq!(projection.phases[1].projected_item_speed_bps, 200);
     }
 
     #[test]
