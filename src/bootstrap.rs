@@ -20,7 +20,7 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub enum BootstrapAction {
-    StartUi { initial_snapshot: Option<Snapshot> },
+    StartUi { initial_snapshot: Box<Option<Snapshot>> },
     Exit,
 }
 
@@ -40,7 +40,9 @@ pub async fn run_default_flow(app: &AppContext) -> Result<BootstrapAction> {
     if let Some(runtime_marker) = read_live_daemon_marker(&app.paths)? {
         if runtime_marker.build_id == app.current_build_id {
             let initial_snapshot = read_snapshot_cache(&app.paths);
-            return Ok(BootstrapAction::StartUi { initial_snapshot });
+            return Ok(BootstrapAction::StartUi {
+                initial_snapshot: Box::new(initial_snapshot),
+            });
         } else {
             eprintln!(
                 "AriaTUI fast path rejected .daemon marker: running pid {} build {} but current build is {}",
@@ -57,13 +59,13 @@ pub async fn run_default_flow(app: &AppContext) -> Result<BootstrapAction> {
     if let Some(snapshot) = running_snapshot.as_ref() {
         let snapshot = handle_outdated_daemon(app, snapshot, &service_status).await?;
         return Ok(BootstrapAction::StartUi {
-            initial_snapshot: Some(snapshot),
+            initial_snapshot: Box::new(Some(snapshot)),
         });
     }
 
     if !is_arch_linux()? || !has_systemd() {
         return Ok(BootstrapAction::StartUi {
-            initial_snapshot: None,
+            initial_snapshot: Box::new(None),
         });
     }
 
@@ -112,7 +114,7 @@ pub async fn run_default_flow(app: &AppContext) -> Result<BootstrapAction> {
             let snapshot =
                 wait_for_daemon_build_id(&app.paths, app.current_build_id.as_str()).await?;
             Ok(BootstrapAction::StartUi {
-                initial_snapshot: Some(snapshot),
+                initial_snapshot: Box::new(Some(snapshot)),
             })
         }
         's' => {
@@ -120,11 +122,11 @@ pub async fn run_default_flow(app: &AppContext) -> Result<BootstrapAction> {
             let snapshot =
                 wait_for_daemon_build_id(&app.paths, app.current_build_id.as_str()).await?;
             Ok(BootstrapAction::StartUi {
-                initial_snapshot: Some(snapshot),
+                initial_snapshot: Box::new(Some(snapshot)),
             })
         }
         'c' => Ok(BootstrapAction::StartUi {
-            initial_snapshot: None,
+            initial_snapshot: Box::new(None),
         }),
         'q' => Ok(BootstrapAction::Exit),
         _ => unreachable!(),
@@ -311,10 +313,10 @@ async fn fetch_daemon_snapshot_with_timeout(
 
 async fn wait_for_daemon_build_id(paths: &AppPaths, expected_build_id: &str) -> Result<Snapshot> {
     for _ in 0..24 {
-        if let Ok(snapshot) = fetch_daemon_snapshot_with_timeout(paths, 300, 800).await {
-            if snapshot.daemon_status.build_id == expected_build_id {
-                return Ok(snapshot);
-            }
+        if let Ok(snapshot) = fetch_daemon_snapshot_with_timeout(paths, 300, 800).await
+            && snapshot.daemon_status.build_id == expected_build_id
+        {
+            return Ok(snapshot);
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
     }

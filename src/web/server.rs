@@ -925,8 +925,8 @@ async fn save_range(
         .into_response();
     }
     let mut limits = snapshot.scheduler.schedule_limits_bps.to_vec();
-    for hour in form.start_hour..form.end_hour {
-        limits[hour] = limit;
+    for entry in limits.iter_mut().take(form.end_hour).skip(form.start_hour) {
+        *entry = limit;
     }
     let _ = state
         .execute(ApiRequest::SetSchedule { limits_bps: limits })
@@ -944,8 +944,12 @@ async fn delete_range(
     }
     let snapshot = state.snapshot().await;
     let mut limits = snapshot.scheduler.schedule_limits_bps.to_vec();
-    for hour in form.start_hour..form.end_hour.min(24) {
-        limits[hour] = None;
+    for entry in limits
+        .iter_mut()
+        .take(form.end_hour.min(24))
+        .skip(form.start_hour)
+    {
+        *entry = None;
     }
     let _ = state
         .execute(ApiRequest::SetSchedule { limits_bps: limits })
@@ -1544,7 +1548,7 @@ fn render_current_page(
                 query.filter,
                 query.sort,
             )),
-            esc(&status_label(&item.status)),
+            esc(status_label(&item.status)),
             esc(&item.name),
             esc(&progress_text(item)),
             esc(&format_bytes(item.completed_bytes)),
@@ -1753,7 +1757,7 @@ fn render_history_page(snapshot: &Snapshot, query: &HistoryListQuery) -> String 
 <td><form method="post" action="/history/{}/remove{}"><button>Forget</button></form></td>
 </tr>"#,
             esc(&item_query),
-            esc(&status_label(&item.status)),
+            esc(status_label(&item.status)),
             esc(&item.name),
             esc(&format_bytes(item.total_bytes)),
             esc(item.error_code.as_deref().unwrap_or("-")),
@@ -2514,11 +2518,11 @@ fn scheduler_ranges(snapshot: &Snapshot) -> Vec<(usize, usize, Option<u64>)> {
     let mut ranges = Vec::new();
     let mut start = 0usize;
     let mut current = limits[0];
-    for hour in 1..limits.len() {
-        if limits[hour] != current {
+    for (hour, &limit) in limits.iter().enumerate().skip(1) {
+        if limit != current {
             ranges.push((start, hour, current));
             start = hour;
-            current = limits[hour];
+            current = limit;
         }
     }
     ranges.push((start, limits.len(), current));

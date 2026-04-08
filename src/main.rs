@@ -76,7 +76,7 @@ async fn main() -> color_eyre::Result<()> {
         return match bootstrap::run_default_flow(context.as_ref()).await? {
             BootstrapAction::StartUi { initial_snapshot } => {
                 startup.mark("bootstrap.default.done");
-                tui::run(context, initial_snapshot).await
+                tui::run(context, *initial_snapshot).await
             }
             BootstrapAction::Exit => Ok(()),
         };

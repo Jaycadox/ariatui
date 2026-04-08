@@ -187,15 +187,15 @@ impl UiApp {
         let mut start = 0usize;
         let mut current = limits[0];
 
-        for hour in 1..limits.len() {
-            if limits[hour] != current {
+        for (hour, &limit) in limits.iter().enumerate().skip(1) {
+            if limit != current {
                 ranges.push(ScheduleRange {
                     start_hour: start,
                     end_hour: hour,
                     limit_bps: current,
                 });
                 start = hour;
-                current = limits[hour];
+                current = limit;
             }
         }
 
@@ -339,13 +339,13 @@ impl UiApp {
                 }
             }
             KeyCode::Char('x') => {
-                if self.tab == TabKind::History {
-                    if let Some(item) = self.history_selected() {
-                        self.issue(ApiRequest::RemoveHistory {
-                            gid: item.gid.clone(),
-                        })
-                        .await?;
-                    }
+                if self.tab == TabKind::History
+                    && let Some(item) = self.history_selected()
+                {
+                    self.issue(ApiRequest::RemoveHistory {
+                        gid: item.gid.clone(),
+                    })
+                    .await?;
                 }
             }
             KeyCode::Char('X') => {
@@ -702,8 +702,8 @@ impl UiApp {
                         }
                         let limit_bps = units::parse_limit(&limit)?;
                         let mut limits = self.snapshot.scheduler.schedule_limits_bps.to_vec();
-                        for hour in start_hour..end_hour {
-                            limits[hour] = limit_bps;
+                        for entry in limits.iter_mut().take(end_hour).skip(start_hour) {
+                            *entry = limit_bps;
                         }
                         self.issue(ApiRequest::SetSchedule { limits_bps: limits })
                             .await?;
@@ -934,8 +934,12 @@ impl UiApp {
     async fn set_selected_range_limit(&mut self, limit_bps: Option<u64>) -> Result<()> {
         if let Some(range) = self.selected_schedule_range() {
             let mut limits = self.snapshot.scheduler.schedule_limits_bps.to_vec();
-            for hour in range.start_hour..range.end_hour {
-                limits[hour] = limit_bps;
+            for entry in limits
+                .iter_mut()
+                .take(range.end_hour)
+                .skip(range.start_hour)
+            {
+                *entry = limit_bps;
             }
             self.issue(ApiRequest::SetSchedule { limits_bps: limits })
                 .await?;
@@ -959,10 +963,10 @@ impl UiApp {
     }
 
     async fn delete_selected_rule(&mut self) -> Result<()> {
-        if let Some(rule) = self.selected_routing_rule() {
-            if rule.pattern == "*" {
-                return Ok(());
-            }
+        if let Some(rule) = self.selected_routing_rule()
+            && rule.pattern == "*"
+        {
+            return Ok(());
         }
         let rules = self
             .snapshot

@@ -138,10 +138,10 @@ pub async fn log_child_output(mut rx: mpsc::UnboundedReceiver<ChildLogEvent>) {
 }
 
 fn expand_tilde(value: &str) -> PathBuf {
-    if let Some(stripped) = value.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(stripped);
-        }
+    if let Some(stripped) = value.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(stripped);
     }
     PathBuf::from(value)
 }

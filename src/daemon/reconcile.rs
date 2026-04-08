@@ -835,22 +835,22 @@ impl DaemonState {
 
     async fn check_child_exit(&self) -> Result<()> {
         let mut runtime = self.runtime.lock().await;
-        if let Some(current) = runtime.as_mut() {
-            if let Some(status) = current.child.try_wait()? {
-                warn!("aria2c exited unexpectedly: {status}");
-                {
-                    let mut snapshot = self.snapshot.write().await;
-                    snapshot.aria2_status.lifecycle = ChildLifecycle::Restarting;
-                    snapshot.aria2_status.last_exit = Some(status.to_string());
-                    snapshot.aria2_status.restart_count += 1;
-                }
-                *runtime = None;
-                drop(runtime);
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                let mut runtime = self.runtime.lock().await;
-                self.spawn_runtime(&mut runtime, ChildLifecycle::Restarting)
-                    .await?;
+        if let Some(current) = runtime.as_mut()
+            && let Some(status) = current.child.try_wait()?
+        {
+            warn!("aria2c exited unexpectedly: {status}");
+            {
+                let mut snapshot = self.snapshot.write().await;
+                snapshot.aria2_status.lifecycle = ChildLifecycle::Restarting;
+                snapshot.aria2_status.last_exit = Some(status.to_string());
+                snapshot.aria2_status.restart_count += 1;
             }
+            *runtime = None;
+            drop(runtime);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let mut runtime = self.runtime.lock().await;
+            self.spawn_runtime(&mut runtime, ChildLifecycle::Restarting)
+                .await?;
         }
         Ok(())
     }
@@ -974,7 +974,7 @@ fn filename_from_url(url: &str) -> String {
         .and_then(|parsed| {
             parsed
                 .path_segments()
-                .and_then(|segments| segments.filter(|segment| !segment.is_empty()).last())
+                .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
                 .map(str::to_string)
         })
         .filter(|segment| !segment.trim().is_empty())
@@ -1045,10 +1045,10 @@ fn is_torrent_target(
 }
 
 fn expand_tilde(value: &str) -> PathBuf {
-    if let Some(stripped) = value.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(stripped);
-        }
+    if let Some(stripped) = value.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(stripped);
     }
     PathBuf::from(value)
 }
@@ -1071,16 +1071,16 @@ async fn delete_paths(files: Vec<Aria2File>) -> Vec<String> {
     let mut warnings = Vec::new();
     for file in files {
         if let Some(path) = file.path {
-            if let Err(error) = tokio::fs::remove_file(&path).await {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    warnings.push(format!("failed to delete {path}: {error}"));
-                }
+            if let Err(error) = tokio::fs::remove_file(&path).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warnings.push(format!("failed to delete {path}: {error}"));
             }
             let sidecar = format!("{path}.aria2");
-            if let Err(error) = tokio::fs::remove_file(&sidecar).await {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    warnings.push(format!("failed to delete {sidecar}: {error}"));
-                }
+            if let Err(error) = tokio::fs::remove_file(&sidecar).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warnings.push(format!("failed to delete {sidecar}: {error}"));
             }
         }
     }

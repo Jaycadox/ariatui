@@ -104,10 +104,10 @@ pub fn match_rule(
 }
 
 pub fn expand_home(input: &str) -> PathBuf {
-    if let Some(stripped) = input.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(stripped);
-        }
+    if let Some(stripped) = input.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(stripped);
     }
     PathBuf::from(input)
 }

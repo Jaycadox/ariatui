@@ -112,10 +112,10 @@ pub async fn create_or_get_pairing(
 ) -> Result<(String, String)> {
     cleanup_expired_auth(state).await;
     let mut pairings = state.web_pairings.lock().await;
-    if let Some(request_id) = existing_request_id {
-        if let Some(pairing) = pairings.get(request_id) {
-            return Ok((request_id.to_string(), pairing.pin.clone()));
-        }
+    if let Some(request_id) = existing_request_id
+        && let Some(pairing) = pairings.get(request_id)
+    {
+        return Ok((request_id.to_string(), pairing.pin.clone()));
     }
 
     let pin = loop {
@@ -291,22 +291,22 @@ pub async fn supervise(state: SharedDaemonState) -> Result<()> {
             let should_restart = keep.as_ref().is_some_and(|server| {
                 !desired.enabled || server.config != desired || server.task.is_finished()
             });
-            if should_restart {
-                if let Some(server) = keep.take() {
-                    let _ = server.shutdown.send(());
-                    if server.task.is_finished() {
-                        match server.task.await {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => {
-                                warn!("web server exited: {error}");
-                            }
-                            Err(error) => {
-                                warn!("web server task join failed: {error}");
-                            }
+            if should_restart
+                && let Some(server) = keep.take()
+            {
+                let _ = server.shutdown.send(());
+                if server.task.is_finished() {
+                    match server.task.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            warn!("web server exited: {error}");
                         }
-                    } else {
-                        server.task.abort();
+                        Err(error) => {
+                            warn!("web server task join failed: {error}");
+                        }
                     }
+                } else {
+                    server.task.abort();
                 }
             }
             active = keep;

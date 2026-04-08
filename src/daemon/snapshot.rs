@@ -91,9 +91,10 @@ pub struct WebhookSnapshot {
     pub ping_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum WebUiStatus {
+    #[default]
     Disabled,
     Starting,
     Listening,
@@ -381,11 +382,6 @@ impl Default for WebhookSnapshot {
     }
 }
 
-impl Default for WebUiStatus {
-    fn default() -> Self {
-        Self::Disabled
-    }
-}
 
 impl Default for WebUiSnapshot {
     fn default() -> Self {
