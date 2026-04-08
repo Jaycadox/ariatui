@@ -26,7 +26,10 @@ use crate::{
         history_visible_items,
     },
     routing::{DownloadRoutingRule, describe_directory_input, match_rule, validate_rule},
-    state::{CancelBehaviorPreference, ManualOrScheduled},
+    state::{
+        CancelBehaviorPreference, ManualOrScheduled, TorrentStreamingMode,
+        validate_torrent_size_mib,
+    },
     units::{self, Percentage, format_bytes, format_bytes_per_sec, format_eta, format_limit},
     web::{
         AUTH_COOKIE_NAME, PAIR_COOKIE_NAME, PairingStatus, create_or_get_pairing, pairing_status,
@@ -72,6 +75,7 @@ pub fn router(state: SharedDaemonState) -> Router {
         .route("/scheduler/range/save", post(save_range))
         .route("/scheduler/range/delete", post(delete_range))
         .route("/scheduler/mode", post(set_scheduler_mode))
+        .route("/torrents", get(torrents_page).post(save_torrents))
         .route("/routing", get(routing_page))
         .route("/routing/rule/new", get(new_rule_page))
         .route("/routing/rule/{index}/edit", get(edit_rule_page))
@@ -90,6 +94,7 @@ enum WebTab {
     Current,
     History,
     Scheduler,
+    Torrents,
     Routing,
     Webhooks,
     WebUi,
@@ -101,6 +106,7 @@ impl WebTab {
             Self::Current => "Current",
             Self::History => "History",
             Self::Scheduler => "Scheduler",
+            Self::Torrents => "Torrents",
             Self::Routing => "Routing",
             Self::Webhooks => "Webhooks",
             Self::WebUi => "Web UI",
@@ -112,17 +118,19 @@ impl WebTab {
             Self::Current => "/current",
             Self::History => "/history",
             Self::Scheduler => "/scheduler",
+            Self::Torrents => "/torrents",
             Self::Routing => "/routing",
             Self::Webhooks => "/webhooks",
             Self::WebUi => "/web-ui",
         }
     }
 
-    fn all() -> [Self; 6] {
+    fn all() -> [Self; 7] {
         [
             Self::Current,
             Self::History,
             Self::Scheduler,
+            Self::Torrents,
             Self::Routing,
             Self::Webhooks,
             Self::WebUi,
@@ -194,6 +202,13 @@ struct WebUiFormData {
     bind_address: String,
     port: u16,
     cookie_days: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct TorrentSettingsFormData {
+    mode: String,
+    head_size_mib: u32,
+    tail_size_mib: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -695,6 +710,56 @@ async fn scheduler_page(State(state): State<SharedDaemonState>, jar: CookieJar) 
     }
     let snapshot = state.snapshot().await;
     Html(render_scheduler_page(&snapshot, None)).into_response()
+}
+
+async fn torrents_page(State(state): State<SharedDaemonState>, jar: CookieJar) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    Html(render_torrents_page(&snapshot, None)).into_response()
+}
+
+async fn save_torrents(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Form(form): Form<TorrentSettingsFormData>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    let mode = match form.mode.as_str() {
+        "off" => TorrentStreamingMode::Off,
+        "start_first" => TorrentStreamingMode::StartFirst,
+        "start_and_end_first" => TorrentStreamingMode::StartAndEndFirst,
+        _ => {
+            return Html(render_torrents_page(
+                &snapshot,
+                Some("mode must be off, start_first, or start_and_end_first"),
+            ))
+            .into_response();
+        }
+    };
+    if let Err(error) = validate_torrent_size_mib(form.head_size_mib, "torrent head size") {
+        return Html(render_torrents_page(&snapshot, Some(&error.to_string()))).into_response();
+    }
+    if let Err(error) = validate_torrent_size_mib(form.tail_size_mib, "torrent tail size") {
+        return Html(render_torrents_page(&snapshot, Some(&error.to_string()))).into_response();
+    }
+    match state
+        .execute(ApiRequest::SetTorrentStreamingSettings {
+            mode,
+            head_size_mib: form.head_size_mib,
+            tail_size_mib: form.tail_size_mib,
+        })
+        .await
+    {
+        Ok(_) => Redirect::to("/torrents").into_response(),
+        Err(error) => {
+            Html(render_torrents_page(&snapshot, Some(&error.to_string()))).into_response()
+        }
+    }
 }
 
 async fn edit_manual_page(State(state): State<SharedDaemonState>, jar: CookieJar) -> Response {
@@ -1825,6 +1890,60 @@ fn render_scheduler_page(snapshot: &Snapshot, error: Option<&str>) -> String {
         rows,
     );
     render_shell(snapshot, WebTab::Scheduler, &body, true, "Scheduler")
+}
+
+fn render_torrents_page(snapshot: &Snapshot, error: Option<&str>) -> String {
+    let mut body = String::new();
+    if let Some(error) = error {
+        let _ = write!(body, "<p class=\"error\">{}</p>", esc(error));
+    }
+    let mode = snapshot.torrents.mode;
+    let _ = write!(
+        body,
+        r#"<section class="card narrow-card">
+<h2>Torrent Streaming</h2>
+<p class="muted">These defaults apply only to new magnet and remote .torrent downloads.</p>
+<p class="muted">aria2 does not support true sequential torrent download. This feature uses <code>bt-prioritize-piece</code> to favor the beginning of files, and optionally the end as well.</p>
+<form method="post" action="/torrents" class="stack">
+<label>Mode</label>
+<select name="mode">
+<option value="off" {}>Off</option>
+<option value="start_first" {}>Start first</option>
+<option value="start_and_end_first" {}>Start and end first</option>
+</select>
+<label>Start-first size (MiB)</label>
+<input type="number" name="head_size_mib" min="1" max="8192" value="{}">
+<label>End-first size (MiB)</label>
+<input type="number" name="tail_size_mib" min="1" max="8192" value="{}">
+<p>Current aria2 option: <code>{}</code></p>
+<p class="muted">Typical values: start first 32 MiB, end first 4 MiB. Start + end first is useful for media containers that store indexes near the end of the file.</p>
+<div class="actions"><button type="submit">Save settings</button></div>
+</form>
+</section>"#,
+        if mode == TorrentStreamingMode::Off {
+            "selected"
+        } else {
+            ""
+        },
+        if mode == TorrentStreamingMode::StartFirst {
+            "selected"
+        } else {
+            ""
+        },
+        if mode == TorrentStreamingMode::StartAndEndFirst {
+            "selected"
+        } else {
+            ""
+        },
+        snapshot.torrents.head_size_mib,
+        snapshot.torrents.tail_size_mib,
+        esc(snapshot
+            .torrents
+            .aria2_prioritize_piece
+            .as_deref()
+            .unwrap_or("off"),),
+    );
+    render_shell(snapshot, WebTab::Torrents, &body, true, "Torrent Streaming")
 }
 
 fn render_limit_editor_page(

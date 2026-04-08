@@ -57,6 +57,9 @@ mod tests {
             web_ui_port: 39123,
             web_ui_cookie_days: 30,
             web_ui_session_secret: String::new(),
+            torrent_streaming_mode: crate::state::TorrentStreamingMode::Off,
+            torrent_head_size_mib: 32,
+            torrent_tail_size_mib: 4,
         };
         let now = Local.with_ymd_and_hms(2026, 4, 7, 10, 30, 0).unwrap();
         let resolved = resolve(now, &state).expect("resolve");

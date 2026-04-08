@@ -11,7 +11,7 @@ use crate::{
     daemon::snapshot::SchedulerSnapshot,
     daemon::{DownloadItem, DownloadStatus, Snapshot},
     routing::{DownloadRoutingRule, describe_directory_input, match_rule, validate_rule},
-    state::ManualOrScheduled,
+    state::{ManualOrScheduled, TorrentStreamingMode, validate_torrent_size_mib},
     tui::{
         app::{ModalState, ScheduleRange, UiApp},
         focus::TabKind,
@@ -109,6 +109,7 @@ fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
         TabKind::Current => draw_current(frame, chunks[1], app),
         TabKind::History => draw_history(frame, chunks[1], app),
         TabKind::Scheduler => draw_scheduler(frame, chunks[1], app),
+        TabKind::Torrents => draw_torrents(frame, chunks[1], app),
         TabKind::Routing => draw_routing(frame, chunks[1], app),
         TabKind::Webhooks => draw_webhooks(frame, chunks[1], app),
         TabKind::WebUi => draw_web_ui(frame, chunks[1], app),
@@ -434,6 +435,47 @@ fn draw_webhooks(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
     );
 }
 
+fn draw_torrents(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
+    let mode_label = match app.snapshot.torrents.mode {
+        TorrentStreamingMode::Off => "off",
+        TorrentStreamingMode::StartFirst => "start first",
+        TorrentStreamingMode::StartAndEndFirst => "start + end first",
+    };
+    let body = vec![
+        Line::from(format!("Streaming mode: {mode_label}")),
+        Line::from(format!(
+            "Start-first size: {} MiB",
+            app.snapshot.torrents.head_size_mib
+        )),
+        Line::from(format!(
+            "End-first size: {} MiB",
+            app.snapshot.torrents.tail_size_mib
+        )),
+        Line::from(format!(
+            "aria2 bt-prioritize-piece: {}",
+            app.snapshot
+                .torrents
+                .aria2_prioritize_piece
+                .clone()
+                .unwrap_or_else(|| "off".into())
+        )),
+        Line::from("This applies to new magnet and .torrent downloads only."),
+        Line::from(
+            "aria2 does not support true sequential torrent download; this prioritizes early pieces instead.",
+        ),
+        Line::from(
+            "Use start + end first for media where container metadata may live at the tail.",
+        ),
+        Line::from("Press Space to cycle mode quickly. Press Enter or e to edit sizes."),
+    ];
+    frame.render_widget(
+        Paragraph::new(Text::from(body))
+            .block(bordered("Torrent Streaming"))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 fn draw_web_ui(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
     let lines = vec![
         Line::from(format!(
@@ -494,6 +536,9 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
         }
         TabKind::Scheduler => {
             "q quit  arrows/vim select  m/Space mode  Enter/e edit  r new range  d/u clear range  manual/usual support: 10M, 10 mb/s, 1 kbps, unlimited"
+        }
+        TabKind::Torrents => {
+            "q quit  Space cycle mode  Enter/e edit start/end sizes  applies to new magnet and .torrent downloads"
         }
         TabKind::Routing => {
             "q quit  arrows/vim select  a add  Enter/e edit  d delete  J/K reorder  t edit tester"
@@ -683,6 +728,79 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
             );
             frame.render_widget(&form.input, layout[1]);
             frame.render_widget(limit_status_paragraph(&form.value()), layout[2]);
+        }
+        ModalState::EditTorrentStreaming(form) => {
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(5),
+                    Constraint::Length(2),
+                    Constraint::Length(3),
+                    Constraint::Length(3),
+                    Constraint::Length(2),
+                    Constraint::Length(2),
+                    Constraint::Min(1),
+                ])
+                .margin(1)
+                .split(popup);
+            let mode_label = match form.mode {
+                TorrentStreamingMode::Off => "off",
+                TorrentStreamingMode::StartFirst => "start first",
+                TorrentStreamingMode::StartAndEndFirst => "start + end first",
+            };
+            frame.render_widget(
+                Paragraph::new("Configure torrent streaming defaults for new magnet and .torrent downloads. This is not true sequential mode; aria2 will prioritize beginning pieces and optionally ending pieces.")
+                    .block(bordered("Torrent Streaming"))
+                    .style(Style::default().bg(Color::Black))
+                    .wrap(Wrap { trim: false }),
+                popup,
+            );
+            frame.render_widget(
+                Paragraph::new(format!("Mode: {mode_label}"))
+                    .style(Style::default().bg(Color::Black)),
+                layout[1],
+            );
+            frame.render_widget(&form.head_size_mib, layout[2]);
+            frame.render_widget(&form.tail_size_mib, layout[3]);
+            let (head_text, tail_text) = (
+                form.head_size_mib.value().to_string(),
+                form.tail_size_mib.value().to_string(),
+            );
+            let status = match (
+                head_text.trim().parse::<u32>(),
+                tail_text.trim().parse::<u32>(),
+            ) {
+                (Ok(head), Ok(tail)) => {
+                    if let Err(error) = validate_torrent_size_mib(head, "torrent head size") {
+                        (error.to_string(), Color::Red)
+                    } else if let Err(error) = validate_torrent_size_mib(tail, "torrent tail size")
+                    {
+                        (error.to_string(), Color::Red)
+                    } else {
+                        let value = match form.mode {
+                            TorrentStreamingMode::Off => "off".to_string(),
+                            TorrentStreamingMode::StartFirst => format!("head={head}M"),
+                            TorrentStreamingMode::StartAndEndFirst => {
+                                format!("head={head}M,tail={tail}M")
+                            }
+                        };
+                        (format!("Will send aria2 option: {value}"), Color::Green)
+                    }
+                }
+                _ => ("Sizes must be whole numbers in MiB".to_string(), Color::Red),
+            };
+            frame.render_widget(
+                Paragraph::new(status.0)
+                    .style(Style::default().fg(status.1).bg(Color::Black))
+                    .wrap(Wrap { trim: false }),
+                layout[4],
+            );
+            frame.render_widget(
+                Paragraph::new("Space cycles mode. Tab switches fields. Enter saves.")
+                    .style(Style::default().bg(Color::Black))
+                    .wrap(Wrap { trim: false }),
+                layout[5],
+            );
         }
         ModalState::EditWebhooks(form) => {
             let layout = Layout::default()

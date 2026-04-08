@@ -3,6 +3,7 @@ pub enum TabKind {
     Current,
     History,
     Scheduler,
+    Torrents,
     Routing,
     Webhooks,
     WebUi,
@@ -14,17 +15,19 @@ impl TabKind {
             Self::Current => "Current",
             Self::History => "History",
             Self::Scheduler => "Scheduler",
+            Self::Torrents => "Torrents",
             Self::Routing => "Routing",
             Self::Webhooks => "Webhooks",
             Self::WebUi => "Web UI",
         }
     }
 
-    pub fn all() -> [TabKind; 6] {
+    pub fn all() -> [TabKind; 7] {
         [
             Self::Current,
             Self::History,
             Self::Scheduler,
+            Self::Torrents,
             Self::Routing,
             Self::Webhooks,
             Self::WebUi,
@@ -35,7 +38,8 @@ impl TabKind {
         match self {
             Self::Current => Self::History,
             Self::History => Self::Scheduler,
-            Self::Scheduler => Self::Routing,
+            Self::Scheduler => Self::Torrents,
+            Self::Torrents => Self::Routing,
             Self::Routing => Self::Webhooks,
             Self::Webhooks => Self::WebUi,
             Self::WebUi => Self::Current,
@@ -47,7 +51,8 @@ impl TabKind {
             Self::Current => Self::WebUi,
             Self::History => Self::Current,
             Self::Scheduler => Self::History,
-            Self::Routing => Self::Scheduler,
+            Self::Torrents => Self::Scheduler,
+            Self::Routing => Self::Torrents,
             Self::Webhooks => Self::Routing,
             Self::WebUi => Self::Webhooks,
         }

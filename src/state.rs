@@ -28,6 +28,15 @@ pub enum CancelBehaviorPreference {
     DeletePartials,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TorrentStreamingMode {
+    #[default]
+    Off,
+    StartFirst,
+    StartAndEndFirst,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct PersistedState {
@@ -46,6 +55,9 @@ pub struct PersistedState {
     pub web_ui_port: u16,
     pub web_ui_cookie_days: u32,
     pub web_ui_session_secret: String,
+    pub torrent_streaming_mode: TorrentStreamingMode,
+    pub torrent_head_size_mib: u32,
+    pub torrent_tail_size_mib: u32,
 }
 
 impl Default for PersistedState {
@@ -69,6 +81,9 @@ impl Default for PersistedState {
             web_ui_port: 39123,
             web_ui_cookie_days: 30,
             web_ui_session_secret: String::new(),
+            torrent_streaming_mode: TorrentStreamingMode::Off,
+            torrent_head_size_mib: 32,
+            torrent_tail_size_mib: 4,
         }
     }
 }
@@ -113,6 +128,21 @@ impl PersistedState {
             .map_err(|_| color_eyre::eyre::eyre!("schedule must contain 24 entries"))
     }
 
+    pub fn torrent_prioritize_piece_value(&self) -> Result<Option<String>> {
+        validate_torrent_size_mib(self.torrent_head_size_mib, "torrent head size")?;
+        validate_torrent_size_mib(self.torrent_tail_size_mib, "torrent tail size")?;
+        Ok(match self.torrent_streaming_mode {
+            TorrentStreamingMode::Off => None,
+            TorrentStreamingMode::StartFirst => {
+                Some(format!("head={}M", self.torrent_head_size_mib))
+            }
+            TorrentStreamingMode::StartAndEndFirst => Some(format!(
+                "head={}M,tail={}M",
+                self.torrent_head_size_mib, self.torrent_tail_size_mib
+            )),
+        })
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.schedule.len() != 24 {
             bail!("schedule must contain exactly 24 entries");
@@ -128,8 +158,16 @@ impl PersistedState {
         if self.web_ui_port == 0 {
             bail!("web ui port must be between 1 and 65535");
         }
+        self.torrent_prioritize_piece_value()?;
         Ok(())
     }
+}
+
+pub fn validate_torrent_size_mib(value: u32, label: &str) -> Result<()> {
+    if !(1..=8192).contains(&value) {
+        bail!("{label} must be between 1 and 8192 MiB");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -139,5 +177,22 @@ mod tests {
     #[test]
     fn default_state_is_valid() {
         PersistedState::default().validate().expect("valid");
+    }
+
+    #[test]
+    fn torrent_priority_option_formats() {
+        let mut state = PersistedState {
+            torrent_streaming_mode: TorrentStreamingMode::StartFirst,
+            ..PersistedState::default()
+        };
+        assert_eq!(
+            state.torrent_prioritize_piece_value().unwrap(),
+            Some("head=32M".into())
+        );
+        state.torrent_streaming_mode = TorrentStreamingMode::StartAndEndFirst;
+        assert_eq!(
+            state.torrent_prioritize_piece_value().unwrap(),
+            Some("head=32M,tail=4M".into())
+        );
     }
 }

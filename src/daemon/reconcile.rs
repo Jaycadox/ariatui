@@ -23,7 +23,7 @@ use crate::{
         snapshot::{
             ApiPayload, ApiReply, Aria2ChildStatus, ChildLifecycle, DownloadItem, DownloadStatus,
             GlobalStats, ResolvedHttpUrl, RoutingSnapshot, SchedulerSnapshot, Snapshot,
-            WebUiStatus, WebhookSnapshot,
+            TorrentSettingsSnapshot, WebUiStatus, WebhookSnapshot,
         },
     },
     download_uri::{DownloadUriKind, classify_download_uri, magnet_display_name},
@@ -32,7 +32,9 @@ use crate::{
         client::Aria2RpcClient,
         types::{Aria2File, Aria2GlobalStat, Aria2Status},
     },
-    schedule, units, web,
+    schedule,
+    state::validate_torrent_size_mib,
+    units, web,
     webhook::{
         WebhookPingMode, mention_prefix, validate_discord_webhook_url, validate_ping_id,
         webhook_enabled,
@@ -270,6 +272,12 @@ impl DaemonState {
             next_change_at_local: resolved.next_change_at_local,
             remembered_cancel_behavior: state.remembered_cancel_behavior,
         };
+        snapshot.torrents = TorrentSettingsSnapshot {
+            mode: state.torrent_streaming_mode,
+            head_size_mib: state.torrent_head_size_mib,
+            tail_size_mib: state.torrent_tail_size_mib,
+            aria2_prioritize_piece: state.torrent_prioritize_piece_value()?,
+        };
         snapshot.routing = RoutingSnapshot {
             default_download_dir: state.default_download_dir.clone(),
             rules: normalize_rules(&state.default_download_dir, &state.download_rules),
@@ -356,9 +364,7 @@ impl DaemonState {
                 let state = self.app.state.read().await.clone();
                 let uri_kind = classify_download_uri(&url)?;
                 if matches!(uri_kind, DownloadUriKind::HttpLike)
-                    && self
-                        .try_add_remote_torrent(&url, &state.default_download_dir)
-                        .await?
+                    && self.try_add_remote_torrent(&url, &state).await?
                 {
                     self.perform_refresh().await?;
                     return Ok(ApiReply {
@@ -382,9 +388,17 @@ impl DaemonState {
                 )?;
                 tokio::fs::create_dir_all(&route.resolved_directory).await?;
                 let options = match uri_kind {
-                    DownloadUriKind::Magnet => json!({
-                        "dir": route.resolved_directory.display().to_string(),
-                    }),
+                    DownloadUriKind::Magnet => {
+                        let mut options = serde_json::Map::new();
+                        options.insert(
+                            "dir".into(),
+                            json!(route.resolved_directory.display().to_string()),
+                        );
+                        if let Some(value) = state.torrent_prioritize_piece_value()? {
+                            options.insert("bt-prioritize-piece".into(), json!(value));
+                        }
+                        Value::Object(options)
+                    }
                     DownloadUriKind::HttpLike => {
                         let filename = validate_download_filename(
                             filename.unwrap_or_else(|| filename_from_url(&url)).trim(),
@@ -482,6 +496,21 @@ impl DaemonState {
                 let mut state = self.app.state.write().await;
                 state.default_download_dir = default_download_dir;
                 state.download_rules = rules;
+                state.save(&self.app.paths.state_file)?;
+                drop(state);
+                self.perform_refresh().await?;
+            }
+            crate::daemon::ApiRequest::SetTorrentStreamingSettings {
+                mode,
+                head_size_mib,
+                tail_size_mib,
+            } => {
+                validate_torrent_size_mib(head_size_mib, "torrent head size")?;
+                validate_torrent_size_mib(tail_size_mib, "torrent tail size")?;
+                let mut state = self.app.state.write().await;
+                state.torrent_streaming_mode = mode;
+                state.torrent_head_size_mib = head_size_mib;
+                state.torrent_tail_size_mib = tail_size_mib;
                 state.save(&self.app.paths.state_file)?;
                 drop(state);
                 self.perform_refresh().await?;
@@ -681,7 +710,11 @@ impl DaemonState {
         })
     }
 
-    async fn try_add_remote_torrent(&self, url: &str, default_download_dir: &str) -> Result<bool> {
+    async fn try_add_remote_torrent(
+        &self,
+        url: &str,
+        state: &crate::state::PersistedState,
+    ) -> Result<bool> {
         if !url.starts_with("http://") && !url.starts_with("https://") {
             return Ok(false);
         }
@@ -733,18 +766,17 @@ impl DaemonState {
             .bytes()
             .await?;
         let torrent = STANDARD.encode(torrent_bytes);
-        let download_dir = expand_tilde(default_download_dir);
+        let download_dir = expand_tilde(&state.default_download_dir);
         tokio::fs::create_dir_all(&download_dir).await?;
+        let mut options = serde_json::Map::new();
+        options.insert("dir".into(), json!(download_dir.display().to_string()));
+        if let Some(value) = state.torrent_prioritize_piece_value()? {
+            options.insert("bt-prioritize-piece".into(), json!(value));
+        }
         let _: String = self
             .call(
                 "aria2.addTorrent",
-                vec![
-                    json!(torrent),
-                    json!([]),
-                    json!({
-                        "dir": download_dir.display().to_string(),
-                    }),
-                ],
+                vec![json!(torrent), json!([]), Value::Object(options)],
             )
             .await?;
         Ok(true)

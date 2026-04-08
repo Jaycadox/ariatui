@@ -19,15 +19,18 @@ use crate::{
         history_visible_items,
     },
     routing::{DownloadRoutingRule, validate_directory_input, validate_rule},
-    state::{CancelBehaviorPreference, ManualOrScheduled},
+    state::{
+        CancelBehaviorPreference, ManualOrScheduled, TorrentStreamingMode,
+        validate_torrent_size_mib,
+    },
     tui::{
         draw,
         event::{UiEvent, next_event},
         focus::TabKind,
         forms::{
             AddUrlForm, CancelChoice, CancelForm, FilenameChoice, FilenameChoiceForm, PinForm,
-            RangeField, RangeForm, RoutingField, RoutingRuleForm, SearchForm, SpeedForm, WebUiForm,
-            WebhookForm,
+            RangeField, RangeForm, RoutingField, RoutingRuleForm, SearchForm, SpeedForm,
+            TorrentStreamingForm, WebUiForm, WebhookForm,
         },
         input::InputField,
     },
@@ -50,6 +53,7 @@ pub enum ModalState {
     EditWebUi(WebUiForm),
     EditManual(SpeedForm),
     EditUsualInternetSpeed(SpeedForm),
+    EditTorrentStreaming(TorrentStreamingForm),
     EditRange(RangeForm),
     EditRoutingRule {
         form: RoutingRuleForm,
@@ -267,6 +271,8 @@ impl UiApp {
             KeyCode::Enter => {
                 if self.tab == TabKind::Scheduler {
                     self.open_scheduler_editor();
+                } else if self.tab == TabKind::Torrents {
+                    self.open_torrent_streaming_editor();
                 } else if self.tab == TabKind::Routing {
                     self.open_routing_editor();
                 } else if self.tab == TabKind::Webhooks {
@@ -354,6 +360,18 @@ impl UiApp {
                         ManualOrScheduled::Scheduled => ManualOrScheduled::Manual,
                     };
                     self.issue(ApiRequest::SetMode { mode: next }).await?;
+                } else if self.tab == TabKind::Torrents {
+                    let next = match self.snapshot.torrents.mode {
+                        TorrentStreamingMode::Off => TorrentStreamingMode::StartFirst,
+                        TorrentStreamingMode::StartFirst => TorrentStreamingMode::StartAndEndFirst,
+                        TorrentStreamingMode::StartAndEndFirst => TorrentStreamingMode::Off,
+                    };
+                    self.issue(ApiRequest::SetTorrentStreamingSettings {
+                        mode: next,
+                        head_size_mib: self.snapshot.torrents.head_size_mib,
+                        tail_size_mib: self.snapshot.torrents.tail_size_mib,
+                    })
+                    .await?;
                 } else if self.tab == TabKind::WebUi {
                     let response = self
                         .request_response(ApiRequest::SetWebUiSettings {
@@ -372,6 +390,8 @@ impl UiApp {
             KeyCode::Char('e') => {
                 if self.tab == TabKind::Scheduler {
                     self.open_scheduler_editor();
+                } else if self.tab == TabKind::Torrents {
+                    self.open_torrent_streaming_editor();
                 } else if self.tab == TabKind::Webhooks {
                     self.open_webhooks_editor();
                 } else if self.tab == TabKind::WebUi {
@@ -637,6 +657,35 @@ impl UiApp {
                     form.input.input(key);
                 }
             },
+            ModalState::EditTorrentStreaming(form) => match key.code {
+                KeyCode::Esc => self.modal = None,
+                KeyCode::Tab => form.next_focus(),
+                KeyCode::BackTab => form.previous_focus(),
+                KeyCode::Char(' ') => form.cycle_mode(),
+                KeyCode::Enter => {
+                    let (mode, head_size_mib, tail_size_mib) = form.values();
+                    let head_size_mib = head_size_mib
+                        .trim()
+                        .parse::<u32>()
+                        .map_err(|_| eyre!("start-first size must be a whole number of MiB"))?;
+                    let tail_size_mib = tail_size_mib
+                        .trim()
+                        .parse::<u32>()
+                        .map_err(|_| eyre!("end-first size must be a whole number of MiB"))?;
+                    validate_torrent_size_mib(head_size_mib, "torrent head size")?;
+                    validate_torrent_size_mib(tail_size_mib, "torrent tail size")?;
+                    self.issue(ApiRequest::SetTorrentStreamingSettings {
+                        mode,
+                        head_size_mib,
+                        tail_size_mib,
+                    })
+                    .await?;
+                    self.modal = None;
+                }
+                _ => {
+                    form.active_input().input(key);
+                }
+            },
             ModalState::EditRange(form) => match key.code {
                 KeyCode::Esc => self.modal = None,
                 KeyCode::Tab => form.next_focus(),
@@ -747,7 +796,7 @@ impl UiApp {
                 let routing_len = self.routing_rules().len();
                 move_index(&mut self.routing_index, routing_len, delta);
             }
-            TabKind::Webhooks | TabKind::WebUi => {}
+            TabKind::Torrents | TabKind::Webhooks | TabKind::WebUi => {}
         }
     }
 
@@ -850,6 +899,14 @@ impl UiApp {
                 .ping_id
                 .as_deref()
                 .unwrap_or_default(),
+        )));
+    }
+
+    fn open_torrent_streaming_editor(&mut self) {
+        self.modal = Some(ModalState::EditTorrentStreaming(TorrentStreamingForm::new(
+            self.snapshot.torrents.mode,
+            self.snapshot.torrents.head_size_mib,
+            self.snapshot.torrents.tail_size_mib,
         )));
     }
 

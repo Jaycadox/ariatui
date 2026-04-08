@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     routing::DownloadRoutingRule,
-    state::{CancelBehaviorPreference, ManualOrScheduled},
+    state::{CancelBehaviorPreference, ManualOrScheduled, TorrentStreamingMode},
     webhook::WebhookPingMode,
 };
 
@@ -21,6 +21,7 @@ pub struct Snapshot {
     pub daemon_status: DaemonStatus,
     pub aria2_status: Aria2ChildStatus,
     pub scheduler: SchedulerSnapshot,
+    pub torrents: TorrentSettingsSnapshot,
     pub routing: RoutingSnapshot,
     pub webhooks: WebhookSnapshot,
     pub web_ui: WebUiSnapshot,
@@ -70,6 +71,15 @@ pub struct SchedulerSnapshot {
 pub struct RoutingSnapshot {
     pub default_download_dir: String,
     pub rules: Vec<DownloadRoutingRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct TorrentSettingsSnapshot {
+    pub mode: TorrentStreamingMode,
+    pub head_size_mib: u32,
+    pub tail_size_mib: u32,
+    pub aria2_prioritize_piece: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,6 +225,11 @@ pub enum ApiRequest {
         default_download_dir: String,
         rules: Vec<DownloadRoutingRule>,
     },
+    SetTorrentStreamingSettings {
+        mode: TorrentStreamingMode,
+        head_size_mib: u32,
+        tail_size_mib: u32,
+    },
     SetWebhookSettings {
         discord_webhook_url: String,
         ping_mode: WebhookPingMode,
@@ -297,6 +312,7 @@ impl Snapshot {
                 next_change_at_local: "01:00".into(),
                 remembered_cancel_behavior: CancelBehaviorPreference::Ask,
             },
+            torrents: TorrentSettingsSnapshot::default(),
             routing: RoutingSnapshot {
                 default_download_dir: "~/Downloads".into(),
                 rules: vec![DownloadRoutingRule {

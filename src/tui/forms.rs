@@ -3,8 +3,8 @@ use ratatui::{
     widgets::{Block, Borders},
 };
 
-use crate::tui::input::InputField;
 use crate::webhook::WebhookPingMode;
+use crate::{state::TorrentStreamingMode, tui::input::InputField};
 
 #[derive(Debug)]
 pub struct AddUrlForm {
@@ -140,6 +140,87 @@ impl Default for CancelForm {
 #[derive(Debug)]
 pub struct SpeedForm {
     pub input: InputField,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TorrentStreamingField {
+    HeadSize,
+    TailSize,
+}
+
+#[derive(Debug)]
+pub struct TorrentStreamingForm {
+    pub head_size_mib: InputField,
+    pub tail_size_mib: InputField,
+    pub mode: TorrentStreamingMode,
+    pub focus: TorrentStreamingField,
+}
+
+impl TorrentStreamingForm {
+    pub fn new(mode: TorrentStreamingMode, head_size_mib: u32, tail_size_mib: u32) -> Self {
+        let mut head = InputField::new();
+        head.insert_str(head_size_mib.to_string());
+        head.set_placeholder_text("32");
+
+        let mut tail = InputField::new();
+        tail.insert_str(tail_size_mib.to_string());
+        tail.set_placeholder_text("4");
+
+        let mut form = Self {
+            head_size_mib: head,
+            tail_size_mib: tail,
+            mode,
+            focus: TorrentStreamingField::HeadSize,
+        };
+        form.update_blocks();
+        form
+    }
+
+    pub fn next_focus(&mut self) {
+        self.focus = match self.focus {
+            TorrentStreamingField::HeadSize => TorrentStreamingField::TailSize,
+            TorrentStreamingField::TailSize => TorrentStreamingField::HeadSize,
+        };
+        self.update_blocks();
+    }
+
+    pub fn previous_focus(&mut self) {
+        self.next_focus();
+    }
+
+    pub fn cycle_mode(&mut self) {
+        self.mode = match self.mode {
+            TorrentStreamingMode::Off => TorrentStreamingMode::StartFirst,
+            TorrentStreamingMode::StartFirst => TorrentStreamingMode::StartAndEndFirst,
+            TorrentStreamingMode::StartAndEndFirst => TorrentStreamingMode::Off,
+        };
+    }
+
+    pub fn active_input(&mut self) -> &mut InputField {
+        match self.focus {
+            TorrentStreamingField::HeadSize => &mut self.head_size_mib,
+            TorrentStreamingField::TailSize => &mut self.tail_size_mib,
+        }
+    }
+
+    pub fn values(&self) -> (TorrentStreamingMode, String, String) {
+        (
+            self.mode,
+            self.head_size_mib.value().to_string(),
+            self.tail_size_mib.value().to_string(),
+        )
+    }
+
+    fn update_blocks(&mut self) {
+        self.head_size_mib.set_block(field_block(
+            "Start-First Size (MiB)",
+            self.focus == TorrentStreamingField::HeadSize,
+        ));
+        self.tail_size_mib.set_block(field_block(
+            "End-First Size (MiB)",
+            self.focus == TorrentStreamingField::TailSize,
+        ));
+    }
 }
 
 #[derive(Debug)]
