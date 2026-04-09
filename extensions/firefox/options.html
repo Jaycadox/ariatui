@@ -12,6 +12,7 @@
       <p class="eyebrow">AriatUI Firefox</p>
       <h1>Download via AriatUI</h1>
       <p class="lead">Manage local and remote targets for the right-click menu.</p>
+      <p class="muted">The extension only opens AriatUI popup pages. Sign into each remote web UI normally first.</p>
       <p class="warning">HTTP remotes are supported. Use them only on networks you trust.</p>
     </header>
 
@@ -46,17 +47,6 @@
         <div id="remotes" class="remote-list"></div>
       </section>
     </section>
-
-    <section id="pairing-panel" class="panel hidden">
-      <div class="panel-head">
-        <h2>Pairing</h2>
-      </div>
-      <p id="pairing-remote" class="muted"></p>
-      <p class="pairing-copy">Approve this PIN in AriatUI’s terminal Web UI tab.</p>
-      <p id="pairing-pin" class="pin"></p>
-      <p id="pairing-countdown" class="muted"></p>
-      <p id="pairing-status" class="status-box"></p>
-    </section>
   </main>
 
   <template id="remote-template">
@@ -66,13 +56,9 @@
           <h3 class="remote-label"></h3>
           <p class="remote-url"></p>
         </div>
-        <span class="remote-state"></span>
       </div>
       <div class="actions">
         <button data-action="edit" type="button" class="secondary">Edit</button>
-        <button data-action="pair" type="button">Pair</button>
-        <button data-action="test" type="button" class="secondary">Test</button>
-        <button data-action="forget" type="button" class="secondary">Forget pairing</button>
         <button data-action="open" type="button" class="secondary">Open Web UI</button>
         <button data-action="delete" type="button" class="danger">Delete</button>
       </div>

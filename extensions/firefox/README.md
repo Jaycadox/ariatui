@@ -2,6 +2,14 @@
 
 This directory contains a Firefox-only WebExtension for AriatUI.
 
+The extension is intentionally thin:
+
+- it stores named remote endpoints
+- it adds those endpoints to the right-click menu
+- it opens AriatUI popup pages on the selected remote
+
+It does not manage authentication itself. Sign into each remote web UI in a normal browser tab first, then the extension popups reuse those browser cookies.
+
 ## Temporary Load
 
 Use this only while iterating on the extension. Firefox removes temporary add-ons when the browser exits.
@@ -56,12 +64,12 @@ When you change the extension:
 
 1. Open the extension options page.
 2. Save a local or remote AriatUI base URL such as `http://127.0.0.1:39123`.
-3. Click `Pair` for that remote.
-4. Approve the shown 4-digit PIN from AriatUI’s terminal `Web UI` tab.
-5. Right-click a link in Firefox and choose `Download via AriatUI`.
+3. Open that remote’s web UI and sign in normally.
+4. Right-click a link in Firefox and choose `Download via AriatUI`.
+5. The extension opens a remote AriatUI popup that either queues immediately or shows the filename chooser on the AriatUI side.
 
 ## Notes
 
 - Remotes are stored only in browser extension storage.
-- The extension talks to AriatUI through the `/api/*` routes.
+- The extension launches the browser-facing `/extension/add` route on the chosen AriatUI remote.
 - Raw `http://` remotes are supported, but pairing and session traffic are visible to the network unless you use a trusted path or external TLS.

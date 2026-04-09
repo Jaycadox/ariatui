@@ -15,6 +15,7 @@ use chrono::{Duration, Local, Timelike};
 use color_eyre::eyre::Result;
 use serde::{Deserialize, Serialize};
 use time::Duration as CookieDuration;
+use url::form_urlencoded;
 
 use crate::{
     daemon::{
@@ -47,6 +48,10 @@ pub fn router(state: SharedDaemonState) -> Router {
         .route("/login", get(login_page))
         .route("/login/status", get(login_status))
         .route("/logout", post(logout))
+        .route(
+            "/extension/add",
+            get(extension_add_page).post(extension_add_submit),
+        )
         .route("/api/pairings", post(api_create_pairing))
         .route("/api/pairings/{request_id}", get(api_pairing_status))
         .route("/api/session", get(api_session).delete(api_delete_session))
@@ -218,6 +223,23 @@ struct ApiAddDownloadBody {
 }
 
 #[derive(Debug, Deserialize)]
+struct LoginQuery {
+    next: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExtensionAddQuery {
+    url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExtensionAddFormData {
+    url: String,
+    filename_choice: String,
+    custom_filename: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct TorrentSettingsFormData {
     mode: String,
     head_size_mib: u32,
@@ -371,9 +393,14 @@ async fn root(State(state): State<SharedDaemonState>, jar: CookieJar) -> Respons
     }
 }
 
-async fn login_page(State(state): State<SharedDaemonState>, jar: CookieJar) -> Response {
+async fn login_page(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Query(query): Query<LoginQuery>,
+) -> Response {
+    let next = normalize_next_path(query.next.as_deref());
     if authenticated(&state, &jar).await.unwrap_or(false) {
-        return Redirect::to("/current").into_response();
+        return Redirect::to(&next).into_response();
     }
     match create_or_get_pairing(
         state.as_ref(),
@@ -388,11 +415,12 @@ async fn login_page(State(state): State<SharedDaemonState>, jar: CookieJar) -> R
                 .same_site(SameSite::Strict)
                 .max_age(CookieDuration::minutes(5))
                 .build();
-            (jar.add(cookie), Html(render_login(&pin))).into_response()
+            (jar.add(cookie), Html(render_login(&pin, &next))).into_response()
         }
         Err(error) => Html(render_public_shell(
             "Login",
             &format!("<p class=\"error\">{}</p>", esc(&error.to_string())),
+            Some(&next),
         ))
         .into_response(),
     }
@@ -428,6 +456,7 @@ async fn login_status(State(state): State<SharedDaemonState>, jar: CookieJar) ->
         Err(error) => Html(render_public_shell(
             "Login",
             &format!("<p class=\"error\">{}</p>", esc(&error.to_string())),
+            Some("/current"),
         ))
         .into_response(),
     }
@@ -546,6 +575,104 @@ async fn api_add_download(
             }
         }
         Err(error) => error.into_response(),
+    }
+}
+
+async fn extension_add_page(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Query(query): Query<ExtensionAddQuery>,
+) -> Response {
+    let url = query.url.unwrap_or_default().trim().to_string();
+    let next = extension_add_path(&url);
+    if let Some(response) = auth_redirect_with_next(&state, &jar, Some(&next)).await {
+        return response;
+    }
+    match prepare_download_submission(&state, &url).await {
+        Ok(PreparedDownloadSubmission::Prompt {
+            url,
+            url_filename,
+            remote_label,
+            remote_filename,
+            final_url,
+        }) => Html(render_extension_add_prompt(
+            &url,
+            &url_filename,
+            remote_label,
+            &remote_filename,
+            final_url.as_deref(),
+            None,
+        ))
+        .into_response(),
+        Ok(prepared) => {
+            let queued = match prepared.into_queue_with_filename(None) {
+                Ok(queued) => queued,
+                Err(error) => return error.into_response(),
+            };
+            match state
+                .execute(ApiRequest::AddHttpUrl {
+                    url: queued.url,
+                    filename: queued.filename,
+                })
+                .await
+            {
+                Ok(_) => Html(render_extension_add_done(
+                    &queued.display_name,
+                    queued.final_url.as_deref(),
+                ))
+                .into_response(),
+                Err(error) => Html(render_extension_add_error(&error.to_string())).into_response(),
+            }
+        }
+        Err(error) => Html(render_extension_add_error(&error.message)).into_response(),
+    }
+}
+
+async fn extension_add_submit(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Form(form): Form<ExtensionAddFormData>,
+) -> Response {
+    let next = extension_add_path(&form.url);
+    if let Some(response) = auth_redirect_with_next(&state, &jar, Some(&next)).await {
+        return response;
+    }
+    let prepared = match prepare_download_submission(&state, &form.url).await {
+        Ok(prepared) => prepared,
+        Err(error) => return Html(render_extension_add_error(&error.message)).into_response(),
+    };
+    let requested_filename = if form.filename_choice == "__custom__" {
+        form.custom_filename
+    } else {
+        Some(form.filename_choice)
+    };
+    let queued = match prepared.into_queue_with_filename(requested_filename) {
+        Ok(queued) => queued,
+        Err(error) => {
+            return Html(render_extension_add_prompt_from_submission(
+                &form.url,
+                error.message.as_str(),
+            ))
+            .into_response();
+        }
+    };
+    match state
+        .execute(ApiRequest::AddHttpUrl {
+            url: queued.url,
+            filename: queued.filename,
+        })
+        .await
+    {
+        Ok(_) => Html(render_extension_add_done(
+            &queued.display_name,
+            queued.final_url.as_deref(),
+        ))
+        .into_response(),
+        Err(error) => Html(render_extension_add_prompt_from_submission(
+            &form.url,
+            &error.to_string(),
+        ))
+        .into_response(),
     }
 }
 
@@ -1634,13 +1761,42 @@ async fn authenticated(state: &SharedDaemonState, jar: &CookieJar) -> Result<boo
 }
 
 async fn auth_redirect(state: &SharedDaemonState, jar: &CookieJar) -> Option<Response> {
+    auth_redirect_with_next(state, jar, None).await
+}
+
+async fn auth_redirect_with_next(
+    state: &SharedDaemonState,
+    jar: &CookieJar,
+    next: Option<&str>,
+) -> Option<Response> {
     match authenticated(state, jar).await {
         Ok(true) => None,
-        _ => Some(Redirect::to("/login").into_response()),
+        _ => Some(Redirect::to(&login_path(next)).into_response()),
     }
 }
 
-fn render_login(pin: &str) -> String {
+fn normalize_next_path(next: Option<&str>) -> String {
+    let candidate = next.unwrap_or("/current").trim();
+    if candidate.starts_with('/') && !candidate.starts_with("//") {
+        candidate.to_string()
+    } else {
+        "/current".into()
+    }
+}
+
+fn login_path(next: Option<&str>) -> String {
+    let next = normalize_next_path(next);
+    if next == "/current" {
+        "/login".into()
+    } else {
+        let query = form_urlencoded::Serializer::new(String::new())
+            .append_pair("next", &next)
+            .finish();
+        format!("/login?{query}")
+    }
+}
+
+fn render_login(pin: &str, next: &str) -> String {
     let body = format!(
         r#"<section class="card narrow-card">
 <h2>Browser pairing</h2>
@@ -1651,10 +1807,10 @@ fn render_login(pin: &str) -> String {
 </section>"#,
         esc(pin)
     );
-    render_public_shell("Login", &body)
+    render_public_shell("Login", &body, Some(next))
 }
 
-fn render_public_shell(title: &str, body: &str) -> String {
+fn render_public_shell(title: &str, body: &str, login_next: Option<&str>) -> String {
     format!(
         r#"<!doctype html>
 <html>
@@ -1675,7 +1831,7 @@ fn render_public_shell(title: &str, body: &str) -> String {
         esc(title),
         styles(),
         body,
-        script()
+        script(login_next)
     )
 }
 
@@ -1721,7 +1877,7 @@ fn render_shell(
         render_header(snapshot),
         tabs,
         body,
-        script()
+        script(None)
     )
 }
 
@@ -2031,6 +2187,114 @@ fn render_add_url_page(
         );
     }
     render_shell(snapshot, WebTab::Current, &body, false, "Add URI")
+}
+
+fn extension_add_path(url: &str) -> String {
+    let query = form_urlencoded::Serializer::new(String::new())
+        .append_pair("url", url)
+        .finish();
+    format!("/extension/add?{query}")
+}
+
+fn render_extension_add_shell(title: &str, body: &str, close_on_load: bool) -> String {
+    let close_script = if close_on_load {
+        r#"<script>
+setTimeout(() => {
+  try { window.close(); } catch (_) {}
+}, 500);
+</script>"#
+    } else {
+        ""
+    };
+    format!(
+        r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{}</title>
+<style>{}</style>
+</head>
+<body>
+<main class="wrap narrow">
+<section class="card narrow-card">{}</section>
+</main>
+{}
+</body>
+</html>"#,
+        esc(title),
+        styles(),
+        body,
+        close_script
+    )
+}
+
+fn render_extension_add_prompt(
+    url: &str,
+    url_filename: &str,
+    remote_label: &str,
+    remote_filename: &str,
+    final_url: Option<&str>,
+    error: Option<&str>,
+) -> String {
+    let mut body = String::new();
+    body.push_str("<h2>Choose filename</h2>");
+    if let Some(error) = error {
+        let _ = write!(body, "<p class=\"error\">{}</p>", esc(error));
+    }
+    let _ = write!(
+        body,
+        r#"<p class="muted">Source: {}</p>
+<form method="post" action="/extension/add" class="stack">
+<input type="hidden" name="url" value="{}" />
+<label><input type="radio" name="filename_choice" value="{}"> URL filename: {}</label>
+<label><input type="radio" name="filename_choice" value="{}" checked> {}: {}</label>
+<label><input type="radio" name="filename_choice" value="__custom__"> Use a custom filename</label>
+<label>Custom filename</label>
+<input type="text" name="custom_filename" value="{}" />
+<div class="actions"><button type="submit">Add download</button></div>
+</form>"#,
+        esc(final_url.unwrap_or(url)),
+        esc(url),
+        esc(url_filename),
+        esc(url_filename),
+        esc(remote_filename),
+        esc(remote_label),
+        esc(remote_filename),
+        esc(remote_filename),
+    );
+    render_extension_add_shell("Choose Filename", &body, false)
+}
+
+fn render_extension_add_prompt_from_submission(url: &str, error: &str) -> String {
+    let body = format!(
+        r#"<h2>Download not queued</h2>
+<p class="error">{}</p>
+<div class="actions"><a class="button" href="{}">Back</a></div>"#,
+        esc(error),
+        esc(&extension_add_path(url))
+    );
+    render_extension_add_shell("Download Not Queued", &body, false)
+}
+
+fn render_extension_add_done(display_name: &str, final_url: Option<&str>) -> String {
+    let body = format!(
+        r#"<h2>Queued</h2>
+<p>{}</p>
+<p class="muted">{}</p>"#,
+        esc(display_name),
+        esc(final_url.unwrap_or("This window will close automatically."))
+    );
+    render_extension_add_shell("Queued", &body, true)
+}
+
+fn render_extension_add_error(message: &str) -> String {
+    let body = format!(
+        r#"<h2>Download not queued</h2>
+<p class="error">{}</p>"#,
+        esc(message)
+    );
+    render_extension_add_shell("Download Not Queued", &body, false)
 }
 
 fn render_cancel_page(snapshot: &Snapshot, gid: &str, error: Option<&str>) -> String {
@@ -2577,6 +2841,7 @@ fn render_disabled_message() -> String {
     render_public_shell(
         "Web UI disabled",
         "<p>The web UI has been disabled. This page will stop working as soon as the daemon closes the listener.</p>",
+        Some("/current"),
     )
 }
 
@@ -2988,8 +3253,9 @@ code { background: #0d0d0d; padding: 0.15rem 0.25rem; }
 "#
 }
 
-fn script() -> &'static str {
-    r#"
+fn script(login_next: Option<&str>) -> String {
+    let script = r#"
+const loginNext = __LOGIN_NEXT__;
 const pairingStatus = document.getElementById("pairing-status");
 if (pairingStatus) {
   setInterval(async () => {
@@ -2997,7 +3263,7 @@ if (pairingStatus) {
       const response = await fetch("/login/status", { credentials: "same-origin" });
       const data = await response.json();
       if (data.status === "approved") {
-        window.location.href = "/current";
+        window.location.href = loginNext;
       } else if (data.status === "expired") {
         pairingStatus.textContent = "Pairing expired. Reloading...";
         window.location.reload();
@@ -3037,7 +3303,11 @@ if (document.body.dataset.autorefresh === "1") {
     }
   }, 1500);
 }
-"#
+"#;
+    script.replace(
+        "__LOGIN_NEXT__",
+        &serde_json::to_string(&normalize_next_path(login_next)).unwrap(),
+    )
 }
 
 #[cfg(test)]
