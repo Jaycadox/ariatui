@@ -1812,11 +1812,17 @@ fn login_path(next: Option<&str>) -> String {
 fn render_login(pin: &str, next: &str) -> String {
     let body = format!(
         r#"<section class="card narrow-card">
+<div id="login-loading" class="login-loading">
+<div class="spinner" aria-hidden="true"></div>
+<p class="muted">Checking existing browser session...</p>
+</div>
+<div id="login-pairing" class="hidden">
 <h2>Browser pairing</h2>
 <p>Type this PIN into the terminal UI in the <strong>Web UI</strong> tab to approve this browser:</p>
 <p class="pin">{}</p>
 <p class="muted">The page will continue automatically after approval.</p>
 <div id="pairing-status" class="muted">Waiting for terminal approval...</div>
+</div>
 </section>"#,
         esc(pin)
     );
@@ -3262,6 +3268,10 @@ input, select { width: 100%; box-sizing: border-box; background: #0f0f0f; color:
 .phase-list li { margin-bottom: 0.3rem; }
 code { background: #0d0d0d; padding: 0.15rem 0.25rem; }
 .pin { font-size: 2.4rem; font-weight: bold; letter-spacing: 0.25rem; text-align: center; margin: 1rem 0; color: #7fe27f; }
+.hidden { display: none; }
+.login-loading { display: grid; justify-items: center; gap: 0.8rem; padding: 1.2rem 0; }
+.spinner { width: 1.6rem; height: 1.6rem; border: 2px solid #333; border-top-color: #29b8b8; border-radius: 999px; animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
 @media (max-width: 900px) { .split, .grid2 { grid-template-columns: 1fr; } }
 "#
 }
@@ -3270,6 +3280,8 @@ fn script(login_next: Option<&str>) -> String {
     let script = r#"
 const loginNext = __LOGIN_NEXT__;
 const pairingStatus = document.getElementById("pairing-status");
+const loginLoading = document.getElementById("login-loading");
+const loginPairing = document.getElementById("login-pairing");
 if (pairingStatus) {
   async function probeExistingSession() {
     try {
@@ -3286,6 +3298,12 @@ if (pairingStatus) {
   probeExistingSession().then((handled) => {
     if (handled) {
       return;
+    }
+    if (loginLoading) {
+      loginLoading.classList.add("hidden");
+    }
+    if (loginPairing) {
+      loginPairing.classList.remove("hidden");
     }
     setInterval(async () => {
       try {
