@@ -1,0 +1,132 @@
+name: Release Linux Binary
+
+on:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    env:
+      BIN_NAME: ariatui
+      TARGET_TRIPLE: x86_64-unknown-linux-gnu
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Ensure Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain stable
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          cargo --version
+          rustc --version
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release --locked
+
+      - name: Package release assets
+        id: package
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          tag="build-${GITHUB_RUN_NUMBER}"
+          short_sha="$(git rev-parse --short=12 HEAD)"
+          safe_ref="${GITHUB_REF_NAME//\//-}"
+          title="AriaTUI build ${GITHUB_RUN_NUMBER}"
+          asset_base="${BIN_NAME}-${TARGET_TRIPLE}-${tag}"
+
+          mkdir -p dist/package
+          cp "target/release/${BIN_NAME}" "dist/package/${BIN_NAME}"
+          chmod +x "dist/package/${BIN_NAME}"
+
+          tar -C dist/package -czf "dist/${asset_base}.tar.gz" "${BIN_NAME}"
+          sha256sum "dist/${asset_base}.tar.gz" > "dist/${asset_base}.sha256"
+
+          cat > "dist/release-notes.md" <<EOF
+          Automated Linux build for \`${GITHUB_SHA}\`.
+
+          - Run number: ${GITHUB_RUN_NUMBER}
+          - Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          - Commit: \`${short_sha}\`
+          - Ref: \`${GITHUB_REF}\`
+          - Branch/tag name: \`${safe_ref}\`
+          EOF
+
+          if [[ "${GITHUB_REF_NAME}" == "${DEFAULT_BRANCH}" ]]; then
+            prerelease=false
+          else
+            prerelease=true
+            title="${title} (${safe_ref})"
+          fi
+
+          {
+            echo "tag=${tag}"
+            echo "title=${title}"
+            echo "prerelease=${prerelease}"
+            echo "asset_tar=dist/${asset_base}.tar.gz"
+            echo "asset_sha=dist/${asset_base}.sha256"
+            echo "notes_file=dist/release-notes.md"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ariatui-linux-build-${{ github.run_number }}
+          path: |
+            ${{ steps.package.outputs.asset_tar }}
+            ${{ steps.package.outputs.asset_sha }}
+          if-no-files-found: error
+
+      - name: Create or update GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          tag="${{ steps.package.outputs.tag }}"
+          title="${{ steps.package.outputs.title }}"
+          notes_file="${{ steps.package.outputs.notes_file }}"
+          asset_tar="${{ steps.package.outputs.asset_tar }}"
+          asset_sha="${{ steps.package.outputs.asset_sha }}"
+          prerelease="${{ steps.package.outputs.prerelease }}"
+
+          extra_flags=(--target "${GITHUB_SHA}" --title "${title}" --notes-file "${notes_file}")
+          if [[ "${prerelease}" == "true" ]]; then
+            extra_flags+=(--prerelease)
+          else
+            extra_flags+=(--latest)
+          fi
+
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" "${asset_tar}" "${asset_sha}" --clobber
+            gh release edit "${tag}" "${extra_flags[@]}"
+          else
+            gh release create "${tag}" "${asset_tar}" "${asset_sha}" "${extra_flags[@]}"
+          fi
