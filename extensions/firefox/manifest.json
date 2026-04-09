@@ -1,0 +1,59 @@
+{
+  "manifest_version": 3,
+  "name": "AriatUI Download Via",
+  "version": "0.1.0",
+  "description": "Send link downloads to local or remote AriatUI instances from Firefox.",
+  "icons": {
+    "48": "icons/ariatui-48.svg",
+    "96": "icons/ariatui-96.svg"
+  },
+  "action": {
+    "default_title": "AriatUI Remotes",
+    "default_icon": {
+      "48": "icons/ariatui-48.svg",
+      "96": "icons/ariatui-96.svg"
+    }
+  },
+  "background": {
+    "scripts": [
+      "background.js"
+    ]
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "chooser.html",
+        "chooser.js",
+        "chooser.css"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ],
+  "permissions": [
+    "cookies",
+    "contextMenus",
+    "notifications",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*",
+    "http://[::1]/*"
+  ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "download-via-ariatui@jayphen.dev",
+      "strict_min_version": "128.0"
+    }
+  }
+}

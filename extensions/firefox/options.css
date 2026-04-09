@@ -1,0 +1,212 @@
+:root {
+  color-scheme: dark;
+  --bg: #111;
+  --panel: #181818;
+  --panel-alt: #151515;
+  --border: #333;
+  --border-strong: #555;
+  --text: #eee;
+  --muted: #bbb;
+  --accent: #29b8b8;
+  --accent-bg: #0e5f5f;
+  --danger: #ff8383;
+  --danger-border: #8a3d3d;
+  --font: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+}
+
+.shell {
+  width: min(1180px, calc(100% - 2rem));
+  margin: 1rem auto 2rem;
+  display: grid;
+  gap: 0.75rem;
+}
+
+.hero,
+.panel,
+.remote-card {
+  border: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.hero,
+.panel {
+  padding: 0.9rem;
+}
+
+.hero {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.hero h1,
+.hero p,
+.panel h2,
+.panel p,
+.remote-card h3,
+.remote-card p {
+  margin: 0;
+}
+
+.eyebrow {
+  color: var(--muted);
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.lead,
+.muted {
+  color: var(--muted);
+}
+
+.warning,
+.error {
+  color: var(--danger);
+}
+
+.main-grid {
+  display: grid;
+  grid-template-columns: 340px minmax(0, 1fr);
+  gap: 0.75rem;
+}
+
+.panel-head,
+.remote-summary,
+.actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+
+.stack {
+  display: grid;
+  gap: 0.75rem;
+}
+
+label span {
+  display: block;
+  margin-bottom: 0.35rem;
+  color: var(--muted);
+}
+
+input,
+button {
+  font: inherit;
+}
+
+input {
+  width: 100%;
+  border: 1px solid var(--border-strong);
+  background: #0f0f0f;
+  color: var(--text);
+  padding: 0.55rem 0.65rem;
+  outline: 0;
+}
+
+input:focus {
+  border-color: var(--accent);
+}
+
+button {
+  border: 1px solid var(--border-strong);
+  background: #262626;
+  color: var(--text);
+  padding: 0.48rem 0.8rem;
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: #666;
+}
+
+button[type="submit"],
+button:not(.secondary):not(.danger)[data-action="pair"] {
+  background: var(--accent-bg);
+  border-color: var(--accent);
+}
+
+button.secondary {
+  background: #262626;
+}
+
+button.danger {
+  border-color: var(--danger-border);
+  color: #f3b1b1;
+}
+
+.remote-list {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.remote-card {
+  display: grid;
+  gap: 0.75rem;
+  padding: 0.85rem;
+}
+
+.remote-summary {
+  align-items: flex-start;
+}
+
+.remote-label {
+  margin-bottom: 0.35rem;
+}
+
+.remote-url {
+  color: var(--muted);
+  word-break: break-all;
+}
+
+.remote-state {
+  border: 1px solid var(--border-strong);
+  background: var(--panel-alt);
+  color: var(--muted);
+  padding: 0.25rem 0.55rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 0.78rem;
+}
+
+.pin {
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--accent);
+  background: #0f0f0f;
+  color: var(--text);
+  font-size: clamp(1.8rem, 6vw, 3rem);
+  letter-spacing: 0.28em;
+}
+
+.pairing-copy,
+.status-box {
+  color: var(--muted);
+}
+
+.hidden {
+  display: none;
+}
+
+@media (max-width: 900px) {
+  .shell {
+    width: min(100%, calc(100% - 1rem));
+    margin-top: 0.5rem;
+  }
+
+  .main-grid {
+    grid-template-columns: 1fr;
+  }
+}

@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Choose Filename</title>
+  <link rel="stylesheet" href="chooser.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="panel">
+      <p class="eyebrow">AriatUI</p>
+      <h1>Choose a filename</h1>
+      <p id="remote-line" class="muted"></p>
+      <p id="url-line" class="url"></p>
+      <form id="chooser-form" class="stack">
+        <div class="choice-grid">
+          <label class="choice">
+            <input type="radio" name="filename_choice" value="url" checked>
+            <span>
+              <strong>Use URL filename</strong>
+              <small id="url-filename"></small>
+            </span>
+          </label>
+          <label class="choice">
+            <input type="radio" name="filename_choice" value="remote">
+            <span>
+              <strong id="remote-label-title">Use remote filename</strong>
+              <small id="remote-filename"></small>
+            </span>
+          </label>
+          <label class="choice">
+            <input type="radio" name="filename_choice" value="custom">
+            <span>
+              <strong>Use custom filename</strong>
+              <small>Enter your own output filename.</small>
+            </span>
+          </label>
+        </div>
+        <label>
+          <span>Custom filename</span>
+          <input id="custom-filename" type="text" autocomplete="off">
+        </label>
+        <div class="actions">
+          <button type="submit">Add download</button>
+          <button id="cancel" type="button" class="secondary">Cancel</button>
+        </div>
+      </form>
+      <p id="status" class="status"></p>
+    </section>
+  </main>
+  <script src="chooser.js"></script>
+</body>
+</html>

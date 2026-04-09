@@ -63,6 +63,7 @@ pub struct DaemonState {
     pub last_notified_restart_count: Mutex<u32>,
     pub web_pairings: Mutex<HashMap<String, WebPairing>>,
     pub web_sessions: Mutex<HashMap<String, Instant>>,
+    pub web_revoked_sessions: Mutex<HashMap<String, Instant>>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +104,7 @@ impl DaemonState {
             last_notified_restart_count: Mutex::new(0),
             web_pairings: Mutex::new(HashMap::new()),
             web_sessions: Mutex::new(HashMap::new()),
+            web_revoked_sessions: Mutex::new(HashMap::new()),
         })
     }
 

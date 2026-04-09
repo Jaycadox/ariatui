@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 use axum::{
     Form, Json, Router,
     extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
@@ -16,8 +17,11 @@ use serde::{Deserialize, Serialize};
 use time::Duration as CookieDuration;
 
 use crate::{
-    daemon::{ApiPayload, ApiRequest, DownloadItem, DownloadStatus, SharedDaemonState, Snapshot},
-    download_uri::is_http_like_uri,
+    daemon::{
+        ApiPayload, ApiRequest, DownloadItem, DownloadStatus, ResolvedHttpUrl, SharedDaemonState,
+        Snapshot,
+    },
+    download_uri::{DownloadUriKind, classify_download_uri, magnet_display_name},
     eta::{ProjectionPhaseEnd, ScheduledEtaPhase, ScheduledEtaProjection, project_scheduled_eta},
     list_view::{
         CurrentFilter, CurrentSort, HistoryFilter, HistorySort, current_visible_items,
@@ -30,8 +34,9 @@ use crate::{
     },
     units::{self, Percentage, format_bytes, format_bytes_per_sec, format_eta, format_limit},
     web::{
-        AUTH_COOKIE_NAME, PAIR_COOKIE_NAME, PairingStatus, create_or_get_pairing, pairing_status,
-        remove_session, session_is_valid, validate_bind_address, validate_cookie_days,
+        AUTH_COOKIE_NAME, PAIR_COOKIE_NAME, PAIRING_TTL_SECS, PairingStatus, create_or_get_pairing,
+        pairing_status, revoke_session, session_is_valid, token_expires_in_secs,
+        validate_bind_address, validate_cookie_days,
     },
     webhook::{WebhookPingMode, validate_discord_webhook_url, validate_ping_id},
 };
@@ -42,6 +47,10 @@ pub fn router(state: SharedDaemonState) -> Router {
         .route("/login", get(login_page))
         .route("/login/status", get(login_status))
         .route("/logout", post(logout))
+        .route("/api/pairings", post(api_create_pairing))
+        .route("/api/pairings/{request_id}", get(api_pairing_status))
+        .route("/api/session", get(api_session).delete(api_delete_session))
+        .route("/api/downloads", post(api_add_download))
         .route("/current", get(current_page))
         .route("/current/pause-all", post(pause_all_downloads))
         .route("/current/resume-all", post(resume_all_downloads))
@@ -203,6 +212,12 @@ struct WebUiFormData {
 }
 
 #[derive(Debug, Deserialize)]
+struct ApiAddDownloadBody {
+    url: String,
+    filename: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct TorrentSettingsFormData {
     mode: String,
     head_size_mib: u32,
@@ -223,6 +238,91 @@ struct RulePath {
 #[derive(Debug, Serialize)]
 struct LoginStatusBody {
     status: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiErrorBody {
+    error: String,
+}
+
+#[derive(Debug)]
+struct ApiErrorResponse {
+    status: StatusCode,
+    message: String,
+}
+
+impl ApiErrorResponse {
+    fn unauthorized(message: &str) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.to_string(),
+        }
+    }
+
+    fn bad_request(message: &str) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.to_string(),
+        }
+    }
+
+    fn internal(message: &str) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.to_string(),
+        }
+    }
+}
+
+impl IntoResponse for ApiErrorResponse {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(ApiErrorBody {
+                error: self.message,
+            }),
+        )
+            .into_response()
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ApiCreatePairingBody {
+    request_id: String,
+    pin: String,
+    expires_in_secs: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiPairingPendingBody {
+    status: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiPairingApprovedBody {
+    status: &'static str,
+    auth_token: String,
+    expires_in_secs: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiAddDownloadQueuedResponse {
+    status: &'static str,
+    queued: bool,
+    display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    final_url: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiAddDownloadPromptResponse {
+    status: &'static str,
+    url: String,
+    url_filename: String,
+    remote_label: &'static str,
+    remote_filename: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    final_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -333,9 +433,125 @@ async fn login_status(State(state): State<SharedDaemonState>, jar: CookieJar) ->
     }
 }
 
+async fn api_create_pairing(State(state): State<SharedDaemonState>) -> Response {
+    match create_or_get_pairing(state.as_ref(), None).await {
+        Ok((request_id, pin)) => Json(ApiCreatePairingBody {
+            request_id,
+            pin,
+            expires_in_secs: PAIRING_TTL_SECS,
+        })
+        .into_response(),
+        Err(error) => ApiErrorResponse::internal(&error.to_string()).into_response(),
+    }
+}
+
+async fn api_pairing_status(
+    State(state): State<SharedDaemonState>,
+    Path(request_id): Path<String>,
+) -> Response {
+    match pairing_status(state.as_ref(), &request_id).await {
+        Ok(PairingStatus::Pending) => {
+            Json(ApiPairingPendingBody { status: "pending" }).into_response()
+        }
+        Ok(PairingStatus::Expired) => {
+            Json(ApiPairingPendingBody { status: "expired" }).into_response()
+        }
+        Ok(PairingStatus::Approved { auth_token }) => Json(ApiPairingApprovedBody {
+            status: "approved",
+            expires_in_secs: token_expires_in_secs(&auth_token).unwrap_or_default(),
+            auth_token,
+        })
+        .into_response(),
+        Err(error) => ApiErrorResponse::internal(&error.to_string()).into_response(),
+    }
+}
+
+async fn api_session(
+    State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> Response {
+    match authenticated_api_token(&state, &headers, &jar).await {
+        Some(_) => StatusCode::NO_CONTENT.into_response(),
+        None => ApiErrorResponse::unauthorized("authentication required").into_response(),
+    }
+}
+
+async fn api_delete_session(
+    State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> Response {
+    match authenticated_api_token(&state, &headers, &jar).await {
+        Some(token) => {
+            revoke_session(state.as_ref(), &token).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        None => ApiErrorResponse::unauthorized("authentication required").into_response(),
+    }
+}
+
+async fn api_add_download(
+    State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
+    jar: CookieJar,
+    Json(body): Json<ApiAddDownloadBody>,
+) -> Response {
+    if authenticated_api_token(&state, &headers, &jar)
+        .await
+        .is_none()
+    {
+        return ApiErrorResponse::unauthorized("authentication required").into_response();
+    }
+    match prepare_download_submission(&state, &body.url).await {
+        Ok(prepared) => {
+            if body.filename.is_none()
+                && let PreparedDownloadSubmission::Prompt {
+                    url,
+                    url_filename,
+                    remote_label,
+                    remote_filename,
+                    final_url,
+                } = &prepared
+            {
+                return Json(ApiAddDownloadPromptResponse {
+                    status: "needs_filename",
+                    url: url.clone(),
+                    url_filename: url_filename.clone(),
+                    remote_label,
+                    remote_filename: remote_filename.clone(),
+                    final_url: final_url.clone(),
+                })
+                .into_response();
+            }
+            let queued = match prepared.into_queue_with_filename(body.filename) {
+                Ok(queued) => queued,
+                Err(error) => return error.into_response(),
+            };
+            let response = ApiAddDownloadQueuedResponse {
+                status: "queued",
+                queued: true,
+                display_name: queued.display_name.clone(),
+                final_url: queued.final_url.clone(),
+            };
+            match state
+                .execute(ApiRequest::AddHttpUrl {
+                    url: queued.url,
+                    filename: queued.filename,
+                })
+                .await
+            {
+                Ok(_) => (StatusCode::ACCEPTED, Json(response)).into_response(),
+                Err(error) => ApiErrorResponse::bad_request(&error.to_string()).into_response(),
+            }
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
 async fn logout(State(state): State<SharedDaemonState>, jar: CookieJar) -> Response {
     if let Some(cookie) = jar.get(AUTH_COOKIE_NAME) {
-        remove_session(state.as_ref(), cookie.value()).await;
+        revoke_session(state.as_ref(), cookie.value()).await;
     }
     let cookie = Cookie::build((AUTH_COOKIE_NAME, ""))
         .path("/")
@@ -354,6 +570,192 @@ async fn logout(State(state): State<SharedDaemonState>, jar: CookieJar) -> Respo
         Redirect::to("/login"),
     )
         .into_response()
+}
+
+#[derive(Debug, Clone)]
+struct QueuedDownload {
+    url: String,
+    filename: Option<String>,
+    display_name: String,
+    final_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum PreparedDownloadSubmission {
+    Queue(QueuedDownload),
+    Prompt {
+        url: String,
+        url_filename: String,
+        remote_label: &'static str,
+        remote_filename: String,
+        final_url: Option<String>,
+    },
+}
+
+impl PreparedDownloadSubmission {
+    fn into_api_queue(self) -> QueuedDownload {
+        match self {
+            Self::Queue(queue) => queue,
+            Self::Prompt {
+                url,
+                remote_filename,
+                final_url,
+                ..
+            } => QueuedDownload {
+                url,
+                filename: Some(remote_filename.clone()),
+                display_name: remote_filename,
+                final_url,
+            },
+        }
+    }
+
+    fn into_queue_with_filename(
+        self,
+        filename: Option<String>,
+    ) -> Result<QueuedDownload, ApiErrorResponse> {
+        let custom = filename
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        match self {
+            Self::Queue(mut queue) => {
+                if let Some(filename) = custom {
+                    queue.display_name = filename.clone();
+                    queue.filename = Some(filename);
+                }
+                Ok(queue)
+            }
+            Self::Prompt { url, final_url, .. } => {
+                let Some(filename) = custom else {
+                    return Err(ApiErrorResponse::bad_request("filename is required"));
+                };
+                Ok(QueuedDownload {
+                    url,
+                    filename: Some(filename.clone()),
+                    display_name: filename,
+                    final_url,
+                })
+            }
+        }
+    }
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let value = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let token = value.strip_prefix("Bearer ")?.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
+async fn authenticated_api_token(
+    state: &SharedDaemonState,
+    headers: &HeaderMap,
+    jar: &CookieJar,
+) -> Option<String> {
+    if let Some(token) = bearer_token(headers)
+        && session_is_valid(state.as_ref(), &token).await
+    {
+        return Some(token);
+    }
+    let cookie = jar.get(AUTH_COOKIE_NAME)?;
+    if session_is_valid(state.as_ref(), cookie.value()).await {
+        Some(cookie.value().to_string())
+    } else {
+        None
+    }
+}
+
+fn filename_from_url_fallback(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| {
+            parsed
+                .path_segments()
+                .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
+                .map(str::to_string)
+        })
+        .filter(|segment| !segment.trim().is_empty())
+        .unwrap_or_else(|| "download".into())
+}
+
+async fn prepare_download_submission(
+    state: &SharedDaemonState,
+    url: &str,
+) -> Result<PreparedDownloadSubmission, ApiErrorResponse> {
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        return Err(ApiErrorResponse::bad_request("URI cannot be empty"));
+    }
+
+    match classify_download_uri(&url)
+        .map_err(|error| ApiErrorResponse::bad_request(&error.to_string()))?
+    {
+        DownloadUriKind::Magnet => Ok(PreparedDownloadSubmission::Queue(QueuedDownload {
+            display_name: magnet_display_name(&url).unwrap_or_else(|| "torrent".into()),
+            filename: None,
+            final_url: None,
+            url,
+        })),
+        DownloadUriKind::HttpLike => match state
+            .execute(ApiRequest::ResolveHttpUrl { url: url.clone() })
+            .await
+        {
+            Ok(reply) => match reply.payload {
+                Some(ApiPayload::ResolvedHttpUrl(resolved)) => {
+                    Ok(prepared_download_from_resolved(resolved))
+                }
+                _ => Ok(PreparedDownloadSubmission::Queue(QueuedDownload {
+                    display_name: filename_from_url_fallback(&url),
+                    filename: None,
+                    final_url: None,
+                    url,
+                })),
+            },
+            Err(_) => Ok(PreparedDownloadSubmission::Queue(QueuedDownload {
+                display_name: filename_from_url_fallback(&url),
+                filename: None,
+                final_url: None,
+                url,
+            })),
+        },
+    }
+}
+
+fn prepared_download_from_resolved(resolved: ResolvedHttpUrl) -> PreparedDownloadSubmission {
+    if resolved.is_torrent {
+        return PreparedDownloadSubmission::Queue(QueuedDownload {
+            display_name: resolved
+                .remote_filename
+                .clone()
+                .or_else(|| resolved.redirect_filename.clone())
+                .unwrap_or_else(|| resolved.url_filename.clone()),
+            filename: None,
+            final_url: resolved.final_url,
+            url: resolved.url,
+        });
+    }
+    if let Some((label, remote_filename)) = prompt_candidate(&resolved) {
+        PreparedDownloadSubmission::Prompt {
+            url: resolved.url,
+            url_filename: resolved.url_filename,
+            remote_label: label,
+            remote_filename,
+            final_url: resolved.final_url,
+        }
+    } else {
+        PreparedDownloadSubmission::Queue(QueuedDownload {
+            display_name: resolved.url_filename.clone(),
+            filename: Some(resolved.url_filename),
+            final_url: resolved.final_url,
+            url: resolved.url,
+        })
+    }
 }
 
 async fn current_page(
@@ -411,109 +813,46 @@ async fn add_url_resolve(
     }
     let snapshot = state.snapshot().await;
     let url = form.url.trim().to_string();
-    if url.is_empty() {
-        return Html(render_add_url_page(
+    match prepare_download_submission(&state, &url).await {
+        Ok(PreparedDownloadSubmission::Prompt {
+            url,
+            url_filename,
+            remote_label,
+            remote_filename,
+            ..
+        }) => Html(render_add_url_page(
             &snapshot,
-            Some("URI cannot be empty"),
             None,
+            Some((&url, &url_filename, remote_label, &remote_filename)),
             None,
         ))
-        .into_response();
-    }
-
-    if !is_http_like_uri(&url) {
-        return match state
-            .execute(ApiRequest::AddHttpUrl {
-                url: url.clone(),
-                filename: None,
-            })
-            .await
-        {
-            Ok(_) => Redirect::to("/current").into_response(),
-            Err(error) => Html(render_add_url_page(
-                &snapshot,
-                Some(&error.to_string()),
-                None,
-                Some(&url),
-            ))
-            .into_response(),
-        };
-    }
-
-    match state
-        .execute(ApiRequest::ResolveHttpUrl { url: url.clone() })
-        .await
-    {
-        Ok(reply) => match reply.payload {
-            Some(ApiPayload::ResolvedHttpUrl(resolved)) => {
-                if resolved.is_torrent {
-                    return match state
-                        .execute(ApiRequest::AddHttpUrl {
-                            url: resolved.url,
-                            filename: None,
-                        })
-                        .await
-                    {
-                        Ok(_) => Redirect::to("/current").into_response(),
-                        Err(error) => Html(render_add_url_page(
-                            &reply.snapshot,
-                            Some(&error.to_string()),
-                            None,
-                            Some(&url),
-                        ))
-                        .into_response(),
-                    };
-                }
-                if let Some((label, remote_filename)) = prompt_candidate(&resolved) {
-                    Html(render_add_url_page(
-                        &reply.snapshot,
-                        None,
-                        Some((
-                            &resolved.url,
-                            &resolved.url_filename,
-                            label,
-                            &remote_filename,
-                        )),
-                        None,
-                    ))
-                    .into_response()
-                } else {
-                    match state
-                        .execute(ApiRequest::AddHttpUrl {
-                            url: resolved.url,
-                            filename: Some(resolved.url_filename),
-                        })
-                        .await
-                    {
-                        Ok(_) => Redirect::to("/current").into_response(),
-                        Err(error) => Html(render_add_url_page(
-                            &reply.snapshot,
-                            Some(&error.to_string()),
-                            None,
-                            Some(&url),
-                        ))
-                        .into_response(),
-                    }
-                }
+        .into_response(),
+        Ok(prepared) => {
+            let queued = prepared.into_api_queue();
+            match state
+                .execute(ApiRequest::AddHttpUrl {
+                    url: queued.url,
+                    filename: queued.filename,
+                })
+                .await
+            {
+                Ok(_) => Redirect::to("/current").into_response(),
+                Err(error) => Html(render_add_url_page(
+                    &snapshot,
+                    Some(&error.to_string()),
+                    None,
+                    Some(&url),
+                ))
+                .into_response(),
             }
-            _ => Redirect::to("/current").into_response(),
-        },
-        Err(_) => match state
-            .execute(ApiRequest::AddHttpUrl {
-                url: url.clone(),
-                filename: None,
-            })
-            .await
-        {
-            Ok(_) => Redirect::to("/current").into_response(),
-            Err(error) => Html(render_add_url_page(
-                &snapshot,
-                Some(&error.to_string()),
-                None,
-                Some(&url),
-            ))
-            .into_response(),
-        },
+        }
+        Err(error) => Html(render_add_url_page(
+            &snapshot,
+            Some(&error.message),
+            None,
+            Some(&url),
+        ))
+        .into_response(),
     }
 }
 
@@ -2699,4 +3038,264 @@ if (document.body.dataset.autorefresh === "1") {
   }, 1500);
 }
 "#
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::{
+        path::Path,
+        sync::Arc,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
+
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode, header},
+    };
+    use tower::ServiceExt;
+
+    use crate::{
+        config::AppConfig,
+        daemon::{AppContext, DaemonState},
+        paths::AppPaths,
+        state::PersistedState,
+        web::{
+            AUTH_COOKIE_NAME, approve_pairing_pin, create_or_get_pairing,
+            issue_session_cookie_value,
+        },
+    };
+
+    fn test_paths(root: &Path) -> AppPaths {
+        let config_dir = root.join("config");
+        let state_dir = root.join("state");
+        let runtime_dir = root.join("runtime");
+        let user_service_dir = config_dir.join("systemd/user");
+        AppPaths {
+            config_dir: config_dir.clone(),
+            state_dir: state_dir.clone(),
+            runtime_dir: runtime_dir.clone(),
+            config_file: config_dir.join("config.toml"),
+            state_file: state_dir.join("state.toml"),
+            socket_path: runtime_dir.join("daemon.sock"),
+            daemon_marker_file: runtime_dir.join(".daemon"),
+            snapshot_cache_file: runtime_dir.join(".snapshot"),
+            aria2_session_file: state_dir.join("aria2.session"),
+            user_service_dir: user_service_dir.clone(),
+            user_service_file: user_service_dir.join("ariatui-daemon.service"),
+            system_service_file: root.join("ariatui-daemon.service"),
+        }
+    }
+
+    async fn test_state(name: &str) -> SharedDaemonState {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ariatui-web-tests-{name}-{nonce}"));
+        let paths = test_paths(&root);
+        let app = Arc::new(AppContext::new(
+            paths,
+            AppConfig::default(),
+            PersistedState::default(),
+            "/tmp/ariatui".into(),
+            "test-build".into(),
+        ));
+        Arc::new(DaemonState::new(app).await.unwrap())
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn api_session_accepts_bearer_and_cookie_auth() {
+        let state = test_state("api-auth").await;
+        let app = router(state.clone());
+        let token = issue_session_cookie_value(state.as_ref(), 30)
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/session")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/session")
+                    .header(header::COOKIE, format!("{AUTH_COOKIE_NAME}={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn pairing_api_reports_pending_approved_and_expired_states() {
+        let state = test_state("pairing-states").await;
+        let app = router(state.clone());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/pairings")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created = response_json(response).await;
+        let request_id = created["request_id"].as_str().unwrap().to_string();
+        let pin = created["pin"].as_str().unwrap().to_string();
+        assert_eq!(created["expires_in_secs"].as_u64(), Some(PAIRING_TTL_SECS));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/pairings/{request_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["status"], "pending");
+
+        approve_pairing_pin(state.as_ref(), &pin).await.unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/pairings/{request_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let approved = response_json(response).await;
+        assert_eq!(approved["status"], "approved");
+        assert!(approved["auth_token"].as_str().unwrap().starts_with("v1."));
+        assert!(approved["expires_in_secs"].as_u64().unwrap() > 0);
+
+        let (expired_request_id, _) = create_or_get_pairing(state.as_ref(), None).await.unwrap();
+        state
+            .web_pairings
+            .lock()
+            .await
+            .get_mut(&expired_request_id)
+            .unwrap()
+            .expires_at = Instant::now() - Duration::from_secs(1);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/pairings/{expired_request_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["status"], "expired");
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_api_routes_return_json_401_without_redirects() {
+        let state = test_state("unauthenticated").await;
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().get(header::LOCATION).is_none());
+        assert_eq!(
+            response_json(response).await["error"],
+            "authentication required"
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/downloads")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"url":"https://example.com/file.iso"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().get(header::LOCATION).is_none());
+        assert_eq!(
+            response_json(response).await["error"],
+            "authentication required"
+        );
+    }
+
+    #[test]
+    fn prepared_download_helper_auto_selects_remote_filename_for_api_queue() {
+        let prepared = prepared_download_from_resolved(ResolvedHttpUrl {
+            url: "https://example.com/download".into(),
+            url_filename: "download".into(),
+            remote_filename: Some("server-name.iso".into()),
+            redirect_filename: None,
+            final_url: Some("https://cdn.example.com/server-name.iso".into()),
+            is_torrent: false,
+        });
+
+        let queued = prepared.into_api_queue();
+        assert_eq!(queued.filename.as_deref(), Some("server-name.iso"));
+        assert_eq!(queued.display_name, "server-name.iso");
+        assert_eq!(
+            queued.final_url.as_deref(),
+            Some("https://cdn.example.com/server-name.iso")
+        );
+    }
+
+    #[test]
+    fn prompt_download_requires_filename_for_queue_submission() {
+        let prepared = prepared_download_from_resolved(ResolvedHttpUrl {
+            url: "https://example.com/download".into(),
+            url_filename: "download".into(),
+            remote_filename: Some("server-name.iso".into()),
+            redirect_filename: None,
+            final_url: Some("https://cdn.example.com/server-name.iso".into()),
+            is_torrent: false,
+        });
+
+        assert!(prepared.clone().into_queue_with_filename(None).is_err());
+        let queued = prepared
+            .into_queue_with_filename(Some("custom-name.iso".into()))
+            .unwrap();
+        assert_eq!(queued.filename.as_deref(), Some("custom-name.iso"));
+        assert_eq!(queued.display_name, "custom-name.iso");
+    }
 }

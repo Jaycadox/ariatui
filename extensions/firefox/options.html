@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AriatUI Firefox Extension</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <p class="eyebrow">AriatUI Firefox</p>
+      <h1>Download via AriatUI</h1>
+      <p class="lead">Manage local and remote targets for the right-click menu.</p>
+      <p class="warning">HTTP remotes are supported. Use them only on networks you trust.</p>
+    </header>
+
+    <section class="main-grid">
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Remote Editor</h2>
+          <button id="reset-form" type="button" class="secondary">New remote</button>
+        </div>
+        <form id="remote-form" class="stack">
+          <input id="remote-id" type="hidden">
+          <label>
+            <span>Label</span>
+            <input id="remote-label" type="text" placeholder="Office server">
+          </label>
+          <label>
+            <span>Base URL</span>
+            <input id="remote-base-url" type="url" placeholder="http://127.0.0.1:39123">
+          </label>
+          <div class="actions">
+            <button type="submit">Save remote</button>
+            <button id="cancel-edit" type="button" class="secondary">Cancel</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Remotes</h2>
+          <p id="status-line" class="muted">Loading remotes…</p>
+        </div>
+        <div id="remotes" class="remote-list"></div>
+      </section>
+    </section>
+
+    <section id="pairing-panel" class="panel hidden">
+      <div class="panel-head">
+        <h2>Pairing</h2>
+      </div>
+      <p id="pairing-remote" class="muted"></p>
+      <p class="pairing-copy">Approve this PIN in AriatUI’s terminal Web UI tab.</p>
+      <p id="pairing-pin" class="pin"></p>
+      <p id="pairing-countdown" class="muted"></p>
+      <p id="pairing-status" class="status-box"></p>
+    </section>
+  </main>
+
+  <template id="remote-template">
+    <article class="remote-card">
+      <div class="remote-summary">
+        <div>
+          <h3 class="remote-label"></h3>
+          <p class="remote-url"></p>
+        </div>
+        <span class="remote-state"></span>
+      </div>
+      <div class="actions">
+        <button data-action="edit" type="button" class="secondary">Edit</button>
+        <button data-action="pair" type="button">Pair</button>
+        <button data-action="test" type="button" class="secondary">Test</button>
+        <button data-action="forget" type="button" class="secondary">Forget pairing</button>
+        <button data-action="open" type="button" class="secondary">Open Web UI</button>
+        <button data-action="delete" type="button" class="danger">Delete</button>
+      </div>
+    </article>
+  </template>
+
+  <script src="options.js"></script>
+</body>
+</html>

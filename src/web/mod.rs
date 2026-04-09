@@ -104,6 +104,11 @@ pub async fn cleanup_expired_auth(state: &DaemonState) {
         .lock()
         .await
         .retain(|_, expiry| *expiry > now);
+    state
+        .web_revoked_sessions
+        .lock()
+        .await
+        .retain(|_, expiry| *expiry > now);
 }
 
 pub async fn create_or_get_pairing(
@@ -177,6 +182,9 @@ pub async fn approve_pairing_pin(state: &DaemonState, pin: &str) -> Result<()> {
 
 pub async fn session_is_valid(state: &DaemonState, token: &str) -> bool {
     cleanup_expired_auth(state).await;
+    if state.web_revoked_sessions.lock().await.contains_key(token) {
+        return false;
+    }
     if verify_session_cookie_value(state, token).await {
         return true;
     }
@@ -185,6 +193,19 @@ pub async fn session_is_valid(state: &DaemonState, token: &str) -> bool {
 
 pub async fn remove_session(state: &DaemonState, token: &str) {
     state.web_sessions.lock().await.remove(token);
+}
+
+pub async fn revoke_session(state: &DaemonState, token: &str) {
+    cleanup_expired_auth(state).await;
+    remove_session(state, token).await;
+    let Some(expires_at) = token_expiry_instant(token) else {
+        return;
+    };
+    state
+        .web_revoked_sessions
+        .lock()
+        .await
+        .insert(token.to_string(), expires_at);
 }
 
 pub async fn ensure_session_secret(state: &DaemonState) -> Result<String> {
@@ -229,41 +250,78 @@ fn sign_session_payload(secret: &str, payload: &str) -> Result<String> {
 }
 
 fn verify_session_cookie_value_with_secret(secret: &str, token: &str) -> bool {
-    let mut parts = token.split('.');
-    let Some(version) = parts.next() else {
+    let Some(parsed) = parse_session_token(token) else {
         return false;
     };
-    let Some(expiry) = parts.next() else {
-        return false;
-    };
-    let Some(nonce) = parts.next() else {
-        return false;
-    };
-    let Some(signature) = parts.next() else {
-        return false;
-    };
-    if parts.next().is_some() || version != SESSION_COOKIE_VERSION {
+    if parsed.version != SESSION_COOKIE_VERSION {
         return false;
     }
-    let Ok(expiry_unix) = expiry.parse::<u64>() else {
-        return false;
-    };
-    let now_unix = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_secs(),
-        Err(_) => return false,
-    };
-    if expiry_unix <= now_unix {
+    if parsed.expiry_unix <= current_unix_secs().unwrap_or_default() {
         return false;
     }
-    let payload = format!("{version}.{expiry}.{nonce}");
-    let Ok(signature_bytes) = URL_SAFE_NO_PAD.decode(signature.as_bytes()) else {
+    let Ok(signature_bytes) = URL_SAFE_NO_PAD.decode(parsed.signature.as_bytes()) else {
         return false;
     };
     let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) else {
         return false;
     };
-    mac.update(payload.as_bytes());
+    mac.update(parsed.payload.as_bytes());
     mac.verify_slice(&signature_bytes).is_ok()
+}
+
+pub fn token_expiry_instant(token: &str) -> Option<std::time::Instant> {
+    let parsed = parse_session_token(token)?;
+    let now_unix = current_unix_secs()?;
+    if parsed.expiry_unix <= now_unix {
+        return None;
+    }
+    Some(std::time::Instant::now() + Duration::from_secs(parsed.expiry_unix - now_unix))
+}
+
+pub fn token_expires_in_secs(token: &str) -> Option<u64> {
+    let parsed = parse_session_token(token)?;
+    let now_unix = current_unix_secs()?;
+    parsed.expiry_unix.checked_sub(now_unix)
+}
+
+fn current_unix_secs() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
+struct ParsedSessionToken<'a> {
+    version: &'a str,
+    expiry_unix: u64,
+    payload: String,
+    signature: &'a str,
+}
+
+fn parse_session_token(token: &str) -> Option<ParsedSessionToken<'_>> {
+    let mut parts = token.split('.');
+    let Some(version) = parts.next() else {
+        return None;
+    };
+    let Some(expiry) = parts.next() else {
+        return None;
+    };
+    let Some(nonce) = parts.next() else {
+        return None;
+    };
+    let Some(signature) = parts.next() else {
+        return None;
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    let expiry_unix = expiry.parse::<u64>().ok()?;
+    Some(ParsedSessionToken {
+        version,
+        expiry_unix,
+        payload: format!("{version}.{expiry}.{nonce}"),
+        signature,
+    })
 }
 
 #[derive(Debug, Clone)]
