@@ -3271,20 +3271,37 @@ fn script(login_next: Option<&str>) -> String {
 const loginNext = __LOGIN_NEXT__;
 const pairingStatus = document.getElementById("pairing-status");
 if (pairingStatus) {
-  setInterval(async () => {
+  async function probeExistingSession() {
     try {
-      const response = await fetch("/login/status", { credentials: "same-origin" });
-      const data = await response.json();
-      if (data.status === "approved") {
+      const response = await fetch("/api/session", { credentials: "same-origin" });
+      if (response.status === 204) {
         window.location.href = loginNext;
-      } else if (data.status === "expired") {
-        pairingStatus.textContent = "Pairing expired. Reloading...";
-        window.location.reload();
+        return true;
       }
     } catch (_) {
-      pairingStatus.textContent = "Waiting for daemon...";
     }
-  }, 1200);
+    return false;
+  }
+
+  probeExistingSession().then((handled) => {
+    if (handled) {
+      return;
+    }
+    setInterval(async () => {
+      try {
+        const response = await fetch("/login/status", { credentials: "same-origin" });
+        const data = await response.json();
+        if (data.status === "approved") {
+          window.location.href = loginNext;
+        } else if (data.status === "expired") {
+          pairingStatus.textContent = "Pairing expired. Reloading...";
+          window.location.reload();
+        }
+      } catch (_) {
+        pairingStatus.textContent = "Waiting for daemon...";
+      }
+    }, 1200);
+  });
 }
 
 async function subtleRefresh() {

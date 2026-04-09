@@ -44,6 +44,19 @@ function extensionLaunchUrl(baseUrl, linkUrl) {
   return root.toString();
 }
 
+function originPattern(baseUrl) {
+  const url = new URL(`${baseUrl}/`);
+  return `${url.origin}/*`;
+}
+
+async function existingCookieStoreId(baseUrl) {
+  const matches = await browser.tabs.query({
+    url: originPattern(baseUrl)
+  });
+  const candidate = matches.find((tab) => tab.cookieStoreId);
+  return candidate?.cookieStoreId;
+}
+
 async function getRemotes() {
   const stored = await browser.storage.local.get(STORAGE_KEY);
   const remotes = Array.isArray(stored[STORAGE_KEY]) ? stored[STORAGE_KEY] : [];
@@ -118,7 +131,12 @@ async function openWebUi(remoteId) {
   if (!remote) {
     throw new Error("Remote not found.");
   }
-  await browser.tabs.create({ url: `${remote.base_url}/` });
+  const cookieStoreId = await existingCookieStoreId(remote.base_url);
+  const createProperties = { url: `${remote.base_url}/` };
+  if (cookieStoreId) {
+    createProperties.cookieStoreId = cookieStoreId;
+  }
+  await browser.tabs.create(createProperties);
 }
 
 async function launchDownload(remoteId, linkUrl) {
@@ -130,12 +148,17 @@ async function launchDownload(remoteId, linkUrl) {
   if (!linkUrl) {
     throw new Error("No link URL was provided by Firefox.");
   }
-  await browser.windows.create({
+  const cookieStoreId = await existingCookieStoreId(remote.base_url);
+  const createProperties = {
     type: "popup",
     width: 960,
     height: 620,
     url: extensionLaunchUrl(remote.base_url, linkUrl)
-  });
+  };
+  if (cookieStoreId) {
+    createProperties.cookieStoreId = cookieStoreId;
+  }
+  await browser.windows.create(createProperties);
 }
 
 browser.runtime.onInstalled.addListener(() => {
