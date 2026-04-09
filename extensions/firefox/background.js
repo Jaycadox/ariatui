@@ -37,9 +37,11 @@ function normalizeBaseUrl(input) {
 }
 
 function extensionLaunchUrl(baseUrl, linkUrl) {
-  const url = new URL(`${baseUrl}/extension/add`);
-  url.searchParams.set("url", linkUrl);
-  return url.toString();
+  const next = new URL("/extension/add", `${baseUrl}/`);
+  next.searchParams.set("url", linkUrl);
+  const root = new URL(`${baseUrl}/`);
+  root.searchParams.set("next", `${next.pathname}${next.search}`);
+  return root.toString();
 }
 
 async function getRemotes() {
@@ -116,7 +118,7 @@ async function openWebUi(remoteId) {
   if (!remote) {
     throw new Error("Remote not found.");
   }
-  await browser.tabs.create({ url: remote.base_url });
+  await browser.tabs.create({ url: `${remote.base_url}/` });
 }
 
 async function launchDownload(remoteId, linkUrl) {

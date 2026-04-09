@@ -385,11 +385,15 @@ impl HistoryListQuery {
     }
 }
 
-async fn root(State(state): State<SharedDaemonState>, jar: CookieJar) -> Response {
+async fn root(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Query(query): Query<LoginQuery>,
+) -> Response {
     if authenticated(&state, &jar).await.unwrap_or(false) {
-        Redirect::to("/current").into_response()
+        Redirect::to(&root_next_path(query.next.as_deref())).into_response()
     } else {
-        Redirect::to("/login").into_response()
+        Redirect::to(&login_path(query.next.as_deref())).into_response()
     }
 }
 
@@ -398,7 +402,7 @@ async fn login_page(
     jar: CookieJar,
     Query(query): Query<LoginQuery>,
 ) -> Response {
-    let next = normalize_next_path(query.next.as_deref());
+    let next = login_success_path(query.next.as_deref());
     if authenticated(&state, &jar).await.unwrap_or(false) {
         return Redirect::to(&next).into_response();
     }
@@ -1776,17 +1780,26 @@ async fn auth_redirect_with_next(
 }
 
 fn normalize_next_path(next: Option<&str>) -> String {
-    let candidate = next.unwrap_or("/current").trim();
+    let candidate = next.unwrap_or("/").trim();
     if candidate.starts_with('/') && !candidate.starts_with("//") {
         candidate.to_string()
     } else {
-        "/current".into()
+        "/".into()
     }
+}
+
+fn root_next_path(next: Option<&str>) -> String {
+    let next = normalize_next_path(next);
+    if next == "/" { "/current".into() } else { next }
+}
+
+fn login_success_path(next: Option<&str>) -> String {
+    normalize_next_path(next)
 }
 
 fn login_path(next: Option<&str>) -> String {
     let next = normalize_next_path(next);
-    if next == "/current" {
+    if next == "/" {
         "/login".into()
     } else {
         let query = form_urlencoded::Serializer::new(String::new())
