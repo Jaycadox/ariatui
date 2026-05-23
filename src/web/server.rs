@@ -4739,6 +4739,7 @@ mod tests {
             socket_path: runtime_dir.join("daemon.sock"),
             daemon_marker_file: runtime_dir.join(".daemon"),
             snapshot_cache_file: runtime_dir.join(".snapshot"),
+            history_file: state_dir.join("history.json"),
             aria2_session_file: state_dir.join("aria2.session"),
             retry_state_file: state_dir.join("retry-state.json"),
             user_service_dir: user_service_dir.clone(),

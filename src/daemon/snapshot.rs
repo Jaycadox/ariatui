@@ -137,7 +137,7 @@ pub enum DownloadStatus {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DownloadItem {
     pub gid: String,
     pub status: DownloadStatus,

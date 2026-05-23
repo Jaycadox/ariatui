@@ -28,6 +28,7 @@ use crate::{
         },
     },
     download_uri::{DownloadUriKind, classify_download_uri, magnet_display_name},
+    history,
     routing::{match_rule, normalize_rules},
     rpc::{
         client::Aria2RpcClient,
@@ -90,6 +91,7 @@ pub struct DaemonState {
     pub snapshot: RwLock<Snapshot>,
     pub desired_limit_bps: RwLock<Option<u64>>,
     pub speed_tracker: Mutex<RollingSpeedTracker>,
+    pub history_downloads: Mutex<Vec<DownloadItem>>,
     pub log_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub seen_terminal_events: Mutex<HashSet<String>>,
     pub notifications_initialized: Mutex<bool>,
@@ -116,6 +118,7 @@ impl DaemonState {
         if !app.paths.aria2_session_file.exists() {
             tokio::fs::write(&app.paths.aria2_session_file, "").await?;
         }
+        let history_downloads = history::load(&app.paths.history_file)?;
         let snapshot = Snapshot::empty(
             app.config
                 .daemon
@@ -134,6 +137,7 @@ impl DaemonState {
             snapshot: RwLock::new(snapshot),
             desired_limit_bps: RwLock::new(None),
             speed_tracker: Mutex::new(RollingSpeedTracker::default()),
+            history_downloads: Mutex::new(history_downloads),
             log_task: Mutex::new(None),
             seen_terminal_events: Mutex::new(HashSet::new()),
             notifications_initialized: Mutex::new(false),
@@ -304,6 +308,16 @@ impl DaemonState {
                 .await?;
             *desired_limit = resolved.effective_limit_bps;
         }
+        let stopped_downloads = stopped.into_iter().map(map_status).collect::<Vec<_>>();
+        let history_downloads = {
+            let mut history_downloads = self.history_downloads.lock().await;
+            let merged = history::merge_terminal_events(&history_downloads, stopped_downloads);
+            if merged != *history_downloads {
+                history::save(&self.app.paths.history_file, &merged)?;
+                *history_downloads = merged;
+            }
+            history_downloads.clone()
+        };
 
         let mut snapshot = self.snapshot.write().await;
         snapshot.scheduler = SchedulerSnapshot {
@@ -355,7 +369,7 @@ impl DaemonState {
             .await
             .refresh(refresh_started, &mut current_downloads);
         snapshot.current_downloads = current_downloads;
-        snapshot.history_downloads = stopped.into_iter().map(map_status).collect();
+        snapshot.history_downloads = history_downloads;
         let snapshot_copy = snapshot.clone();
         drop(snapshot);
         self.process_download_retries(runtime, &snapshot_copy).await;
@@ -537,6 +551,7 @@ impl DaemonState {
                 if matches!(uri_kind, DownloadUriKind::HttpLike)
                     && self.try_add_remote_torrent(&url, &state).await?
                 {
+                    self.save_aria2_session().await;
                     self.perform_refresh().await?;
                     return Ok(ApiReply {
                         snapshot: self.snapshot().await,
@@ -583,6 +598,7 @@ impl DaemonState {
                 let _: String = self
                     .call("aria2.addUri", vec![json!([url]), options])
                     .await?;
+                self.save_aria2_session().await;
                 self.perform_refresh().await?;
             }
             crate::daemon::ApiRequest::Pause { gid, force } => {
@@ -592,22 +608,35 @@ impl DaemonState {
                     "aria2.pause"
                 };
                 let _: String = self.call(method, vec![json!(gid)]).await?;
+                self.save_aria2_session().await;
                 self.perform_refresh().await?;
             }
             crate::daemon::ApiRequest::Resume { gid } => {
                 let _: String = self.call("aria2.unpause", vec![json!(gid)]).await?;
+                self.save_aria2_session().await;
                 self.perform_refresh().await?;
             }
             crate::daemon::ApiRequest::Cancel { gid, delete_files } => {
                 self.cancel_download(&gid, delete_files).await?;
                 self.forget_download_retry(&gid).await;
+                self.save_aria2_session().await;
                 self.perform_refresh().await?;
             }
             crate::daemon::ApiRequest::RemoveHistory { gid } => {
-                let _: String = self
-                    .call("aria2.removeDownloadResult", vec![json!(gid)])
-                    .await?;
+                {
+                    let mut history_downloads = self.history_downloads.lock().await;
+                    if history::remove(&mut history_downloads, &gid) {
+                        history::save(&self.app.paths.history_file, &history_downloads)?;
+                    }
+                }
+                if let Err(error) = self
+                    .call::<String>("aria2.removeDownloadResult", vec![json!(gid)])
+                    .await
+                {
+                    warn!("failed to remove aria2 history item: {error}");
+                }
                 self.forget_download_retry(&gid).await;
+                self.save_aria2_session().await;
                 self.perform_refresh().await?;
             }
             crate::daemon::ApiRequest::ChangePosition { gid, offset } => {
@@ -617,19 +646,33 @@ impl DaemonState {
                         vec![json!(gid), json!(offset), json!("POS_CUR")],
                     )
                     .await?;
+                self.save_aria2_session().await;
                 self.perform_refresh().await?;
             }
             crate::daemon::ApiRequest::PauseAll => {
                 let _: String = self.call("aria2.pauseAll", vec![]).await?;
+                self.save_aria2_session().await;
                 self.perform_refresh().await?;
             }
             crate::daemon::ApiRequest::ResumeAll => {
                 let _: String = self.call("aria2.unpauseAll", vec![]).await?;
+                self.save_aria2_session().await;
                 self.perform_refresh().await?;
             }
             crate::daemon::ApiRequest::PurgeHistory => {
-                let _: String = self.call("aria2.purgeDownloadResult", vec![]).await?;
+                {
+                    let mut history_downloads = self.history_downloads.lock().await;
+                    history_downloads.clear();
+                    history::save(&self.app.paths.history_file, &history_downloads)?;
+                }
+                if let Err(error) = self
+                    .call::<String>("aria2.purgeDownloadResult", vec![])
+                    .await
+                {
+                    warn!("failed to purge aria2 history: {error}");
+                }
                 self.clear_download_retries().await;
+                self.save_aria2_session().await;
                 self.perform_refresh().await?;
             }
             crate::daemon::ApiRequest::SetMode { mode } => {
@@ -1012,6 +1055,12 @@ impl DaemonState {
             .as_ref()
             .ok_or_else(|| eyre!("aria2 runtime missing"))?;
         runtime.rpc.call(method, params).await
+    }
+
+    async fn save_aria2_session(&self) {
+        if let Err(error) = self.call::<String>("aria2.saveSession", vec![]).await {
+            warn!("failed to save aria2 session: {error}");
+        }
     }
 
     async fn check_child_exit(&self) -> Result<()> {

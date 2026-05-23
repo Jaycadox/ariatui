@@ -68,7 +68,7 @@ pub async fn spawn_aria2(
         ))
         .arg(format!("--save-session={}", session_file.display()))
         .arg(format!("--input-file={}", session_file.display()))
-        .arg("--save-session-interval=60")
+        .arg("--save-session-interval=5")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
