@@ -6,7 +6,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Local, Utc};
 use color_eyre::eyre::{Result, eyre};
 use reqwest::{
@@ -37,6 +36,7 @@ use crate::{
     schedule,
     speed::RollingSpeedTracker,
     state::validate_torrent_size_mib,
+    torrent_engine::TorrentEngine,
     units, web,
     webhook::{
         WebhookPingMode, mention_prefix, validate_discord_webhook_url, validate_ping_id,
@@ -88,6 +88,7 @@ pub struct RuntimeAria2 {
 pub struct DaemonState {
     pub app: Arc<AppContext>,
     pub runtime: Mutex<Option<RuntimeAria2>>,
+    pub torrent_engine: TorrentEngine,
     pub snapshot: RwLock<Snapshot>,
     pub desired_limit_bps: RwLock<Option<u64>>,
     pub speed_tracker: Mutex<RollingSpeedTracker>,
@@ -119,6 +120,8 @@ impl DaemonState {
             tokio::fs::write(&app.paths.aria2_session_file, "").await?;
         }
         let history_downloads = history::load(&app.paths.history_file)?;
+        let torrent_engine =
+            TorrentEngine::new(&app.paths, expand_tilde(&app.config.daemon.download_dir)).await?;
         let snapshot = Snapshot::empty(
             app.config
                 .daemon
@@ -134,6 +137,7 @@ impl DaemonState {
         Ok(Self {
             app,
             runtime: Mutex::new(None),
+            torrent_engine,
             snapshot: RwLock::new(snapshot),
             desired_limit_bps: RwLock::new(None),
             speed_tracker: Mutex::new(RollingSpeedTracker::default()),
@@ -306,12 +310,21 @@ impl DaemonState {
         if *desired_limit != resolved.effective_limit_bps {
             self.apply_speed_limit(runtime, resolved.effective_limit_bps)
                 .await?;
+            self.torrent_engine
+                .apply_download_limit(resolved.effective_limit_bps);
             *desired_limit = resolved.effective_limit_bps;
         }
+        let torrent_downloads = self.torrent_engine.snapshot();
+        let torrent_terminal_downloads = TorrentEngine::terminal_download_items(&torrent_downloads);
         let stopped_downloads = stopped.into_iter().map(map_status).collect::<Vec<_>>();
         let history_downloads = {
             let mut history_downloads = self.history_downloads.lock().await;
-            let merged = history::merge_terminal_events(&history_downloads, stopped_downloads);
+            let merged = history::merge_terminal_events(
+                &history_downloads,
+                stopped_downloads
+                    .into_iter()
+                    .chain(torrent_terminal_downloads),
+            );
             if merged != *history_downloads {
                 history::save(&self.app.paths.history_file, &merged)?;
                 *history_downloads = merged;
@@ -335,6 +348,8 @@ impl DaemonState {
             head_size_mib: state.torrent_head_size_mib,
             tail_size_mib: state.torrent_tail_size_mib,
             aria2_prioritize_piece: state.torrent_prioritize_piece_value()?,
+            engine: "librqbit".into(),
+            downloads: torrent_downloads.clone(),
         };
         snapshot.routing = RoutingSnapshot {
             default_download_dir: state.default_download_dir.clone(),
@@ -364,6 +379,7 @@ impl DaemonState {
             .chain(waiting.into_iter())
             .map(map_status)
             .collect();
+        current_downloads.extend(TorrentEngine::current_download_items(&torrent_downloads));
         self.speed_tracker
             .lock()
             .await
@@ -548,6 +564,8 @@ impl DaemonState {
             crate::daemon::ApiRequest::AddHttpUrl { url, filename } => {
                 let state = self.app.state.read().await.clone();
                 let uri_kind = classify_download_uri(&url)?;
+                let effective_limit_bps =
+                    schedule::resolve(Local::now(), &state)?.effective_limit_bps;
                 if matches!(uri_kind, DownloadUriKind::HttpLike)
                     && self.try_add_remote_torrent(&url, &state).await?
                 {
@@ -573,28 +591,28 @@ impl DaemonState {
                     &routing_name,
                 )?;
                 tokio::fs::create_dir_all(&route.resolved_directory).await?;
-                let options = match uri_kind {
-                    DownloadUriKind::Magnet => {
-                        let mut options = serde_json::Map::new();
-                        options.insert(
-                            "dir".into(),
-                            json!(route.resolved_directory.display().to_string()),
-                        );
-                        if let Some(value) = state.torrent_prioritize_piece_value()? {
-                            options.insert("bt-prioritize-piece".into(), json!(value));
-                        }
-                        Value::Object(options)
-                    }
-                    DownloadUriKind::HttpLike => {
-                        let filename = validate_download_filename(
-                            filename.unwrap_or_else(|| filename_from_url(&url)).trim(),
-                        )?;
-                        json!({
-                            "dir": route.resolved_directory.display().to_string(),
-                            "out": filename,
-                        })
-                    }
-                };
+                if matches!(uri_kind, DownloadUriKind::Magnet) {
+                    self.torrent_engine
+                        .add_url(
+                            &url,
+                            route.resolved_directory,
+                            effective_limit_bps,
+                            state.torrent_streaming_mode != crate::state::TorrentStreamingMode::Off,
+                        )
+                        .await?;
+                    self.perform_refresh().await?;
+                    return Ok(ApiReply {
+                        snapshot: self.snapshot().await,
+                        payload,
+                    });
+                }
+                let filename = validate_download_filename(
+                    filename.unwrap_or_else(|| filename_from_url(&url)).trim(),
+                )?;
+                let options = json!({
+                    "dir": route.resolved_directory.display().to_string(),
+                    "out": filename,
+                });
                 let _: String = self
                     .call("aria2.addUri", vec![json!([url]), options])
                     .await?;
@@ -602,6 +620,14 @@ impl DaemonState {
                 self.perform_refresh().await?;
             }
             crate::daemon::ApiRequest::Pause { gid, force } => {
+                if TorrentEngine::is_torrent_gid(&gid) {
+                    self.torrent_engine.pause(&gid).await?;
+                    self.perform_refresh().await?;
+                    return Ok(ApiReply {
+                        snapshot: self.snapshot().await,
+                        payload,
+                    });
+                }
                 let method = if force {
                     "aria2.forcePause"
                 } else {
@@ -612,11 +638,27 @@ impl DaemonState {
                 self.perform_refresh().await?;
             }
             crate::daemon::ApiRequest::Resume { gid } => {
+                if TorrentEngine::is_torrent_gid(&gid) {
+                    self.torrent_engine.resume(&gid).await?;
+                    self.perform_refresh().await?;
+                    return Ok(ApiReply {
+                        snapshot: self.snapshot().await,
+                        payload,
+                    });
+                }
                 let _: String = self.call("aria2.unpause", vec![json!(gid)]).await?;
                 self.save_aria2_session().await;
                 self.perform_refresh().await?;
             }
             crate::daemon::ApiRequest::Cancel { gid, delete_files } => {
+                if TorrentEngine::is_torrent_gid(&gid) {
+                    self.torrent_engine.cancel(&gid, delete_files).await?;
+                    self.perform_refresh().await?;
+                    return Ok(ApiReply {
+                        snapshot: self.snapshot().await,
+                        payload,
+                    });
+                }
                 self.cancel_download(&gid, delete_files).await?;
                 self.forget_download_retry(&gid).await;
                 self.save_aria2_session().await;
@@ -629,14 +671,16 @@ impl DaemonState {
                         history::save(&self.app.paths.history_file, &history_downloads)?;
                     }
                 }
-                if let Err(error) = self
-                    .call::<String>("aria2.removeDownloadResult", vec![json!(gid)])
-                    .await
-                {
-                    warn!("failed to remove aria2 history item: {error}");
+                if !TorrentEngine::is_torrent_gid(&gid) {
+                    if let Err(error) = self
+                        .call::<String>("aria2.removeDownloadResult", vec![json!(gid)])
+                        .await
+                    {
+                        warn!("failed to remove aria2 history item: {error}");
+                    }
+                    self.save_aria2_session().await;
                 }
                 self.forget_download_retry(&gid).await;
-                self.save_aria2_session().await;
                 self.perform_refresh().await?;
             }
             crate::daemon::ApiRequest::ChangePosition { gid, offset } => {
@@ -982,25 +1026,25 @@ impl DaemonState {
             return Ok(false);
         }
 
-        let torrent_bytes = client
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await?;
-        let torrent = STANDARD.encode(torrent_bytes);
-        let download_dir = expand_tilde(&state.default_download_dir);
-        tokio::fs::create_dir_all(&download_dir).await?;
-        let mut options = serde_json::Map::new();
-        options.insert("dir".into(), json!(download_dir.display().to_string()));
-        if let Some(value) = state.torrent_prioritize_piece_value()? {
-            options.insert("bt-prioritize-piece".into(), json!(value));
-        }
-        let _: String = self
-            .call(
-                "aria2.addTorrent",
-                vec![json!(torrent), json!([]), Value::Object(options)],
+        let routing_name = if let Some(response) = head.as_ref() {
+            filename_from_content_disposition(response)
+                .or_else(|| filename_from_final_url(response.url().as_str()))
+                .unwrap_or_else(|| filename_from_url(url))
+        } else {
+            filename_from_url(url)
+        };
+        let route = match_rule(
+            &state.default_download_dir,
+            &state.download_rules,
+            &routing_name,
+        )?;
+        let effective_limit_bps = schedule::resolve(Local::now(), state)?.effective_limit_bps;
+        self.torrent_engine
+            .add_url(
+                url,
+                route.resolved_directory,
+                effective_limit_bps,
+                state.torrent_streaming_mode != crate::state::TorrentStreamingMode::Off,
             )
             .await?;
         Ok(true)

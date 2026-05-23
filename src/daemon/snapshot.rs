@@ -80,6 +80,61 @@ pub struct TorrentSettingsSnapshot {
     pub head_size_mib: u32,
     pub tail_size_mib: u32,
     pub aria2_prioritize_piece: Option<String>,
+    pub engine: String,
+    pub downloads: Vec<TorrentDownloadSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TorrentDownloadSnapshot {
+    pub gid: String,
+    pub id: usize,
+    pub name: String,
+    pub info_hash: String,
+    pub output_folder: String,
+    pub status: DownloadStatus,
+    pub total_bytes: u64,
+    pub completed_bytes: u64,
+    pub download_speed_bps: u64,
+    pub upload_speed_bps: u64,
+    pub live_peers: usize,
+    pub seen_peers: usize,
+    pub queued_peers: usize,
+    pub peer_ips: Vec<String>,
+    pub piece_map: String,
+    pub files: Vec<TorrentFileSnapshot>,
+}
+
+impl Default for TorrentDownloadSnapshot {
+    fn default() -> Self {
+        Self {
+            gid: String::new(),
+            id: 0,
+            name: String::new(),
+            info_hash: String::new(),
+            output_folder: String::new(),
+            status: DownloadStatus::Unknown,
+            total_bytes: 0,
+            completed_bytes: 0,
+            download_speed_bps: 0,
+            upload_speed_bps: 0,
+            live_peers: 0,
+            seen_peers: 0,
+            queued_peers: 0,
+            peer_ips: Vec::new(),
+            piece_map: String::new(),
+            files: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct TorrentFileSnapshot {
+    pub name: String,
+    pub length: u64,
+    pub completed_bytes: u64,
+    pub included: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

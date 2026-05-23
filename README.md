@@ -2,11 +2,11 @@
 
 Warning: this entire project is vibe coded. Use at your own risk.
 
-AriaTUI is a terminal UI and background daemon for managing `aria2c`.
+AriaTUI is a terminal UI and background daemon for managing downloads.
 
 It provides:
 - a `ratatui` download manager UI
-- a daemon that spawns and owns `aria2c`
+- a daemon that spawns and owns `aria2c` for non-torrent downloads
 - current/history views with search, filtering, and sorting
 - pause, resume, cancel, purge, and add-by-URL controls
 - queue reordering and pause-all/resume-all controls
@@ -15,7 +15,7 @@ It provides:
 - regex-based download routing rules
 - Discord webhook notifications
 - an optional browser-facing web UI with PIN pairing and signed session cookies
-- torrent and magnet support, including configurable streaming-biased piece priorities
+- torrent and magnet support through `librqbit`, including start-first media mode
 - a Firefox extension for sending downloads to the web UI
 
 ## Run

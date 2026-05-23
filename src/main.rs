@@ -14,6 +14,7 @@ mod schedule;
 mod speed;
 mod startup;
 mod state;
+mod torrent_engine;
 mod tui;
 mod units;
 mod web;

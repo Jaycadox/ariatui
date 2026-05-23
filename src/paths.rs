@@ -17,6 +17,7 @@ pub struct AppPaths {
     pub daemon_marker_file: PathBuf,
     pub snapshot_cache_file: PathBuf,
     pub history_file: PathBuf,
+    pub torrent_session_dir: PathBuf,
     pub aria2_session_file: PathBuf,
     pub retry_state_file: PathBuf,
     pub user_service_dir: PathBuf,
@@ -43,6 +44,7 @@ impl AppPaths {
         let daemon_marker_file = runtime_dir.join(".daemon");
         let snapshot_cache_file = runtime_dir.join(".snapshot");
         let history_file = state_dir.join("history.json");
+        let torrent_session_dir = state_dir.join("rqbit-session");
         let aria2_session_file = state_dir.join("aria2.session");
         let retry_state_file = state_dir.join("retry-state.json");
         let user_service_dir = config_dir
@@ -67,6 +69,7 @@ impl AppPaths {
             daemon_marker_file,
             snapshot_cache_file,
             history_file,
+            torrent_session_dir,
             aria2_session_file,
             retry_state_file,
             user_service_dir,
@@ -103,6 +106,7 @@ mod tests {
         assert!(paths.snapshot_cache_file.ends_with(".snapshot"));
         assert!(paths.retry_state_file.ends_with("retry-state.json"));
         assert!(paths.history_file.ends_with("history.json"));
+        assert!(paths.torrent_session_dir.ends_with("rqbit-session"));
         assert!(
             paths
                 .user_service_file

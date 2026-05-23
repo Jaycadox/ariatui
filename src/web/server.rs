@@ -2855,9 +2855,10 @@ fn render_torrents_page(snapshot: &Snapshot, error: Option<&str>) -> String {
 <div><p class="eyebrow">New torrents</p><h1>Streaming priority</h1><p class="muted">Make media usable sooner while it downloads.</p></div>
 </div>
 <section class="card narrow-card">
-<h2>Piece priority</h2>
+<h2>Torrents</h2>
+<p>Engine: <code>{}</code></p>
 <p class="muted">These defaults apply only to new magnet and remote .torrent downloads.</p>
-<p class="muted">aria2 does not support true sequential torrent download. This feature uses <code>bt-prioritize-piece</code> to favor the beginning of files, and optionally the end as well.</p>
+<p class="muted">Magnets and remote .torrent files are handled by librqbit. Start-first mode prioritizes the first file for sequential media playback.</p>
 <form method="post" action="/torrents" class="stack">
 <label>Mode</label>
 <select name="mode">
@@ -2869,11 +2870,15 @@ fn render_torrents_page(snapshot: &Snapshot, error: Option<&str>) -> String {
 <input type="number" name="head_size_mib" min="1" max="8192" value="{}">
 <label>End-first size (MiB)</label>
 <input type="number" name="tail_size_mib" min="1" max="8192" value="{}">
-<p>Current aria2 option: <code>{}</code></p>
-<p class="muted">Typical values: start first 32 MiB, end first 4 MiB. Start + end first is useful for media containers that store indexes near the end of the file.</p>
+<p class="muted">Typical values: start first 32 MiB, end first 4 MiB.</p>
 <div class="actions"><button type="submit" class="primary">Save settings</button></div>
 </form>
+</section>
+<section class="card">
+<h2>Torrent Downloads</h2>
+<table><thead><tr><th>Status</th><th>Name</th><th>Progress</th><th>Peers</th><th>Peer IPs</th><th>Have pieces</th></tr></thead><tbody>{}</tbody></table>
 </section>"#,
+        esc(&snapshot.torrents.engine),
         if mode == TorrentStreamingMode::Off {
             "selected"
         } else {
@@ -2891,13 +2896,41 @@ fn render_torrents_page(snapshot: &Snapshot, error: Option<&str>) -> String {
         },
         snapshot.torrents.head_size_mib,
         snapshot.torrents.tail_size_mib,
-        esc(snapshot
-            .torrents
-            .aria2_prioritize_piece
-            .as_deref()
-            .unwrap_or("off"),),
+        render_torrent_rows(snapshot),
     );
-    render_shell(snapshot, WebTab::Torrents, &body, true, "Torrent Streaming")
+    render_shell(snapshot, WebTab::Torrents, &body, true, "Torrents")
+}
+
+fn render_torrent_rows(snapshot: &Snapshot) -> String {
+    if snapshot.torrents.downloads.is_empty() {
+        return r#"<tr><td colspan="6" class="muted">No torrent downloads.</td></tr>"#.into();
+    }
+    snapshot
+        .torrents
+        .downloads
+        .iter()
+        .map(|item| {
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{} / {}</td><td>{} live / {} seen</td><td>{}</td><td><code>{}</code></td></tr>",
+                status_label(&item.status),
+                esc(&item.name),
+                format_bytes(item.completed_bytes),
+                format_bytes(item.total_bytes),
+                item.live_peers,
+                item.seen_peers,
+                esc(&format_peer_ips(&item.peer_ips)),
+                esc(&item.piece_map),
+            )
+        })
+        .collect()
+}
+
+fn format_peer_ips(peer_ips: &[String]) -> String {
+    if peer_ips.is_empty() {
+        "-".into()
+    } else {
+        peer_ips.join(", ")
+    }
 }
 
 fn render_limit_editor_page(
@@ -4740,6 +4773,7 @@ mod tests {
             daemon_marker_file: runtime_dir.join(".daemon"),
             snapshot_cache_file: runtime_dir.join(".snapshot"),
             history_file: state_dir.join("history.json"),
+            torrent_session_dir: state_dir.join("rqbit-session"),
             aria2_session_file: state_dir.join("aria2.session"),
             retry_state_file: state_dir.join("retry-state.json"),
             user_service_dir: user_service_dir.clone(),

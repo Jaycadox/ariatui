@@ -441,7 +441,35 @@ fn draw_torrents(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
         TorrentStreamingMode::StartFirst => "start first",
         TorrentStreamingMode::StartAndEndFirst => "start + end first",
     };
+    let rows = app
+        .snapshot
+        .torrents
+        .downloads
+        .iter()
+        .map(|item| {
+            Row::new(vec![
+                Cell::from(status_label(&item.status)),
+                Cell::from(item.name.clone()),
+                Cell::from(format!(
+                    "{} / {}",
+                    format_bytes(item.completed_bytes),
+                    format_bytes(item.total_bytes)
+                )),
+                Cell::from(format!(
+                    "{} live / {} seen",
+                    item.live_peers, item.seen_peers
+                )),
+                Cell::from(if item.peer_ips.is_empty() {
+                    "-".into()
+                } else {
+                    item.peer_ips.join(", ")
+                }),
+                Cell::from(item.piece_map.clone()),
+            ])
+        })
+        .collect::<Vec<_>>();
     let body = vec![
+        Line::from(format!("Engine: {}", app.snapshot.torrents.engine)),
         Line::from(format!("Streaming mode: {mode_label}")),
         Line::from(format!(
             "Start-first size: {} MiB",
@@ -451,29 +479,42 @@ fn draw_torrents(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
             "End-first size: {} MiB",
             app.snapshot.torrents.tail_size_mib
         )),
-        Line::from(format!(
-            "aria2 bt-prioritize-piece: {}",
-            app.snapshot
-                .torrents
-                .aria2_prioritize_piece
-                .clone()
-                .unwrap_or_else(|| "off".into())
-        )),
         Line::from("This applies to new magnet and .torrent downloads only."),
-        Line::from(
-            "aria2 does not support true sequential torrent download; this prioritizes early pieces instead.",
-        ),
-        Line::from(
-            "Use start + end first for media where container metadata may live at the tail.",
-        ),
+        Line::from("Magnets and remote .torrent files use librqbit, not aria2."),
+        Line::from("Start-first mode prioritizes the first file for sequential media playback."),
         Line::from("Press Space to cycle mode quickly. Press Enter or e to edit sizes."),
     ];
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(9), Constraint::Min(8)])
+        .split(area);
     frame.render_widget(
         Paragraph::new(Text::from(body))
-            .block(bordered("Torrent Streaming"))
+            .block(bordered("Torrents"))
             .wrap(Wrap { trim: false }),
-        area,
+        layout[0],
     );
+    let table = ratatui::widgets::Table::new(
+        rows,
+        [
+            Constraint::Length(10),
+            Constraint::Percentage(28),
+            Constraint::Length(24),
+            Constraint::Length(18),
+            Constraint::Percentage(22),
+            Constraint::Percentage(18),
+        ],
+    )
+    .header(Row::new(vec![
+        "Status",
+        "Name",
+        "Progress",
+        "Peers",
+        "Peer IPs",
+        "Have pieces",
+    ]))
+    .block(bordered("Torrent Downloads"));
+    frame.render_widget(table, layout[1]);
 }
 
 fn draw_web_ui(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
@@ -749,8 +790,8 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
                 TorrentStreamingMode::StartAndEndFirst => "start + end first",
             };
             frame.render_widget(
-                Paragraph::new("Configure torrent streaming defaults for new magnet and .torrent downloads. This is not true sequential mode; aria2 will prioritize beginning pieces and optionally ending pieces.")
-                    .block(bordered("Torrent Streaming"))
+                Paragraph::new("Configure librqbit defaults for new magnet and .torrent downloads. Start-first mode prioritizes the first file for sequential media playback.")
+                    .block(bordered("Torrent Settings"))
                     .style(Style::default().bg(Color::Black))
                     .wrap(Wrap { trim: false }),
                 popup,
@@ -778,13 +819,15 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
                         (error.to_string(), Color::Red)
                     } else {
                         let value = match form.mode {
-                            TorrentStreamingMode::Off => "off".to_string(),
-                            TorrentStreamingMode::StartFirst => format!("head={head}M"),
+                            TorrentStreamingMode::Off => "standard torrent download".to_string(),
+                            TorrentStreamingMode::StartFirst => {
+                                format!("prioritize first file, head hint {head} MiB")
+                            }
                             TorrentStreamingMode::StartAndEndFirst => {
-                                format!("head={head}M,tail={tail}M")
+                                format!("prioritize first file, head/tail hints {head}/{tail} MiB")
                             }
                         };
-                        (format!("Will send aria2 option: {value}"), Color::Green)
+                        (value, Color::Green)
                     }
                 }
                 _ => ("Sizes must be whole numbers in MiB".to_string(), Color::Red),

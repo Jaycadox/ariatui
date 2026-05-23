@@ -15,6 +15,7 @@ directories = "6.0"
 futures = "0.3"
 hmac = "0.12"
 libc = "0.2"
+librqbit = { version = "8.1.1", default-features = false, features = ["rust-tls"] }
 rand = "0.10"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 regex = "1.12"
