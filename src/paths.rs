@@ -17,6 +17,7 @@ pub struct AppPaths {
     pub daemon_marker_file: PathBuf,
     pub snapshot_cache_file: PathBuf,
     pub aria2_session_file: PathBuf,
+    pub retry_state_file: PathBuf,
     pub user_service_dir: PathBuf,
     pub user_service_file: PathBuf,
     pub system_service_file: PathBuf,
@@ -41,6 +42,7 @@ impl AppPaths {
         let daemon_marker_file = runtime_dir.join(".daemon");
         let snapshot_cache_file = runtime_dir.join(".snapshot");
         let aria2_session_file = state_dir.join("aria2.session");
+        let retry_state_file = state_dir.join("retry-state.json");
         let user_service_dir = config_dir
             .parent()
             .map(|base| base.join("systemd/user"))
@@ -63,6 +65,7 @@ impl AppPaths {
             daemon_marker_file,
             snapshot_cache_file,
             aria2_session_file,
+            retry_state_file,
             user_service_dir,
             user_service_file,
             system_service_file,
@@ -95,6 +98,7 @@ mod tests {
         assert!(paths.socket_path.ends_with("daemon.sock"));
         assert!(paths.daemon_marker_file.ends_with(".daemon"));
         assert!(paths.snapshot_cache_file.ends_with(".snapshot"));
+        assert!(paths.retry_state_file.ends_with("retry-state.json"));
         assert!(
             paths
                 .user_service_file

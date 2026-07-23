@@ -141,7 +141,7 @@ fn draw_current(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
         .current_visible_items()
         .iter()
         .enumerate()
-        .map(|(idx, item)| row_from_download(idx == app.current_index, item))
+        .map(|(idx, item)| row_from_download(idx == app.current_index, item, &app.snapshot))
         .collect::<Vec<_>>();
     let table = ratatui::widgets::Table::new(
         rows,
@@ -1069,7 +1069,7 @@ fn split_main(area: Rect, details: bool) -> Vec<Rect> {
     }
 }
 
-fn row_from_download(selected: bool, item: &DownloadItem) -> Row<'static> {
+fn row_from_download(selected: bool, item: &DownloadItem, snapshot: &Snapshot) -> Row<'static> {
     let progress = if item.total_bytes == 0 {
         "0%".into()
     } else {
@@ -1085,7 +1085,11 @@ fn row_from_download(selected: bool, item: &DownloadItem) -> Row<'static> {
             format_bytes(item.total_bytes)
         )),
         Cell::from(format_bytes_per_sec(item.download_speed_bps)),
-        Cell::from(format_eta(item.eta_seconds)),
+        Cell::from(format_eta(
+            project_scheduled_eta(Local::now(), snapshot, item)
+                .map(|projection| projection.eta_seconds)
+                .or(item.eta_seconds),
+        )),
         Cell::from(
             item.connections
                 .map(|v| v.to_string())

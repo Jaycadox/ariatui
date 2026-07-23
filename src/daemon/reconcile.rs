@@ -7,12 +7,13 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use chrono::Local;
+use chrono::{DateTime, Local, Utc};
 use color_eyre::eyre::{Result, eyre};
 use reqwest::{
     StatusCode,
     header::{CONTENT_DISPOSITION, CONTENT_TYPE, RANGE},
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, warn};
@@ -43,6 +44,38 @@ use crate::{
 };
 
 const WEBHOOK_MIN_BYTES: u64 = 20 * 1024 * 1024;
+const DAILY_RETRY_AFTER: u32 = 10;
+const DAILY_RETRY_SECS: i64 = 24 * 60 * 60;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RetryEntry {
+    source_uri: String,
+    output_path: Option<String>,
+    current_gid: String,
+    retries: u32,
+    next_attempt_at: Option<DateTime<Utc>>,
+    daily: bool,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct RetryState {
+    entries: HashMap<String, RetryEntry>,
+}
+
+impl RetryState {
+    fn load(path: &Path) -> Self {
+        std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, path: &Path) -> Result<()> {
+        std::fs::write(path, serde_json::to_vec_pretty(self)?)?;
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 pub struct RuntimeAria2 {
@@ -60,6 +93,8 @@ pub struct DaemonState {
     pub log_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub seen_terminal_events: Mutex<HashSet<String>>,
     pub notifications_initialized: Mutex<bool>,
+    retry_state: Mutex<RetryState>,
+    daily_failure_events: Mutex<HashSet<String>>,
     pub last_notified_restart_count: Mutex<u32>,
     pub web_pairings: Mutex<HashMap<String, WebPairing>>,
     pub web_sessions: Mutex<HashMap<String, Instant>>,
@@ -92,6 +127,7 @@ impl DaemonState {
             app.current_executable_path.clone(),
             app.current_build_id.clone(),
         );
+        let retry_state = RetryState::load(&app.paths.retry_state_file);
         Ok(Self {
             app,
             runtime: Mutex::new(None),
@@ -101,6 +137,8 @@ impl DaemonState {
             log_task: Mutex::new(None),
             seen_terminal_events: Mutex::new(HashSet::new()),
             notifications_initialized: Mutex::new(false),
+            retry_state: Mutex::new(retry_state),
+            daily_failure_events: Mutex::new(HashSet::new()),
             last_notified_restart_count: Mutex::new(0),
             web_pairings: Mutex::new(HashMap::new()),
             web_sessions: Mutex::new(HashMap::new()),
@@ -320,6 +358,7 @@ impl DaemonState {
         snapshot.history_downloads = stopped.into_iter().map(map_status).collect();
         let snapshot_copy = snapshot.clone();
         drop(snapshot);
+        self.process_download_retries(runtime, &snapshot_copy).await;
         self.process_webhook_events(&snapshot_copy).await;
         self.write_snapshot_cache(&snapshot_copy).await;
 
@@ -341,6 +380,127 @@ impl DaemonState {
             Err(error) => {
                 warn!("failed to encode snapshot cache: {error}");
             }
+        }
+    }
+
+    async fn process_download_retries(&self, runtime: &RuntimeAria2, snapshot: &Snapshot) {
+        let now = Utc::now();
+        let mut state = self.retry_state.lock().await;
+        let mut changed = false;
+
+        let completed_gids = snapshot
+            .history_downloads
+            .iter()
+            .filter(|item| item.status == DownloadStatus::Complete)
+            .map(|item| item.gid.as_str())
+            .collect::<HashSet<_>>();
+        let before = state.entries.len();
+        state
+            .entries
+            .retain(|_, entry| !completed_gids.contains(entry.current_gid.as_str()));
+        changed |= before != state.entries.len();
+
+        for item in snapshot
+            .history_downloads
+            .iter()
+            .filter(|item| item.status == DownloadStatus::Error)
+        {
+            let Some(source_uri) = item.source_uri.clone() else {
+                continue;
+            };
+            let key = retry_key(&source_uri, item.primary_path.as_deref());
+            let entry = state.entries.entry(key).or_insert_with(|| RetryEntry {
+                source_uri,
+                output_path: item.primary_path.clone(),
+                current_gid: item.gid.clone(),
+                retries: 0,
+                next_attempt_at: None,
+                daily: false,
+            });
+            if entry.current_gid != item.gid || entry.next_attempt_at.is_some() {
+                continue;
+            }
+
+            if entry.retries > DAILY_RETRY_AFTER && !entry.daily {
+                entry.daily = true;
+                self.daily_failure_events
+                    .lock()
+                    .await
+                    .insert(item.gid.clone());
+            }
+            let delay = if entry.daily {
+                DAILY_RETRY_SECS
+            } else {
+                retry_delay_secs(entry.retries)
+            };
+            entry.next_attempt_at = Some(now + chrono::Duration::seconds(delay));
+            changed = true;
+        }
+
+        let due_keys = state
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.next_attempt_at.is_some_and(|due| due <= now))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in due_keys {
+            let Some(entry) = state.entries.get(&key).cloned() else {
+                continue;
+            };
+            let options = retry_options(&entry);
+            match runtime
+                .rpc
+                .call::<String>("aria2.addUri", vec![json!([entry.source_uri]), options])
+                .await
+            {
+                Ok(gid) => {
+                    if let Some(current) = state.entries.get_mut(&key) {
+                        current.current_gid = gid;
+                        current.retries = current.retries.saturating_add(1);
+                        current.next_attempt_at = None;
+                    }
+                    let _ = runtime
+                        .rpc
+                        .call::<String>(
+                            "aria2.removeDownloadResult",
+                            vec![json!(entry.current_gid)],
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    warn!("failed to submit scheduled retry: {error}");
+                    if let Some(current) = state.entries.get_mut(&key) {
+                        current.next_attempt_at = Some(now + chrono::Duration::seconds(60));
+                    }
+                }
+            }
+            changed = true;
+        }
+
+        if changed && let Err(error) = state.save(&self.app.paths.retry_state_file) {
+            warn!("failed to persist download retry state: {error}");
+        }
+    }
+
+    async fn forget_download_retry(&self, gid: &str) {
+        let mut state = self.retry_state.lock().await;
+        let before = state.entries.len();
+        state.entries.retain(|_, entry| entry.current_gid != gid);
+        if before != state.entries.len()
+            && let Err(error) = state.save(&self.app.paths.retry_state_file)
+        {
+            warn!("failed to persist download retry state: {error}");
+        }
+    }
+
+    async fn clear_download_retries(&self) {
+        let mut state = self.retry_state.lock().await;
+        if state.entries.is_empty() {
+            return;
+        }
+        state.entries.clear();
+        if let Err(error) = state.save(&self.app.paths.retry_state_file) {
+            warn!("failed to persist download retry state: {error}");
         }
     }
 
@@ -440,12 +600,14 @@ impl DaemonState {
             }
             crate::daemon::ApiRequest::Cancel { gid, delete_files } => {
                 self.cancel_download(&gid, delete_files).await?;
+                self.forget_download_retry(&gid).await;
                 self.perform_refresh().await?;
             }
             crate::daemon::ApiRequest::RemoveHistory { gid } => {
                 let _: String = self
                     .call("aria2.removeDownloadResult", vec![json!(gid)])
                     .await?;
+                self.forget_download_retry(&gid).await;
                 self.perform_refresh().await?;
             }
             crate::daemon::ApiRequest::ChangePosition { gid, offset } => {
@@ -467,6 +629,7 @@ impl DaemonState {
             }
             crate::daemon::ApiRequest::PurgeHistory => {
                 let _: String = self.call("aria2.purgeDownloadResult", vec![]).await?;
+                self.clear_download_retries().await;
                 self.perform_refresh().await?;
             }
             crate::daemon::ApiRequest::SetMode { mode } => {
@@ -587,24 +750,30 @@ impl DaemonState {
     async fn process_webhook_events(&self, snapshot: &Snapshot) {
         let settings = snapshot.webhooks.clone();
         if !settings.enabled {
+            self.daily_failure_events.lock().await.clear();
             return;
         }
 
         let mut initialized = self.notifications_initialized.lock().await;
         let mut seen = self.seen_terminal_events.lock().await;
+        let daily_failures = self.daily_failure_events.lock().await.clone();
         if !*initialized {
             for item in &snapshot.history_downloads {
-                seen.insert(event_key(item));
+                if !daily_failures.contains(&item.gid) {
+                    seen.insert(event_key(item));
+                }
             }
             *self.last_notified_restart_count.lock().await = snapshot.aria2_status.restart_count;
             *initialized = true;
-            return;
         }
 
         let new_events = snapshot
             .history_downloads
             .iter()
             .filter(|item| is_notable_terminal_event(item))
+            .filter(|item| {
+                item.status != DownloadStatus::Error || daily_failures.contains(&item.gid)
+            })
             .filter(|item| seen.insert(event_key(item)))
             .cloned()
             .collect::<Vec<_>>();
@@ -618,6 +787,7 @@ impl DaemonState {
                 webhook_body_for_item(&item),
             );
         }
+        self.daily_failure_events.lock().await.clear();
 
         let mut last_restart = self.last_notified_restart_count.lock().await;
         if snapshot.aria2_status.restart_count > *last_restart {
@@ -1099,6 +1269,30 @@ async fn delete_paths(files: Vec<Aria2File>) -> Vec<String> {
     warnings
 }
 
+fn retry_delay_secs(retries: u32) -> i64 {
+    (60_i64.saturating_mul(1_i64 << retries.min(6))).min(60 * 60)
+}
+
+fn retry_key(source_uri: &str, output_path: Option<&str>) -> String {
+    format!("{source_uri}\n{}", output_path.unwrap_or_default())
+}
+
+fn retry_options(entry: &RetryEntry) -> Value {
+    let Some(path) = entry.output_path.as_deref().map(Path::new) else {
+        return json!({});
+    };
+    let mut options = serde_json::Map::new();
+    if let Some(parent) = path.parent() {
+        options.insert("dir".into(), json!(parent.display().to_string()));
+    }
+    if !entry.source_uri.starts_with("magnet:")
+        && let Some(name) = path.file_name()
+    {
+        options.insert("out".into(), json!(name.to_string_lossy()));
+    }
+    Value::Object(options)
+}
+
 fn is_notable_terminal_event(item: &DownloadItem) -> bool {
     if item.is_metadata_only {
         return false;
@@ -1231,5 +1425,35 @@ trait IfEmptyThen {
 impl IfEmptyThen for String {
     fn if_empty_then(self, fallback: String) -> String {
         if self.is_empty() { fallback } else { self }
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn retry_backoff_grows_and_caps_at_one_hour() {
+        assert_eq!(retry_delay_secs(0), 60);
+        assert_eq!(retry_delay_secs(1), 120);
+        assert_eq!(retry_delay_secs(5), 1_920);
+        assert_eq!(retry_delay_secs(6), 3_600);
+        assert_eq!(retry_delay_secs(50), 3_600);
+    }
+
+    #[test]
+    fn retry_preserves_http_output_location() {
+        let entry = RetryEntry {
+            source_uri: "https://example.com/file".into(),
+            output_path: Some("/downloads/release.iso".into()),
+            current_gid: "old".into(),
+            retries: 1,
+            next_attempt_at: None,
+            daily: false,
+        };
+        assert_eq!(
+            retry_options(&entry),
+            json!({"dir": "/downloads", "out": "release.iso"})
+        );
     }
 }

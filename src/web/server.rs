@@ -11,7 +11,7 @@ use axum_extra::extract::{
     CookieJar,
     cookie::{Cookie, SameSite},
 };
-use chrono::{Duration, Local, Timelike};
+use chrono::{Duration, Local};
 use color_eyre::eyre::Result;
 use serde::{Deserialize, Serialize};
 use time::Duration as CookieDuration;
@@ -64,6 +64,7 @@ pub fn router(state: SharedDaemonState) -> Router {
         .route("/current/add/confirm", post(add_url_confirm))
         .route("/current/{gid}/move/up", post(move_download_up))
         .route("/current/{gid}/move/down", post(move_download_down))
+        .route("/current/{gid}/reorder", post(reorder_download))
         .route("/current/{gid}/pause", post(pause_download))
         .route("/current/{gid}/resume", post(resume_download))
         .route(
@@ -87,6 +88,7 @@ pub fn router(state: SharedDaemonState) -> Router {
         .route("/scheduler/range/save", post(save_range))
         .route("/scheduler/range/delete", post(delete_range))
         .route("/scheduler/mode", post(set_scheduler_mode))
+        .route("/scheduler/quick", post(set_quick_speed_mode))
         .route("/torrents", get(torrents_page).post(save_torrents))
         .route("/routing", get(routing_page))
         .route("/routing/rule/new", get(new_rule_page))
@@ -95,6 +97,7 @@ pub fn router(state: SharedDaemonState) -> Router {
         .route("/routing/rule/{index}/delete", post(delete_rule))
         .route("/routing/rule/{index}/move/up", post(move_rule_up))
         .route("/routing/rule/{index}/move/down", post(move_rule_down))
+        .route("/routing/rule/reorder", post(reorder_rule))
         .route("/webhooks", get(webhooks_page).post(save_webhooks))
         .route("/webhooks/test", post(trigger_webhook_test))
         .route("/web-ui", get(web_ui_page).post(save_web_ui))
@@ -115,13 +118,13 @@ enum WebTab {
 impl WebTab {
     fn title(self) -> &'static str {
         match self {
-            Self::Current => "Current",
-            Self::History => "History",
-            Self::Scheduler => "Scheduler",
+            Self::Current => "Downloads",
+            Self::History => "Activity",
+            Self::Scheduler => "Speed",
             Self::Torrents => "Torrents",
-            Self::Routing => "Routing",
-            Self::Webhooks => "Webhooks",
-            Self::WebUi => "Web UI",
+            Self::Routing => "Folders",
+            Self::Webhooks => "Alerts",
+            Self::WebUi => "Access",
         }
     }
 
@@ -188,10 +191,23 @@ struct ModeFormData {
 }
 
 #[derive(Debug, Deserialize)]
+struct QuickSpeedFormData {
+    action: String,
+    return_to: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RangeFormData {
     start_hour: usize,
     end_hour: usize,
     limit: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReorderFormData {
+    source: Option<String>,
+    target: String,
+    position: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1084,6 +1100,44 @@ async fn move_download_down(
     Redirect::to(&current_path(&query)).into_response()
 }
 
+async fn reorder_download(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Path(gid): Path<String>,
+    Query(query): Query<ItemQuery>,
+    Form(form): Form<ReorderFormData>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let snapshot = state.snapshot().await;
+    let source = snapshot
+        .current_downloads
+        .iter()
+        .position(|item| item.gid == gid);
+    let target = snapshot
+        .current_downloads
+        .iter()
+        .position(|item| item.gid == form.target);
+    if let (Some(source), Some(target)) = (source, target)
+        && source != target
+    {
+        let desired = if form.position == "after" {
+            target.saturating_add(usize::from(source > target))
+        } else {
+            target.saturating_sub(usize::from(source < target))
+        }
+        .min(snapshot.current_downloads.len().saturating_sub(1));
+        let offset = desired as i32 - source as i32;
+        if offset != 0 {
+            let _ = state
+                .execute(ApiRequest::ChangePosition { gid, offset })
+                .await;
+        }
+    }
+    Redirect::to(&current_path(&query)).into_response()
+}
+
 async fn cancel_page(
     State(state): State<SharedDaemonState>,
     jar: CookieJar,
@@ -1444,6 +1498,67 @@ async fn set_scheduler_mode(
     Redirect::to("/scheduler").into_response()
 }
 
+async fn set_quick_speed_mode(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Form(form): Form<QuickSpeedFormData>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let result = match form.action.as_str() {
+        "scheduled" => {
+            state
+                .execute(ApiRequest::SetMode {
+                    mode: ManualOrScheduled::Scheduled,
+                })
+                .await
+        }
+        "manual" => {
+            state
+                .execute(ApiRequest::SetMode {
+                    mode: ManualOrScheduled::Manual,
+                })
+                .await
+        }
+        "unlimited" => {
+            if let Err(error) = state
+                .execute(ApiRequest::SetManualLimit { limit_bps: None })
+                .await
+            {
+                Err(error)
+            } else {
+                state
+                    .execute(ApiRequest::SetMode {
+                        mode: ManualOrScheduled::Manual,
+                    })
+                    .await
+            }
+        }
+        "slow" => {
+            if let Err(error) = state
+                .execute(ApiRequest::SetManualLimit {
+                    limit_bps: Some(256 * 1024),
+                })
+                .await
+            {
+                Err(error)
+            } else {
+                state
+                    .execute(ApiRequest::SetMode {
+                        mode: ManualOrScheduled::Manual,
+                    })
+                    .await
+            }
+        }
+        _ => return (StatusCode::BAD_REQUEST, "unknown speed mode").into_response(),
+    };
+    if let Err(error) = result {
+        return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+    }
+    Redirect::to(&normalize_next_path(form.return_to.as_deref())).into_response()
+}
+
 async fn routing_page(
     State(state): State<SharedDaemonState>,
     jar: CookieJar,
@@ -1662,6 +1777,71 @@ async fn move_rule(
     Redirect::to("/routing").into_response()
 }
 
+async fn reorder_rule(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Form(form): Form<ReorderFormData>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let Some(source_text) = form.source.as_deref() else {
+        return Redirect::to("/routing").into_response();
+    };
+    let Ok(source_full) = source_text.parse::<usize>() else {
+        return Redirect::to("/routing").into_response();
+    };
+    let Ok(target_full) = form.target.parse::<usize>() else {
+        return Redirect::to("/routing").into_response();
+    };
+    let snapshot = state.snapshot().await;
+    if snapshot
+        .routing
+        .rules
+        .get(source_full)
+        .is_none_or(|rule| rule.pattern == "*")
+        || snapshot
+            .routing
+            .rules
+            .get(target_full)
+            .is_none_or(|rule| rule.pattern == "*")
+    {
+        return Redirect::to("/routing").into_response();
+    }
+    let source = snapshot.routing.rules[..source_full]
+        .iter()
+        .filter(|rule| rule.pattern != "*")
+        .count();
+    let target = snapshot.routing.rules[..target_full]
+        .iter()
+        .filter(|rule| rule.pattern != "*")
+        .count();
+    let mut rules = snapshot
+        .routing
+        .rules
+        .iter()
+        .filter(|rule| rule.pattern != "*")
+        .cloned()
+        .collect::<Vec<_>>();
+    if source < rules.len() && target < rules.len() && source != target {
+        let rule = rules.remove(source);
+        let insert_at = if form.position == "after" {
+            target + usize::from(source > target)
+        } else {
+            target.saturating_sub(usize::from(source < target))
+        }
+        .min(rules.len());
+        rules.insert(insert_at, rule);
+        let _ = state
+            .execute(ApiRequest::SetDownloadRouting {
+                default_download_dir: snapshot.routing.default_download_dir.clone(),
+                rules,
+            })
+            .await;
+    }
+    Redirect::to("/routing").into_response()
+}
+
 async fn webhooks_page(State(state): State<SharedDaemonState>, jar: CookieJar) -> Response {
     if let Some(response) = auth_redirect(&state, &jar).await {
         return response;
@@ -1831,7 +2011,7 @@ fn render_login(pin: &str, next: &str) -> String {
 
 fn render_public_shell(title: &str, body: &str, login_next: Option<&str>) -> String {
     format!(
-        r#"<!doctype html>
+        r##"<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -1841,12 +2021,13 @@ fn render_public_shell(title: &str, body: &str, login_next: Option<&str>) -> Str
 </head>
 <body>
 <main class="wrap narrow">
-<h1>AriaTUI Web</h1>
+<div class="public-brand"><span class="brand-mark" aria-hidden="true">A</span><span>AriaTUI</span></div>
 {}
 </main>
+<div id="toast-region" class="toast-region" role="status" aria-live="polite"></div>
 <script>{}</script>
 </body>
-</html>"#,
+</html>"##,
         esc(title),
         styles(),
         body,
@@ -1864,15 +2045,20 @@ fn render_shell(
     let mut tabs = String::new();
     for tab in WebTab::all() {
         let class = if tab == active { "tab active" } else { "tab" };
+        let current = if tab == active {
+            r#" aria-current="page""#
+        } else {
+            ""
+        };
         let _ = write!(
             tabs,
-            r#"<a class="{class}" href="{}">{}</a>"#,
+            r#"<a class="{class}" href="{}"{current}>{}</a>"#,
             tab.href(),
             esc(tab.title())
         );
     }
     format!(
-        r#"<!doctype html>
+        r##"<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -1881,37 +2067,130 @@ fn render_shell(
 <style>{}</style>
 </head>
 <body data-autorefresh="{}">
-<main class="wrap">
-<header id="app-header" class="header">{}</header>
-<nav class="tabs">{}</nav>
-<section id="page-body">{}</section>
+<a class="skip-link" href="#page-body">Skip to content</a>
+<main class="app-shell">
+<aside class="sidebar">
+<a class="brand" href="/current" aria-label="AriaTUI downloads"><span class="brand-mark" aria-hidden="true">A</span><span>AriaTUI</span></a>
+<nav class="tabs" aria-label="Main navigation">{}</nav>
 <form method="post" action="/logout" class="logout"><button type="submit">Log out</button></form>
+</aside>
+<div class="workspace">
+<header id="app-header" class="header">{}</header>
+<section id="page-body" tabindex="-1">{}</section>
+</div>
 </main>
+<div id="navigation-progress" class="navigation-progress" aria-hidden="true"></div>
+<div id="toast-region" class="toast-region" role="status" aria-live="polite"></div>
+<dialog id="app-dialog" class="app-dialog" aria-labelledby="dialog-title">
+<div class="dialog-bar"><span id="dialog-title">Edit</span><button type="button" class="icon-button" data-dialog-close aria-label="Close">×</button></div>
+<div id="dialog-content"></div>
+</dialog>
 <script>{}</script>
 </body>
-</html>"#,
+</html>"##,
         esc(page_title),
         styles(),
         if auto_refresh { "1" } else { "0" },
-        render_header(snapshot),
         tabs,
+        render_header(snapshot, active.href()),
         body,
         script(None)
     )
 }
 
-fn render_header(snapshot: &Snapshot) -> String {
+fn render_header(snapshot: &Snapshot, return_to: &str) -> String {
+    let lifecycle = format!("{:?}", snapshot.aria2_status.lifecycle).to_lowercase();
+    let connected = lifecycle == "running";
+    let mode_label = match snapshot.scheduler.mode {
+        ManualOrScheduled::Scheduled => "Scheduled",
+        ManualOrScheduled::Manual if snapshot.scheduler.manual_limit_bps.is_none() => "Unlimited",
+        ManualOrScheduled::Manual => "Manual",
+    };
+    let effective_limit = snapshot
+        .scheduler
+        .effective_limit_bps
+        .map(format_bytes_per_sec)
+        .unwrap_or_else(|| "Unlimited".into());
+    let manual_limit = snapshot
+        .scheduler
+        .manual_limit_bps
+        .map(format_bytes_per_sec)
+        .unwrap_or_else(|| "Unlimited".into());
     format!(
-        "<strong>aria2 {}</strong> &nbsp; down {} &nbsp; up {} &nbsp; active {} waiting {} stopped {} &nbsp; mode {:?} limit {} &nbsp; web {}",
-        esc(&format!("{:?}", snapshot.aria2_status.lifecycle).to_lowercase()),
+        r#"<div class="status-group" data-key="connection">
+<span class="connection-status"><span class="status-dot {}"></span>aria2 {}</span>
+<span class="sync-state" id="sync-state">Live</span>
+</div>
+<div class="headline-stats">
+<span data-key="download-speed"><small>Down</small><strong>{}</strong></span>
+<span data-key="upload-speed"><small>Up</small><strong>{}</strong></span>
+<span data-key="active-count"><small>Active</small><strong>{}</strong></span>
+<span data-key="queue-count"><small>Queued</small><strong>{}</strong></span>
+</div>
+<details class="speed-control" data-key="speed-control">
+<summary><span><small>{}</small><strong>{}</strong></span><span aria-hidden="true">⌄</span></summary>
+<div class="speed-menu">
+<div class="speed-menu-heading"><strong>Download speed</strong><span>{} now</span></div>
+<form method="post" action="/scheduler/quick">
+<input type="hidden" name="action" value="scheduled"><input type="hidden" name="return_to" value="{}">
+<button class="speed-option {}"><span><strong>Follow schedule</strong><small>Use the hourly plan</small></span><span>✓</span></button>
+</form>
+<form method="post" action="/scheduler/quick">
+<input type="hidden" name="action" value="manual"><input type="hidden" name="return_to" value="{}">
+<button class="speed-option {}"><span><strong>Manual · {}</strong><small>Keep one limit until changed</small></span><span>✓</span></button>
+</form>
+<form method="post" action="/scheduler/quick">
+<input type="hidden" name="action" value="unlimited"><input type="hidden" name="return_to" value="{}">
+<button class="speed-option {}"><span><strong>Unlimited for now</strong><small>Your schedule stays saved</small></span><span>✓</span></button>
+</form>
+<form method="post" action="/scheduler/quick">
+<input type="hidden" name="action" value="slow"><input type="hidden" name="return_to" value="{}">
+<button class="speed-option {}"><span><strong>Slow mode · 256 KiB/s</strong><small>Quickly free up bandwidth</small></span><span>✓</span></button>
+</form>
+<a class="speed-manage" href="/scheduler">Edit schedule and limits <span>→</span></a>
+</div>
+</details>"#,
+        if connected { "online" } else { "offline" },
+        esc(&lifecycle),
         esc(&format_bytes_per_sec(snapshot.global.download_speed_bps)),
         esc(&format_bytes_per_sec(snapshot.global.upload_speed_bps)),
         snapshot.global.num_active,
         snapshot.global.num_waiting,
-        snapshot.global.num_stopped,
-        snapshot.scheduler.mode,
-        esc(&format_limit(snapshot.scheduler.effective_limit_bps)),
-        esc(&format!("{:?}", snapshot.web_ui.status).to_lowercase()),
+        esc(mode_label),
+        esc(&effective_limit),
+        esc(&effective_limit),
+        esc(return_to),
+        if snapshot.scheduler.mode == ManualOrScheduled::Scheduled {
+            "active"
+        } else {
+            ""
+        },
+        esc(return_to),
+        if snapshot.scheduler.mode == ManualOrScheduled::Manual
+            && snapshot.scheduler.manual_limit_bps.is_some()
+            && snapshot.scheduler.manual_limit_bps != Some(256 * 1024)
+        {
+            "active"
+        } else {
+            ""
+        },
+        esc(&manual_limit),
+        esc(return_to),
+        if snapshot.scheduler.mode == ManualOrScheduled::Manual
+            && snapshot.scheduler.manual_limit_bps.is_none()
+        {
+            "active"
+        } else {
+            ""
+        },
+        esc(return_to),
+        if snapshot.scheduler.mode == ManualOrScheduled::Manual
+            && snapshot.scheduler.manual_limit_bps == Some(256 * 1024)
+        {
+            "active"
+        } else {
+            ""
+        },
     )
 }
 
@@ -2019,6 +2298,9 @@ fn render_current_page(
     let selected_gid = selected.map(|item| item.gid.as_str());
     let mut rows = String::new();
     for item in visible.iter().copied() {
+        let list_eta = project_scheduled_eta(Local::now(), snapshot, item)
+            .map(|projection| projection.eta_seconds)
+            .or(item.eta_seconds);
         let selected_class = if Some(item.gid.as_str()) == selected_gid {
             "selected"
         } else {
@@ -2028,49 +2310,74 @@ fn render_current_page(
             current_query_suffix(Some(&item.gid), &query.search, query.filter, query.sort);
         let actions = match item.status {
             DownloadStatus::Active => format!(
-                r#"<form method="post" action="/current/{gid}/pause{query}"><button>Pause</button></form><a class="button danger" href="/current/{gid}/cancel{query}">Cancel</a>"#,
+                r#"<form method="post" action="/current/{gid}/pause{query}"><button class="icon-button" aria-label="Pause download" title="Pause">Ⅱ</button></form><a class="icon-button danger" data-dialog data-dialog-return="/current{query}" aria-label="Cancel download" title="Cancel" href="/current/{gid}/cancel{query}">×</a>"#,
                 gid = esc(&item.gid),
                 query = esc(&item_query),
             ),
             DownloadStatus::Paused => format!(
-                r#"<form method="post" action="/current/{gid}/resume{query}"><button>Resume</button></form><form method="post" action="/current/{gid}/move/up{query}"><button>Up</button></form><form method="post" action="/current/{gid}/move/down{query}"><button>Down</button></form><a class="button danger" href="/current/{gid}/cancel{query}">Cancel</a>"#,
+                r#"<button type="button" class="drag-handle" data-drag-handle aria-label="Reorder {name}" title="Drag to reorder">⠿</button><form method="post" action="/current/{gid}/resume{query}"><button class="icon-button" aria-label="Resume download" title="Resume">▶</button></form><a class="icon-button danger" data-dialog data-dialog-return="/current{query}" aria-label="Cancel download" title="Cancel" href="/current/{gid}/cancel{query}">×</a>"#,
                 gid = esc(&item.gid),
                 query = esc(&item_query),
+                name = esc(&item.name),
             ),
             DownloadStatus::Waiting => format!(
-                r#"<form method="post" action="/current/{gid}/move/up{query}"><button>Up</button></form><form method="post" action="/current/{gid}/move/down{query}"><button>Down</button></form><a class="button danger" href="/current/{gid}/cancel{query}">Cancel</a>"#,
+                r#"<button type="button" class="drag-handle" data-drag-handle aria-label="Reorder {name}" title="Drag to reorder">⠿</button><a class="icon-button danger" data-dialog data-dialog-return="/current{query}" aria-label="Cancel download" title="Cancel" href="/current/{gid}/cancel{query}">×</a>"#,
                 gid = esc(&item.gid),
                 query = esc(&item_query),
+                name = esc(&item.name),
             ),
             _ => String::new(),
         };
+        let reorder_attributes = if matches!(
+            item.status,
+            DownloadStatus::Paused | DownloadStatus::Waiting
+        ) {
+            format!(
+                r#" draggable="true" data-reorder-kind="download" data-reorder-id="{}" data-reorder-url="/current/{}/reorder{}""#,
+                esc(&item.gid),
+                esc(&item.gid),
+                esc(&item_query)
+            )
+        } else {
+            String::new()
+        };
+        let progress = if item.total_bytes == 0 {
+            0.0
+        } else {
+            (item.completed_bytes as f64 / item.total_bytes as f64 * 100.0).clamp(0.0, 100.0)
+        };
         let _ = write!(
             rows,
-            r#"<tr class="{selected_class}">
-<td><a href="/current{}">{}</a></td>
-<td>{}</td>
-<td>{}</td>
-<td>{} / {}</td>
-<td>{}</td>
-<td>{}</td>
-<td>{}</td>
-<td class="actions">{}</td>
-</tr>"#,
-            esc(&current_query_suffix(
+            r#"<article class="download-item {selected_class}" data-key="download-{gid}" data-gid="{gid}" data-status="{status}"{reorder_attributes}>
+<a class="download-main" href="/current{item_href}" aria-label="View details for {name}">
+<div class="download-heading"><strong>{name}</strong><span class="status-badge {status}">{status}</span></div>
+<div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{progress:.0}"><span style="width:{progress:.2}%"></span></div>
+<div class="download-meta"><span>{progress_text} · {done} of {total}</span><span>{speed}</span><span>{eta}</span></div>
+</a>
+<div class="item-actions">{actions}</div>
+</article>"#,
+            gid = esc(&item.gid),
+            status = esc(status_label(&item.status)),
+            name = esc(&item.name),
+            item_href = esc(&current_query_suffix(
                 Some(&item.gid),
                 &query.search,
                 query.filter,
                 query.sort,
             )),
-            esc(status_label(&item.status)),
-            esc(&item.name),
-            esc(&progress_text(item)),
-            esc(&format_bytes(item.completed_bytes)),
-            esc(&format_bytes(item.total_bytes)),
-            esc(&format_bytes_per_sec(item.download_speed_bps)),
-            esc(&format_eta(item.eta_seconds)),
-            esc(&item.gid),
-            actions,
+            progress = progress,
+            progress_text = esc(&progress_text(item)),
+            done = esc(&format_bytes(item.completed_bytes)),
+            total = esc(&format_bytes(item.total_bytes)),
+            speed = esc(&format_bytes_per_sec(item.download_speed_bps)),
+            eta = esc(&format_eta(list_eta)),
+            actions = actions,
+            reorder_attributes = reorder_attributes,
+        );
+    }
+    if rows.is_empty() {
+        rows.push_str(
+            r#"<div class="empty-state"><strong>No downloads here</strong><p>Try another filter, or add a download to get started.</p><a class="button primary" data-dialog data-dialog-return="/current" href="/current/add">Add download</a></div>"#,
         );
     }
 
@@ -2084,9 +2391,13 @@ fn render_current_page(
     let current_query = current_query_suffix(selected_gid, &query.search, query.filter, query.sort);
     let _ = write!(
         body,
-        r#"<div class="toolbar">
-<form method="get" action="/current" class="inline">
-<input type="text" name="search" value="{search}" placeholder="Search name, GID, path, source">
+        r#"<div class="page-heading">
+<div><p class="eyebrow">Queue</p><h1>Downloads</h1><p class="muted">{visible_count} shown · {total_count} total</p></div>
+<a class="button primary" data-dialog data-dialog-return="/current" href="/current/add"><span aria-hidden="true">＋</span> Add download</a>
+</div>
+<div class="toolbar">
+<form method="get" action="/current" class="filter-bar" data-live-form>
+<label class="search-field"><span class="sr-only">Search downloads</span><input type="search" name="search" value="{search}" placeholder="Search downloads…"></label>
 <select name="filter">
 <option value="all" {filter_all}>All</option>
 <option value="active" {filter_active}>Active</option>
@@ -2100,14 +2411,14 @@ fn render_current_page(
 <option value="speed" {sort_speed}>Speed</option>
 <option value="eta" {sort_eta}>ETA</option>
 </select>
-<button type="submit">Apply</button>
-<a class="button" href="/current">Clear</a>
 </form>
-<form method="post" action="/current/pause-all{query}"><button>Pause all</button></form>
-<form method="post" action="/current/resume-all{query}"><button>Resume all</button></form>
-<a class="button" href="/current/add">Add URI</a>
+<div class="bulk-actions">
+<form method="post" action="/current/pause-all{query}"><button class="button subtle">Pause all</button></form>
+<form method="post" action="/current/resume-all{query}"><button class="button subtle">Resume all</button></form>
 </div>
-<p class="muted">Visible {visible_count} of {total_count}. Up/Down reorder waiting or paused items.</p>"#,
+</div>
+<p class="interaction-hint"><span class="drag-handle-symbol">⠿</span> Drag queued or paused downloads to change their order.</p>
+"#,
         search = esc(&query.search),
         filter_all = selected_attr(query.filter == CurrentFilter::All),
         filter_active = selected_attr(query.filter == CurrentFilter::Active),
@@ -2125,20 +2436,14 @@ fn render_current_page(
     body.push_str("<div class=\"split\">");
     let _ = write!(
         body,
-        r#"<section class="card">
-<h2>Current downloads</h2>
-<div class="table-wrap">
-<table>
-<thead><tr><th>Status</th><th>Name</th><th>Progress</th><th>Done/Total</th><th>Speed</th><th>ETA</th><th>GID</th><th>Actions</th></tr></thead>
-<tbody>{}</tbody>
-</table>
-</div>
+        r#"<section class="card download-list" data-key="download-list" aria-label="Current downloads">
+{}
 </section>"#,
         rows
     );
     let _ = write!(
         body,
-        r#"<aside class="card"><h2>Details</h2>{}</aside>"#,
+        r#"<aside class="card details-card" data-key="download-details"><p class="eyebrow">Selected</p><h2>Details</h2>{}</aside>"#,
         render_download_details(selected, snapshot)
     );
     body.push_str("</div>");
@@ -2157,12 +2462,15 @@ fn render_add_url_page(
     }
     let _ = write!(
         body,
-        r#"<section class="card narrow-card">
-<h2>Add URI</h2>
+        r#"<div class="page-heading">
+<div><p class="eyebrow">New download</p><h1>Add a link</h1><p class="muted">Paste a web, file transfer, or magnet link.</p></div>
+</div>
+<section class="card narrow-card add-source-card">
 <form method="post" action="/current/add/resolve" class="stack">
-<label>HTTP, HTTPS, FTP, SFTP, or magnet URI</label>
-<input type="text" name="url" value="{}" placeholder="https://example.com/file.iso or magnet:?..." />
-<div class="actions"><button type="submit">Add</button><a class="button" href="/current">Back</a></div>
+<label for="download-url">Download link</label>
+<input id="download-url" type="text" inputmode="url" name="url" value="{}" placeholder="https://example.com/file.iso" autocomplete="off" autofocus required />
+<p class="muted">HTTP, HTTPS, FTP, SFTP and magnet links are supported.</p>
+<div class="actions"><button type="submit" class="primary">Continue</button><a class="button" href="/current">Cancel</a></div>
 </form>
 </section>"#,
         esc(initial_url.unwrap_or(""))
@@ -2182,7 +2490,7 @@ fn render_add_url_page(
         };
         let _ = write!(
             body,
-            r#"<section class="card narrow-card">
+            r#"<section class="card narrow-card filename-card">
 <h2>Choose filename</h2>
 <form method="post" action="/current/add/confirm" class="stack">
 <input type="hidden" name="url" value="{}" />
@@ -2327,9 +2635,10 @@ fn render_cancel_page(snapshot: &Snapshot, gid: &str, error: Option<&str>) -> St
     }
     let _ = write!(
         body,
-        r#"<section class="card narrow-card">
-<h2>Cancel download</h2>
-<p>{}</p>
+        r#"<div class="page-heading"><div><p class="eyebrow">Confirm action</p><h1>Cancel download?</h1></div></div>
+<section class="card narrow-card">
+<h2>{}</h2>
+<p class="muted">The download will be removed from the queue. Choose whether to keep anything already downloaded.</p>
 <form method="post" action="/current/{}/cancel" class="stack">
 <label><input type="radio" name="delete_files" value="false" checked> Keep partial files</label>
 <label><input type="radio" name="delete_files" value="true"> Delete partial files</label>
@@ -2340,7 +2649,7 @@ fn render_cancel_page(snapshot: &Snapshot, gid: &str, error: Option<&str>) -> St
 <option value="keep_partials">Always keep partials</option>
 <option value="delete_partials">Always delete partials</option>
 </select>
-<div class="actions"><button type="submit" class="danger">Cancel download</button><a class="button" href="/current">Back</a></div>
+<div class="actions"><button type="submit" class="danger">Cancel download</button><a class="button" href="/current">Keep downloading</a></div>
 </form>
 </section>"#,
         esc(&item
@@ -2368,31 +2677,41 @@ fn render_history_page(snapshot: &Snapshot, query: &HistoryListQuery) -> String 
     for item in visible.iter().copied() {
         let item_query =
             history_query_suffix(Some(&item.gid), &query.search, query.filter, query.sort);
+        let selected_class = if Some(item.gid.as_str()) == selected_gid {
+            "selected"
+        } else {
+            ""
+        };
         let _ = write!(
             rows,
-            r#"<tr>
-<td><a href="/history{}">{}</a></td>
-<td>{}</td>
-<td>{}</td>
-<td>{}</td>
-<td>{}</td>
-<td><form method="post" action="/history/{}/remove{}"><button>Forget</button></form></td>
-</tr>"#,
-            esc(&item_query),
-            esc(status_label(&item.status)),
-            esc(&item.name),
-            esc(&format_bytes(item.total_bytes)),
-            esc(item.error_code.as_deref().unwrap_or("-")),
-            esc(&item.gid),
-            esc(&item.gid),
-            esc(&item_query),
+            r#"<article class="download-item activity-item {selected_class}" data-key="activity-{gid}" data-gid="{gid}">
+<a class="download-main" href="/history{item_query}">
+<div class="download-heading"><strong>{name}</strong><span class="status-badge {status}">{status}</span></div>
+<div class="download-meta"><span>{size}</span><span>{error}</span></div>
+</a>
+<div class="item-actions"><form method="post" action="/history/{gid}/remove{item_query}"><button class="button subtle">Forget</button></form></div>
+</article>"#,
+            gid = esc(&item.gid),
+            item_query = esc(&item_query),
+            name = esc(&item.name),
+            status = esc(status_label(&item.status)),
+            size = esc(&format_bytes(item.total_bytes)),
+            error = esc(item.error_message.as_deref().unwrap_or("No error")),
+        );
+    }
+    if rows.is_empty() {
+        rows.push_str(
+            r#"<div class="empty-state"><strong>No matching activity</strong><p>Completed and removed downloads will appear here.</p></div>"#,
         );
     }
     let history_query = history_query_suffix(selected_gid, &query.search, query.filter, query.sort);
     let body = format!(
-        r#"<div class="toolbar">
-<form method="get" action="/history" class="inline">
-<input type="text" name="search" value="{search}" placeholder="Search name, GID, path, source, error">
+        r#"<div class="page-heading">
+<div><p class="eyebrow">Past downloads</p><h1>Activity</h1><p class="muted">{visible_count} shown · {total_count} total</p></div>
+</div>
+<div class="toolbar">
+<form method="get" action="/history" class="filter-bar" data-live-form>
+<label class="search-field"><span class="sr-only">Search activity</span><input type="search" name="search" value="{search}" placeholder="Search activity…"></label>
 <select name="filter">
 <option value="all" {filter_all}>All</option>
 <option value="complete" {filter_complete}>Complete</option>
@@ -2405,23 +2724,14 @@ fn render_history_page(snapshot: &Snapshot, query: &HistoryListQuery) -> String 
 <option value="size" {sort_size}>Size</option>
 <option value="status" {sort_status}>Status</option>
 </select>
-<button type="submit">Apply</button>
-<a class="button" href="/history">Clear</a>
 </form>
 <form method="post" action="/history/purge{history_query}"><button class="danger">Clear history</button></form>
 </div>
-<p class="muted">Visible {visible_count} of {total_count} history items.</p>
 <div class="split">
-<section class="card">
-<h2>History</h2>
-<div class="table-wrap">
-<table>
-<thead><tr><th>Status</th><th>Name</th><th>Size</th><th>Error</th><th>GID</th><th>Action</th></tr></thead>
-<tbody>{rows}</tbody>
-</table>
-</div>
+<section class="card download-list" data-key="activity-list" aria-label="Download activity">
+{rows}
 </section>
-<aside class="card"><h2>Details</h2>{details}</aside>
+<aside class="card details-card" data-key="activity-details"><p class="eyebrow">Selected</p><h2>Details</h2>{details}</aside>
 </div>"#,
         search = esc(&query.search),
         filter_all = selected_attr(query.filter == HistoryFilter::All),
@@ -2443,75 +2753,92 @@ fn render_history_page(snapshot: &Snapshot, query: &HistoryListQuery) -> String 
 
 fn render_scheduler_page(snapshot: &Snapshot, error: Option<&str>) -> String {
     let ranges = scheduler_ranges(snapshot);
-    let mut rows = String::new();
-    for range in &ranges {
-        let _ = write!(
-            rows,
-            r#"<tr>
-<td>{:02}:00</td><td>{:02}:00</td><td>{}</td>
-<td class="actions">
-<a class="button" href="/scheduler/range/{}/{}/edit">Edit</a>
-<form method="post" action="/scheduler/range/delete">
-<input type="hidden" name="start_hour" value="{}">
-<input type="hidden" name="end_hour" value="{}">
-<input type="hidden" name="limit" value="unlimited">
-<button>Clear</button>
-</form>
-</td>
-</tr>"#,
-            range.0,
-            range.1,
-            esc(&format_limit(range.2)),
-            range.0,
-            range.1,
-            range.0,
-            range.1
-        );
-    }
+    let current_hour = snapshot.scheduler.current_hour as usize;
+    let active_range = ranges
+        .iter()
+        .find(|(start, end, _)| *start <= current_hour && current_hour < *end)
+        .copied()
+        .unwrap_or((current_hour, (current_hour + 1).min(24), None));
+    let active_range_label = format!("{:02}:00–{:02}:00", active_range.0, active_range.1);
+    let schedule_is_active = snapshot.scheduler.mode == ManualOrScheduled::Scheduled;
+    let current_status = if schedule_is_active {
+        format!(
+            "{} is active now at {}",
+            active_range_label,
+            format_limit(active_range.2)
+        )
+    } else {
+        format!(
+            "Schedule paused · {} would be {}",
+            active_range_label,
+            format_limit(active_range.2)
+        )
+    };
     let mut body = String::new();
     if let Some(error) = error {
         let _ = write!(body, "<p class=\"error\">{}</p>", esc(error));
     }
     let _ = write!(
         body,
-        r#"<div class="grid2">
-<section class="card">
-<h2>Scheduler</h2>
-<form method="post" action="/scheduler/mode" class="inline">
-<label><input type="radio" name="mode" value="manual" {}> Manual</label>
-<label><input type="radio" name="mode" value="scheduled" {}> Scheduled</label>
-<button type="submit">Apply mode</button>
+        r#"<div class="page-heading">
+<div><p class="eyebrow">Bandwidth</p><h1>Speed schedule</h1><p class="muted">Shape the day by painting limits directly onto the timeline.</p></div>
+</div>
+<section class="schedule-status">
+<div>
+<span class="live-kicker"><span class="status-dot {}"></span>{}</span>
+<strong>{}</strong>
+<small>Next change {}</small>
+</div>
+<form method="post" action="/scheduler/mode" class="mode-switch" data-live-submit aria-label="Speed control mode">
+<label><input type="radio" name="mode" value="scheduled" {}><span>Follow schedule</span></label>
+<label><input type="radio" name="mode" value="manual" {}><span>Manual</span></label>
+<button type="submit" class="sr-only">Apply mode</button>
 </form>
-<p>Manual limit: {} &nbsp; <a class="button" href="/scheduler/manual">Edit</a></p>
-<p>Usual internet speed: {} &nbsp; <a class="button" href="/scheduler/usual">Edit</a></p>
-<p>Effective limit: {}</p>
-<p>Next change: {}</p>
-<div class="chart-shell">{}</div>
 </section>
-<section class="card">
-<div class="toolbar"><a class="button" href="/scheduler/range/new">New range</a></div>
-<table>
-<thead><tr><th>Start</th><th>End</th><th>Limit</th><th>Actions</th></tr></thead>
-<tbody>{}</tbody>
-</table>
+<section class="card schedule-card">
+<div class="schedule-card-heading">
+<div><h2>Today’s plan</h2><p class="muted">Drag across hours to select them. Click once for a single hour.</p></div>
+<div class="schedule-legend"><span><i class="now"></i>Now</span><span><i class="selected"></i>Selection</span></div>
+</div>
+{}
+<div class="schedule-axis-note"><span>Midnight</span><span>Noon</span><span>Midnight</span></div>
 </section>
-</div>"#,
-        if snapshot.scheduler.mode == ManualOrScheduled::Manual {
-            "checked"
+<section class="schedule-secondary">
+<div class="card">
+<p class="eyebrow">Manual limit</p>
+<p class="muted">Used whenever Manual mode is active.</p>
+<form method="post" action="/scheduler/manual" class="inline-setting">
+<label class="sr-only" for="manual-limit">Manual download limit</label>
+<input id="manual-limit" name="value" value="{}" data-speed-input required>
+<button type="submit">Save</button>
+</form>
+<small class="input-hint">Examples: 500K, 10M, unlimited</small>
+</div>
+<div class="card">
+<p class="eyebrow">Connection baseline</p>
+<p class="muted">Used to make scheduled ETA predictions realistic.</p>
+<form method="post" action="/scheduler/usual" class="inline-setting">
+<label class="sr-only" for="usual-speed">Usual connection speed</label>
+<input id="usual-speed" name="value" value="{}" data-speed-input required>
+<button type="submit">Save</button>
+</form>
+<small class="input-hint">Used only for ETA modelling</small>
+</div>
+</section>
+"#,
+        if schedule_is_active { "online" } else { "" },
+        if schedule_is_active {
+            "Schedule running"
         } else {
-            ""
+            "Schedule paused"
         },
-        if snapshot.scheduler.mode == ManualOrScheduled::Scheduled {
-            "checked"
-        } else {
-            ""
-        },
+        esc(&current_status),
+        esc(&snapshot.scheduler.next_change_at_local),
+        if schedule_is_active { "checked" } else { "" },
+        if !schedule_is_active { "checked" } else { "" },
+        render_interactive_schedule(snapshot, active_range),
         esc(&format_limit(snapshot.scheduler.manual_limit_bps)),
         esc(&format_limit(snapshot.scheduler.usual_internet_speed_bps)),
-        esc(&format_limit(snapshot.scheduler.effective_limit_bps)),
-        esc(&snapshot.scheduler.next_change_at_local),
-        render_schedule_svg(&snapshot.scheduler.schedule_limits_bps),
-        rows,
     );
     render_shell(snapshot, WebTab::Scheduler, &body, true, "Scheduler")
 }
@@ -2524,8 +2851,11 @@ fn render_torrents_page(snapshot: &Snapshot, error: Option<&str>) -> String {
     let mode = snapshot.torrents.mode;
     let _ = write!(
         body,
-        r#"<section class="card narrow-card">
-<h2>Torrent Streaming</h2>
+        r#"<div class="page-heading">
+<div><p class="eyebrow">New torrents</p><h1>Streaming priority</h1><p class="muted">Make media usable sooner while it downloads.</p></div>
+</div>
+<section class="card narrow-card">
+<h2>Piece priority</h2>
 <p class="muted">These defaults apply only to new magnet and remote .torrent downloads.</p>
 <p class="muted">aria2 does not support true sequential torrent download. This feature uses <code>bt-prioritize-piece</code> to favor the beginning of files, and optionally the end as well.</p>
 <form method="post" action="/torrents" class="stack">
@@ -2541,7 +2871,7 @@ fn render_torrents_page(snapshot: &Snapshot, error: Option<&str>) -> String {
 <input type="number" name="tail_size_mib" min="1" max="8192" value="{}">
 <p>Current aria2 option: <code>{}</code></p>
 <p class="muted">Typical values: start first 32 MiB, end first 4 MiB. Start + end first is useful for media containers that store indexes near the end of the file.</p>
-<div class="actions"><button type="submit">Save settings</button></div>
+<div class="actions"><button type="submit" class="primary">Save settings</button></div>
 </form>
 </section>"#,
         if mode == TorrentStreamingMode::Off {
@@ -2648,22 +2978,30 @@ fn render_routing_page(
             "regex"
         };
         let actions = if rule.pattern == "*" {
-            format!(r#"<a class="button" href="/routing/rule/{index}/edit">Edit</a>"#)
+            format!(
+                r#"<a class="button" data-dialog data-dialog-return="/routing" href="/routing/rule/{index}/edit">Edit</a>"#
+            )
         } else {
             format!(
-                r#"<a class="button" href="/routing/rule/{index}/edit">Edit</a>
-<form method="post" action="/routing/rule/{index}/move/up"><button>Up</button></form>
-<form method="post" action="/routing/rule/{index}/move/down"><button>Down</button></form>
+                r#"<button type="button" class="drag-handle" data-drag-handle aria-label="Reorder rule" title="Drag to reorder">⠿</button>
+<a class="button" data-dialog data-dialog-return="/routing" href="/routing/rule/{index}/edit">Edit</a>
 <form method="post" action="/routing/rule/{index}/delete"><button class="danger">Delete</button></form>"#
+            )
+        };
+        let reorder_attributes = if rule.pattern == "*" {
+            String::new()
+        } else {
+            format!(
+                r#" draggable="true" data-reorder-kind="rule" data-reorder-id="{index}" data-reorder-url="/routing/rule/reorder""#
             )
         };
         let _ = write!(
             rows,
-            r#"<tr><td>{}</td><td>{}</td><td>{}</td><td class="actions">{}</td></tr>"#,
+            r#"<tr data-key="rule-{index}"{reorder_attributes}><td>{}</td><td>{}</td><td>{}</td><td class="actions">{}</td></tr>"#,
             esc(kind),
             esc(&rule.pattern),
             esc(&rule.directory),
-            actions
+            actions,
         );
     }
     let test_result = test_name.map(|name| {
@@ -2687,21 +3025,24 @@ fn render_routing_page(
     }
     let _ = write!(
         body,
-        r#"<div class="grid2">
+        r#"<div class="page-heading">
+<div><p class="eyebrow">Automatic organisation</p><h1>Download folders</h1><p class="muted">Route files by name before they enter the queue.</p></div>
+<a class="button primary" data-dialog data-dialog-return="/routing" href="/routing/rule/new">＋ Add rule</a>
+</div>
+<div class="grid2">
 <section class="card">
-<h2>Routing</h2>
+<h2>Folder rules</h2>
 <p>Fallback folder: {}</p>
-<div class="toolbar"><a class="button" href="/routing/rule/new">Add rule</a></div>
+<p class="interaction-hint"><span class="drag-handle-symbol">⠿</span> Drag rules into priority order. The first match wins.</p>
 <table>
 <thead><tr><th>Type</th><th>Pattern</th><th>Directory</th><th>Actions</th></tr></thead>
 <tbody>{}</tbody>
 </table>
 </section>
 <section class="card">
-<h2>Rule tester</h2>
-<form method="get" action="/routing" class="stack">
-<input type="text" name="test" value="{}" placeholder="example-file.iso">
-<button type="submit">Test</button>
+<h2>Try a filename</h2>
+<form method="get" action="/routing" class="stack" data-live-form>
+<input type="search" name="test" value="{}" placeholder="example-file.iso">
 </form>
 <p>{}</p>
 </section>
@@ -2764,8 +3105,11 @@ fn render_webhooks_page(snapshot: &Snapshot, error: Option<&str>) -> String {
     };
     let _ = write!(
         body,
-        r#"<section class="card narrow-card">
-<h2>Webhooks</h2>
+        r#"<div class="page-heading">
+<div><p class="eyebrow">Discord</p><h1>Notifications</h1><p class="muted">Know when a download finishes or needs attention.</p></div>
+</div>
+<section class="card narrow-card">
+<h2>Delivery settings</h2>
 <form method="post" action="/webhooks" class="stack">
 <label>Discord webhook URL</label>
 <input type="text" name="discord_webhook_url" value="{}">
@@ -2778,9 +3122,9 @@ fn render_webhooks_page(snapshot: &Snapshot, error: Option<&str>) -> String {
 <label>Specific ID</label>
 <input type="text" name="ping_id" value="{}">
 <p class="muted">Events: completed, failed, removed, aria2 restart.</p>
-<div class="actions"><button type="submit">Save</button></div>
+<div class="actions"><button type="submit" class="primary">Save changes</button></div>
 </form>
-<form method="post" action="/webhooks/test"><button type="submit">Send test notification</button></form>
+<form method="post" action="/webhooks/test"><button type="submit" class="button subtle">Send a test</button></form>
 </section>"#,
         esc(&snapshot.webhooks.discord_webhook_url),
         if ping_mode == "none" { "selected" } else { "" },
@@ -2806,13 +3150,17 @@ fn render_web_ui_page(snapshot: &Snapshot, error: Option<&str>) -> String {
     }
     let _ = write!(
         body,
-        r#"<section class="card narrow-card">
-<h2>Web UI</h2>
-<p>Status: {:?}</p>
-<p>URL: {}</p>
-<p>Pairing auth: {}</p>
-<p>Pending browser PINs: {}</p>
-<p>Active browser sessions: {}</p>
+        r#"<div class="page-heading">
+<div><p class="eyebrow">Browser access</p><h1>Access</h1><p class="muted">Control where this interface is available and who is paired.</p></div>
+</div>
+<section class="access-summary">
+<div class="summary-card"><small>Status</small><strong>{:?}</strong></div>
+<div class="summary-card"><small>Address</small><strong>{}</strong></div>
+<div class="summary-card"><small>Sessions</small><strong>{}</strong></div>
+</section>
+<section class="card narrow-card">
+<h2>Connection settings</h2>
+<p class="muted">Pairing security: {} · Pending PINs: {}</p>
 {}
 <form method="post" action="/web-ui" class="stack">
 <label><input type="checkbox" name="enabled" {}> Enabled</label>
@@ -2822,11 +3170,12 @@ fn render_web_ui_page(snapshot: &Snapshot, error: Option<&str>) -> String {
 <input type="number" name="port" min="1" max="65535" value="{}">
 <label>Cookie lifetime (days)</label>
 <input type="number" name="cookie_days" min="1" max="365" value="{}">
-<div class="actions"><button type="submit">Save settings</button></div>
+<div class="actions"><button type="submit" class="primary">Save settings</button></div>
 </form>
 </section>"#,
         snapshot.web_ui.status,
         esc(&snapshot.web_ui.url),
+        snapshot.web_ui.active_session_count,
         if snapshot.web_ui.auth_configured {
             "ready"
         } else {
@@ -2837,7 +3186,6 @@ fn render_web_ui_page(snapshot: &Snapshot, error: Option<&str>) -> String {
         } else {
             snapshot.web_ui.pending_pair_pins.join(", ")
         },
-        snapshot.web_ui.active_session_count,
         snapshot
             .web_ui
             .last_error
@@ -3136,69 +3484,74 @@ fn scheduler_ranges(snapshot: &Snapshot) -> Vec<(usize, usize, Option<u64>)> {
     ranges
 }
 
-fn render_schedule_svg(limits: &[Option<u64>; 24]) -> String {
-    let finite = limits.iter().flatten().copied().collect::<Vec<_>>();
-    let max_finite = finite.iter().copied().max().unwrap_or(1);
-    let min_finite = finite.iter().copied().min().unwrap_or(max_finite);
-    let current_hour = Local::now().hour() as usize;
-    let chart_top = 16.0;
-    let chart_height = 144.0;
-    let bar_width = 14.0;
-    let gap = 8.0;
+fn render_interactive_schedule(
+    snapshot: &Snapshot,
+    active_range: (usize, usize, Option<u64>),
+) -> String {
+    let limits = &snapshot.scheduler.schedule_limits_bps;
+    let max_finite = limits.iter().flatten().copied().max().unwrap_or(1);
+    let current_hour = snapshot.scheduler.current_hour as usize;
     let mut body = String::new();
-    body.push_str(
-        r#"<svg class="schedule-chart" viewBox="0 0 584 220" role="img" aria-label="Hourly scheduler limits chart">"#,
+    let _ = write!(
+        body,
+        r#"<div id="schedule-graph" class="schedule-graph" role="group" aria-label="24 hour speed schedule" data-max-bps="{max_finite}">
+<div class="schedule-grid-lines" aria-hidden="true"><i></i><i></i><i></i><i></i></div>"#
     );
-    body.push_str(r##"<rect x="0" y="0" width="584" height="220" rx="10" fill="#101010"/>"##);
-    for grid in 0..=4 {
-        let y = chart_top + (chart_height / 4.0) * grid as f64;
-        let _ = write!(
-            body,
-            r##"<line x1="38" y1="{:.1}" x2="566" y2="{:.1}" stroke="#2b2b2b" stroke-width="1"/>"##,
-            y, y
-        );
-    }
     for (hour, limit) in limits.iter().enumerate() {
-        let x = 42.0 + hour as f64 * (bar_width + gap);
-        let normalized = match limit {
-            None => 1.0,
-            Some(_) if max_finite == min_finite => 0.55,
-            Some(value) => {
-                ((*value - min_finite) as f64 / (max_finite - min_finite) as f64 * 0.85) + 0.15
-            }
+        let level = match limit {
+            None => 100.0,
+            Some(value) => 18.0 + (*value as f64 / max_finite as f64 * 72.0),
         };
-        let bar_height = chart_height * normalized;
-        let y = chart_top + chart_height - bar_height;
-        let fill = if hour == current_hour {
-            "#f2c94c"
-        } else if limit.is_none() {
-            "#25c2a0"
-        } else {
-            "#4f8cff"
-        };
+        let current = hour == current_hour;
+        let in_active_segment = active_range.0 <= hour && hour < active_range.1;
+        let formatted = format_limit(*limit);
         let _ = write!(
             body,
-            r#"<g><rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" rx="3" fill="{}"><title>{:02}:00 - {}</title></rect></g>"#,
-            x,
-            y,
-            bar_width,
-            bar_height.max(2.0),
-            fill,
+            r#"<button type="button" class="schedule-hour {} {}" data-key="schedule-hour-{hour}" data-schedule-hour="{}" data-limit="{}" data-original-level="{:.2}" aria-label="{:02}:00 to {:02}:00, {}">
+<span class="hour-bar-space"><span class="hour-bar" style="--bar-height:{:.2}%"><i></i></span></span>
+<span class="hour-label">{:02}</span>
+<span class="hour-value">{}</span>
+</button>"#,
+            if current { "current" } else { "" },
+            if in_active_segment {
+                "active-segment"
+            } else {
+                ""
+            },
             hour,
-            esc(&format_limit(*limit))
+            esc(&formatted),
+            level,
+            hour,
+            hour + 1,
+            esc(&formatted),
+            level,
+            hour,
+            esc(&formatted),
         );
-        if hour % 3 == 0 {
-            let _ = write!(
-                body,
-                r##"<text x="{:.1}" y="188" text-anchor="middle" fill="#bdbdbd" font-size="11">{:02}</text>"##,
-                x + bar_width / 2.0,
-                hour
-            );
-        }
     }
-    body.push_str(r##"<text x="18" y="18" fill="#bdbdbd" font-size="11">Higher bars mean higher limits. Unlimited uses full height.</text>"##);
-    body.push_str(r##"<text x="18" y="206" fill="#8f8f8f" font-size="11">Hours</text>"##);
-    body.push_str("</svg>");
+    body.push_str(
+        r#"</div>
+<div id="schedule-editor" class="schedule-editor" popover="manual">
+<form method="post" action="/scheduler/range/save" class="stack">
+<input type="hidden" name="start_hour" value="0">
+<input type="hidden" name="end_hour" value="1">
+<div class="schedule-editor-heading">
+<div><p class="eyebrow">Selected hours</p><h3 id="schedule-selection-label">00:00–01:00</h3></div>
+<button type="button" class="icon-button" data-close-schedule aria-label="Close">×</button>
+</div>
+<label for="schedule-limit">Target download speed</label>
+<input id="schedule-limit" name="limit" type="text" inputmode="decimal" placeholder="10M, 500 kb/s, unlimited" autocomplete="off" required>
+<div class="speed-presets" aria-label="Speed presets">
+<button type="button" data-speed-preset="256K">256K</button>
+<button type="button" data-speed-preset="1M">1M</button>
+<button type="button" data-speed-preset="10M">10M</button>
+<button type="button" data-speed-preset="unlimited">Unlimited</button>
+</div>
+<p id="schedule-limit-preview" class="input-preview">Type a speed using K, M, MB/s, or “unlimited”.</p>
+<div class="actions"><button type="submit" class="primary">Apply to selection</button><span class="muted enter-hint">Enter to apply</span></div>
+</form>
+</div>"#,
+    );
     body
 }
 
@@ -3237,51 +3590,1030 @@ fn esc(input: &str) -> String {
 
 fn styles() -> &'static str {
     r#"
-body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: #111; color: #eee; margin: 0; }
-.wrap { max-width: 1280px; margin: 0 auto; padding: 1rem; }
-.narrow { max-width: 520px; }
+:root {
+  color-scheme: dark;
+  --bg: #0d120f;
+  --surface: #151c18;
+  --surface-soft: #1b241f;
+  --ink: #edf4ef;
+  --muted: #96a39b;
+  --line: #2a352e;
+  --brand: #35bd87;
+  --brand-dark: #78dfb7;
+  --brand-soft: #173b2e;
+  --danger: #ff8d8d;
+  --danger-soft: #3b2022;
+  --warning: #e9b665;
+  --shadow: 0 1px 2px rgba(0,0,0,.22), 0 12px 34px rgba(0,0,0,.2);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+* { box-sizing: border-box; }
+html { background: var(--bg); }
+body { background: var(--bg); color: var(--ink); margin: 0; min-height: 100vh; font-size: 15px; line-height: 1.5; }
+button, input, select { font: inherit; }
+a { color: var(--brand-dark); }
+h1, h2, h3, p { margin-top: 0; }
+h1 { font-size: clamp(1.8rem, 3vw, 2.35rem); line-height: 1.1; letter-spacing: -.035em; margin-bottom: .4rem; }
+h2 { font-size: 1.1rem; letter-spacing: -.015em; margin-bottom: 1rem; }
+.wrap { max-width: 1160px; margin: 0 auto; padding: 2rem; }
+.narrow { max-width: 540px; padding-top: 10vh; }
 .narrow-card { max-width: 720px; }
-.header, .card, .tabs, .logout { border: 1px solid #444; background: #181818; padding: 0.75rem; margin-bottom: 0.75rem; }
-.tabs { display: flex; gap: 0.5rem; flex-wrap: wrap; }
-.tab, .button, button { background: #262626; color: #eee; border: 1px solid #555; text-decoration: none; padding: 0.45rem 0.7rem; display: inline-block; cursor: pointer; }
-.tab.active { background: #0e5f5f; border-color: #29b8b8; }
-.split { display: grid; grid-template-columns: 2fr 1fr; gap: 0.75rem; }
-.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
-.stack { display: flex; flex-direction: column; gap: 0.6rem; }
-.inline, .actions { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
-.toolbar { margin-bottom: 0.75rem; }
-.table-wrap { overflow-x: auto; }
+.public-brand, .brand { display: flex; align-items: center; gap: .7rem; font-weight: 750; font-size: 1.05rem; color: var(--ink); text-decoration: none; }
+.public-brand { margin-bottom: 1.25rem; }
+.brand-mark { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 11px; color: #07150f; background: var(--brand); font-size: .95rem; box-shadow: 0 6px 16px rgba(53,189,135,.18); }
+.app-shell { display: grid; grid-template-columns: 220px minmax(0, 1fr); min-height: 100vh; }
+.sidebar { position: sticky; top: 0; height: 100vh; padding: 1.6rem 1rem; background: #111713; border-right: 1px solid var(--line); display: flex; flex-direction: column; z-index: 10; }
+.sidebar .brand { padding: 0 .65rem 1.5rem; }
+.tabs { display: grid; gap: .25rem; }
+.tab { min-width: 0; color: var(--muted); text-decoration: none; padding: .68rem .75rem; border-radius: 10px; font-weight: 600; transition: background .15s, color .15s, transform .15s; }
+.tab:hover { background: var(--surface-soft); color: var(--ink); }
+.tab:active { transform: scale(.98); }
+.tab.active { background: var(--brand-soft); color: var(--brand-dark); }
+.logout { margin-top: auto; }
+.logout button { width: 100%; color: var(--muted); background: transparent; border-color: transparent; justify-content: flex-start; }
+.workspace { min-width: 0; overflow: hidden; }
+.header { min-height: 74px; padding: 1rem clamp(1rem, 3vw, 2.5rem); border-bottom: 1px solid var(--line); background: #0f1511; display: flex; align-items: center; justify-content: space-between; gap: 1rem; position: sticky; top: 0; z-index: 8; }
+.status-group, .headline-stats { display: flex; align-items: center; gap: 1rem; }
+.connection-status { font-weight: 650; display: flex; align-items: center; gap: .5rem; }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; background: #929b95; }
+.status-dot.online { background: #20a36d; box-shadow: 0 0 0 4px rgba(32,163,109,.12); }
+.status-dot.offline { background: #d35a5a; box-shadow: 0 0 0 4px rgba(211,90,90,.12); }
+.sync-state { color: var(--muted); font-size: .82rem; }
+.sync-state.syncing::before { content: ""; display: inline-block; width: 8px; height: 8px; margin-right: .4rem; border: 1.5px solid var(--line); border-top-color: var(--brand); border-radius: 50%; animation: spin .7s linear infinite; }
+.headline-stats span { display: grid; min-width: 68px; }
+.headline-stats small { color: var(--muted); font-size: .7rem; text-transform: uppercase; letter-spacing: .06em; }
+.headline-stats strong { font-size: .92rem; }
+.speed-control { position: relative; }
+.speed-control > summary { list-style: none; min-width: 156px; display: flex; align-items: center; justify-content: space-between; gap: .75rem; padding: .48rem .7rem; border: 1px solid var(--line); border-radius: 10px; cursor: pointer; user-select: none; }
+.speed-control > summary::-webkit-details-marker { display: none; }
+.speed-control > summary:hover, .speed-control[open] > summary { background: var(--surface-soft); border-color: #45554a; }
+.speed-control > summary span:first-child { display: grid; }
+.speed-control > summary small { color: var(--muted); font-size: .66rem; text-transform: uppercase; letter-spacing: .06em; }
+.speed-control > summary strong { font-size: .84rem; }
+.speed-menu { position: absolute; z-index: 30; top: calc(100% + .55rem); right: 0; width: 310px; padding: .55rem; background: #121914; border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 18px 50px rgba(0,0,0,.42); }
+.speed-menu-heading { display: flex; align-items: center; justify-content: space-between; padding: .45rem .55rem .65rem; }
+.speed-menu-heading span { color: var(--muted); font-size: .78rem; }
+.speed-option { width: 100%; min-height: 0; justify-content: space-between; border-color: transparent; background: transparent; padding: .65rem .6rem; text-align: left; }
+.speed-option > span:first-child { display: grid; }
+.speed-option small { color: var(--muted); font-weight: 500; }
+.speed-option > span:last-child { color: transparent; }
+.speed-option.active { color: var(--brand-dark); background: var(--brand-soft); }
+.speed-option.active > span:last-child { color: var(--brand); }
+.speed-manage { display: flex; justify-content: space-between; margin-top: .35rem; padding: .7rem .6rem .4rem; border-top: 1px solid var(--line); text-decoration: none; font-weight: 650; }
+#page-body { width: min(1280px, 100%); margin: 0 auto; padding: clamp(1.25rem, 3vw, 2.5rem); outline: none; }
+.page-heading { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 1rem; margin-bottom: 1.5rem; }
+.page-heading p { margin-bottom: 0; }
+.eyebrow { color: var(--brand); font-size: .73rem; line-height: 1; text-transform: uppercase; letter-spacing: .11em; font-weight: 750; margin-bottom: .65rem; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: clamp(1rem, 2vw, 1.35rem); box-shadow: var(--shadow); margin-bottom: 1rem; }
+.split { display: grid; grid-template-columns: minmax(0, 1.8fr) minmax(280px, .85fr); gap: 1rem; align-items: start; }
+.grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; align-items: start; }
+.access-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .75rem; max-width: 720px; margin-bottom: 1rem; }
+.summary-card { display: grid; gap: .25rem; min-width: 0; padding: 1rem; background: var(--surface); border: 1px solid var(--line); border-radius: 13px; }
+.summary-card small { color: var(--muted); font-size: .72rem; text-transform: uppercase; letter-spacing: .06em; }
+.summary-card strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.schedule-status { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 1rem 1.1rem; margin-bottom: 1rem; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; }
+.schedule-status > div:first-child { display: grid; gap: .2rem; }
+.schedule-status > div:first-child > strong { font-size: 1.05rem; }
+.schedule-status small { color: var(--muted); }
+.live-kicker { display: flex; align-items: center; gap: .45rem; color: var(--brand-dark); font-size: .72rem; font-weight: 750; text-transform: uppercase; letter-spacing: .07em; }
+.mode-switch { display: inline-grid; grid-template-columns: repeat(2, 1fr); padding: 3px; border: 1px solid var(--line); border-radius: 11px; background: #0f1511; }
+.mode-switch label { cursor: pointer; }
+.mode-switch input { position: absolute; opacity: 0; pointer-events: none; }
+.mode-switch span { display: block; padding: .48rem .75rem; border-radius: 8px; color: var(--muted); white-space: nowrap; }
+.mode-switch input:checked + span { color: var(--ink); background: var(--surface-soft); box-shadow: 0 1px 3px rgba(0,0,0,.22); }
+.schedule-card { overflow-x: auto; padding: 1.15rem 1.2rem .9rem; }
+.schedule-card-heading { min-width: 820px; display: flex; justify-content: space-between; gap: 1rem; }
+.schedule-card-heading p { margin-bottom: .25rem; }
+.schedule-legend { display: flex; align-items: flex-start; gap: 1rem; color: var(--muted); font-size: .78rem; }
+.schedule-legend span { display: flex; align-items: center; gap: .35rem; }
+.schedule-legend i { display: inline-block; width: 9px; height: 9px; border-radius: 3px; }
+.schedule-legend i.now { background: var(--warning); }
+.schedule-legend i.selected { background: var(--brand); }
+.schedule-graph { isolation: isolate; position: relative; min-width: 820px; height: 310px; display: grid; grid-template-columns: repeat(24, minmax(0, 1fr)); gap: 3px; padding: 12px 0 0; user-select: none; touch-action: pan-x pan-y pinch-zoom; }
+.schedule-grid-lines { position: absolute; z-index: -1; inset: 12px 0 58px; display: flex; flex-direction: column; justify-content: space-between; pointer-events: none; }
+.schedule-grid-lines i { display: block; border-top: 1px dashed #2b3830; }
+.schedule-hour { position: relative; min-width: 0; height: 100%; display: grid; grid-template-rows: 232px 24px 20px; gap: 2px; padding: 0 1px; color: var(--muted); border: 0; border-radius: 7px; background: transparent; }
+.schedule-hour:hover { border: 0; background: #1c2721; transform: none; }
+.schedule-hour.active-segment { background: rgba(53,189,135,.055); }
+.schedule-hour.current { background: rgba(233,182,101,.08); }
+.schedule-hour.current::after { content: ""; position: absolute; z-index: 3; inset: 0 auto 48px 50%; width: 1px; background: var(--warning); pointer-events: none; }
+.schedule-hour.current .hour-label { color: var(--warning); font-weight: 800; }
+.schedule-hour.is-selected { background: rgba(53,189,135,.14); }
+.schedule-hour.is-selected .hour-label { color: var(--brand-dark); }
+.hour-bar-space { height: 232px; display: flex; align-items: flex-end; padding: 0 3px; }
+.hour-bar { position: relative; width: 100%; height: var(--bar-height); min-height: 5px; border-radius: 5px 5px 2px 2px; background: #3e6554; transition: height .12s ease, background .12s; }
+.active-segment .hour-bar { background: #2d8e69; }
+.current .hour-bar { background: #b88746; }
+.is-selected .hour-bar { background: var(--brand); }
+.hour-bar i { position: absolute; left: 50%; top: 0; width: 7px; height: 7px; border: 2px solid #111713; border-radius: 50%; background: currentColor; transform: translate(-50%, -45%); }
+.hour-label { align-self: center; font-size: .67rem; font-variant-numeric: tabular-nums; }
+.hour-value { position: absolute; z-index: 5; left: 50%; bottom: 47px; width: max-content; max-width: 120px; padding: .28rem .4rem; color: var(--ink); background: #27332c; border: 1px solid #435248; border-radius: 6px; box-shadow: 0 5px 15px rgba(0,0,0,.28); font-size: .65rem; opacity: 0; pointer-events: none; transform: translateX(-50%) translateY(4px); transition: opacity .12s, transform .12s; }
+.schedule-hour:hover .hour-value, .schedule-hour:focus-visible .hour-value { opacity: 1; transform: translateX(-50%) translateY(0); }
+.schedule-axis-note { min-width: 820px; display: flex; justify-content: space-between; padding-top: .3rem; color: var(--muted); border-top: 1px solid var(--line); font-size: .7rem; }
+.schedule-secondary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; max-width: 900px; }
+.setting-value { display: block; margin: -.25rem 0 .35rem; font-size: 1.3rem; }
+.schedule-editor { position: fixed; inset: auto; width: min(350px, calc(100vw - 2rem)); margin: 0; padding: 1rem; color: var(--ink); background: #151d18; border: 1px solid #405047; border-radius: 15px; box-shadow: 0 22px 70px rgba(0,0,0,.52); }
+.schedule-editor::backdrop { background: transparent; }
+.schedule-editor-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; }
+.schedule-editor-heading h3 { margin: 0; font-size: 1.15rem; }
+.speed-presets { display: grid; grid-template-columns: repeat(4, 1fr); gap: .35rem; }
+.speed-presets button { min-width: 0; padding-inline: .3rem; font-size: .75rem; }
+.input-preview { min-height: 24px; margin: 0; color: var(--muted); font-size: .82rem; }
+.input-preview.valid { color: var(--brand-dark); }
+.input-preview.invalid { color: var(--danger); }
+.enter-hint { font-size: .74rem; }
+.stack { display: flex; flex-direction: column; gap: .75rem; }
+.inline, .actions, .item-actions, .bulk-actions { display: flex; gap: .45rem; align-items: center; flex-wrap: wrap; }
+.inline-setting { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .5rem; }
+.input-hint { display: block; margin-top: .4rem; color: var(--muted); }
+.interaction-hint { display: flex; align-items: center; gap: .4rem; margin: -.3rem 0 .85rem; color: var(--muted); font-size: .78rem; }
+.drag-handle-symbol { font-size: 1rem; }
+.toolbar { display: flex; align-items: center; justify-content: space-between; gap: .75rem; margin-bottom: 1rem; }
+.filter-bar { display: grid; grid-template-columns: minmax(220px, 1fr) 130px 130px; gap: .55rem; width: min(680px, 100%); }
+.filter-bar > * { min-width: 0; }
+.search-field { position: relative; }
+.table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; }
 table { width: 100%; border-collapse: collapse; }
-th, td { border-bottom: 1px solid #333; padding: 0.45rem; text-align: left; vertical-align: top; }
-input, select { width: 100%; box-sizing: border-box; background: #0f0f0f; color: #eee; border: 1px solid #555; padding: 0.45rem; }
-.message { color: #7fe27f; }
-.error { color: #ff8383; }
-.muted { color: #bbb; }
-.danger { border-color: #8a3d3d; }
+th { color: var(--muted); background: var(--surface-soft); font-size: .72rem; text-transform: uppercase; letter-spacing: .06em; }
+th, td { border-bottom: 1px solid var(--line); padding: .78rem; text-align: left; vertical-align: middle; }
+tbody tr:last-child td { border-bottom: 0; }
+tbody tr { transition: background .15s; }
+tbody tr:hover { background: var(--surface-soft); }
+label { color: #ced8d1; font-weight: 600; font-size: .9rem; }
+input, select { width: 100%; min-height: 42px; color: var(--ink); background: #111713; border: 1px solid #39473e; border-radius: 10px; padding: .6rem .75rem; outline: none; transition: border .15s, box-shadow .15s, background .15s; }
+input[type="radio"], input[type="checkbox"] { width: auto; min-height: auto; accent-color: var(--brand); }
+input:focus, select:focus { border-color: var(--brand); box-shadow: 0 0 0 3px rgba(53,189,135,.15); }
+input[aria-disabled="true"] { color: var(--muted); background: var(--surface-soft); }
+form.is-dirty:not([data-live-form]) button[type="submit"] { box-shadow: 0 0 0 3px rgba(53,189,135,.15); }
+.button, button { min-height: 38px; display: inline-flex; align-items: center; justify-content: center; gap: .35rem; color: #dce5df; background: var(--surface); border: 1px solid #3a483f; border-radius: 10px; padding: .48rem .78rem; text-decoration: none; font-weight: 650; cursor: pointer; transition: transform .12s, background .12s, border .12s, opacity .12s; }
+.button:hover, button:hover { background: var(--surface-soft); border-color: #56685c; }
+.button:active, button:active { transform: scale(.97); }
+.button.primary, button.primary { color: #07150f; background: var(--brand); border-color: var(--brand); box-shadow: 0 5px 14px rgba(53,189,135,.16); }
+.button.primary:hover, button.primary:hover { background: #57d39f; }
+.button.subtle { color: var(--muted); background: transparent; }
+.icon-button { width: 34px; min-height: 34px; padding: 0; border-radius: 9px; }
+.drag-handle { width: 34px; min-height: 34px; padding: 0; color: var(--muted); border-color: transparent; background: transparent; cursor: grab; font-size: 1.15rem; touch-action: none; }
+.drag-handle:active { cursor: grabbing; }
+button[disabled], .is-busy { opacity: .58; cursor: wait; }
+.message, .error { padding: .75rem 1rem; border-radius: 10px; }
+.message { color: var(--brand-dark); background: var(--brand-soft); }
+.error { color: #ffb1b1; background: var(--danger-soft); }
+.muted { color: var(--muted); }
+.danger { color: var(--danger) !important; border-color: #754044 !important; }
+.download-list { padding: .35rem; overflow: hidden; }
+.empty-state { padding: 3rem 1rem; text-align: center; color: var(--muted); }
+.empty-state strong { display: block; color: var(--ink); font-size: 1.05rem; }
+.empty-state p { margin: .35rem 0 1rem; }
+.download-item { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: .75rem; padding: .9rem; border-radius: 12px; transition: background .15s, opacity .15s; }
+.download-item[draggable="true"] { cursor: default; }
+.is-dragging { opacity: .38 !important; }
+.drop-before::before, tr.drop-before td { box-shadow: inset 0 2px 0 var(--brand); }
+.drop-after::after, tr.drop-after td { box-shadow: inset 0 -2px 0 var(--brand); }
+.download-item.drop-before::before { inset: 0 .5rem auto !important; width: auto !important; height: 2px; }
+.download-item.drop-after::after { content: ""; position: absolute; inset: auto .5rem 0; height: 2px; background: var(--brand); }
+.download-item + .download-item { border-top: 1px solid var(--line); border-top-left-radius: 0; border-top-right-radius: 0; }
+.download-item:hover, .download-item.selected { background: var(--surface-soft); }
+.download-item.selected::before { content: ""; position: absolute; inset: .65rem auto .65rem 0; width: 3px; border-radius: 2px; background: var(--brand); }
+.download-main { min-width: 0; color: inherit; text-decoration: none; }
+.download-heading { display: flex; align-items: center; justify-content: space-between; gap: .75rem; margin-bottom: .6rem; }
+.download-heading strong { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.status-badge { border-radius: 999px; padding: .18rem .5rem; color: var(--muted); background: #222c26; font-size: .7rem; font-weight: 700; text-transform: capitalize; }
+.status-badge.active, .status-badge.complete { color: var(--brand-dark); background: var(--brand-soft); }
+.status-badge.error, .status-badge.removed { color: var(--danger); background: var(--danger-soft); }
+.status-badge.waiting { color: var(--warning); background: #392d1c; }
+.progress-track { height: 6px; overflow: hidden; border-radius: 999px; background: #29342d; }
+.progress-track span { display: block; height: 100%; border-radius: inherit; background: var(--brand); transition: width .35s ease; }
+.download-meta { display: flex; gap: 1rem; color: var(--muted); font-size: .78rem; margin-top: .55rem; }
+.download-meta span:first-child { margin-right: auto; }
+.details-card { position: sticky; top: 90px; max-height: calc(100vh - 112px); overflow: auto; }
+.details { margin: 0; }
+.details dt { color: var(--muted); font-size: .72rem; text-transform: uppercase; letter-spacing: .055em; margin-top: .8rem; }
+.details dd { margin: .15rem 0 0; word-break: break-word; }
 .chart-shell { overflow-x: auto; }
 .schedule-chart { width: 100%; min-width: 584px; height: auto; display: block; }
-.details dt { color: #bbb; margin-top: 0.5rem; }
-.details dd { margin-left: 0; margin-bottom: 0.35rem; word-break: break-word; }
-.projection-shell { margin-top: 0.9rem; }
-.projection-chart { width: 100%; height: auto; display: block; margin-bottom: 0.6rem; }
-.phase-list { margin: 0; padding-left: 1.25rem; color: #ddd; }
-.phase-list li { margin-bottom: 0.3rem; }
-code { background: #0d0d0d; padding: 0.15rem 0.25rem; }
-.pin { font-size: 2.4rem; font-weight: bold; letter-spacing: 0.25rem; text-align: center; margin: 1rem 0; color: #7fe27f; }
-.hidden { display: none; }
-.login-loading { display: grid; justify-items: center; gap: 0.8rem; padding: 1.2rem 0; }
-.spinner { width: 1.6rem; height: 1.6rem; border: 2px solid #333; border-top-color: #29b8b8; border-radius: 999px; animation: spin 0.8s linear infinite; }
+.projection-shell { margin-top: .9rem; }
+.projection-chart { width: 100%; height: auto; display: block; margin-bottom: .6rem; }
+.phase-list { margin: 0; padding-left: 1.25rem; color: #c3cec7; }
+.phase-list li { margin-bottom: .3rem; }
+code { background: #0b100d; border: 1px solid var(--line); border-radius: 5px; padding: .15rem .3rem; }
+.pin { font-variant-numeric: tabular-nums; font-size: 2.7rem; font-weight: 800; letter-spacing: .3rem; text-align: center; margin: 1.2rem 0; color: var(--brand); }
+.hidden { display: none !important; }
+.login-loading { display: grid; justify-items: center; gap: .8rem; padding: 1.2rem 0; }
+.spinner { width: 1.6rem; height: 1.6rem; border: 2px solid var(--line); border-top-color: var(--brand); border-radius: 999px; animation: spin .8s linear infinite; }
+.navigation-progress { position: fixed; z-index: 100; inset: 0 auto auto 0; width: 0; height: 3px; opacity: 0; background: var(--brand); transition: width .25s ease, opacity .2s; }
+.navigation-progress.active { width: 72%; opacity: 1; }
+.navigation-progress.done { width: 100%; opacity: 0; }
+.app-dialog { width: min(680px, calc(100vw - 2rem)); max-height: min(820px, calc(100vh - 2rem)); margin: auto; padding: 0; color: var(--ink); background: #111713; border: 1px solid #3b4a40; border-radius: 17px; box-shadow: 0 28px 90px rgba(0,0,0,.58); overflow: hidden; }
+.app-dialog::backdrop { background: rgba(4,8,6,.76); }
+.dialog-bar { position: sticky; z-index: 2; top: 0; display: flex; align-items: center; justify-content: space-between; min-height: 54px; padding: .65rem .8rem .65rem 1rem; background: #151d18; border-bottom: 1px solid var(--line); font-weight: 750; }
+#dialog-content { max-height: calc(100vh - 76px); padding: 1rem; overflow: auto; }
+#dialog-content .page-heading { margin: 0 0 1rem; }
+#dialog-content .dialog-page-heading { display: none; }
+#dialog-content .card { margin: 0; box-shadow: none; }
+#dialog-content .narrow-card { max-width: none; }
+#dialog-content > .error { margin-bottom: .75rem; }
+#dialog-content:has(.filename-card) .add-source-card { display: none; }
+.toast-region { position: fixed; z-index: 110; right: 1.2rem; bottom: 1.2rem; display: grid; gap: .5rem; pointer-events: none; }
+.toast { max-width: 360px; color: var(--ink); background: #243129; border: 1px solid #39483e; border-radius: 11px; padding: .72rem .9rem; box-shadow: 0 12px 32px rgba(0,0,0,.3); animation: toast-in .2s ease both; }
+.toast.error { color: #ffe7e7; background: #662f34; }
+.skip-link { position: fixed; z-index: 200; top: .5rem; left: .5rem; transform: translateY(-160%); background: var(--ink); color: #0a0f0c; padding: .5rem .75rem; border-radius: 8px; }
+.skip-link:focus { transform: none; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 @keyframes spin { to { transform: rotate(360deg); } }
-@media (max-width: 900px) { .split, .grid2 { grid-template-columns: 1fr; } }
+@keyframes toast-in { from { opacity: 0; transform: translateY(8px); } }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; } }
+@media (max-width: 920px) {
+  .app-shell { grid-template-columns: 1fr; padding-bottom: 66px; }
+  .sidebar { position: fixed; inset: auto 0 0; width: 100%; height: 66px; padding: .45rem; border: 0; border-top: 1px solid var(--line); display: block; }
+  .sidebar .brand, .logout { display: none; }
+  .tabs { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: .1rem; }
+  .tab { padding: .55rem .2rem; text-align: center; font-size: .68rem; overflow: hidden; text-overflow: ellipsis; }
+  .header { position: static; min-height: 58px; padding: .75rem 1rem; }
+  .headline-stats span:nth-child(n+3) { display: none; }
+  .split, .grid2 { grid-template-columns: 1fr; }
+  .schedule-secondary { grid-template-columns: 1fr; }
+  .access-summary { grid-template-columns: 1fr; }
+  .details-card { position: static; max-height: none; }
+}
+@media (max-width: 640px) {
+  #page-body { padding: 1rem; }
+  .headline-stats { display: none; }
+  .connection-status { font-size: .8rem; }
+  .sync-state { display: none; }
+  .speed-control > summary { min-width: 132px; }
+  .speed-menu { position: fixed; top: 64px; right: .65rem; width: min(310px, calc(100vw - 1.3rem)); }
+  .page-heading { align-items: center; }
+  .schedule-status { align-items: stretch; flex-direction: column; }
+  .mode-switch { width: 100%; }
+  .mode-switch span { text-align: center; }
+  .toolbar { align-items: stretch; flex-direction: column; }
+  .filter-bar { grid-template-columns: minmax(0, 1fr) 110px; }
+  .filter-bar .search-field { grid-column: 1 / -1; }
+  .filter-bar select { min-width: 0; }
+  .bulk-actions { justify-content: flex-end; }
+  .download-item { grid-template-columns: minmax(0, 1fr); }
+  .item-actions { justify-content: flex-end; }
+  .download-meta span:first-child { display: none; }
+  .wrap { padding: 1rem; }
+}
 "#
 }
 
 fn script(login_next: Option<&str>) -> String {
-    let script = r#"
+    let script = r##"
 const loginNext = __LOGIN_NEXT__;
 const pairingStatus = document.getElementById("pairing-status");
 const loginLoading = document.getElementById("login-loading");
 const loginPairing = document.getElementById("login-pairing");
+const progressBar = document.getElementById("navigation-progress");
+const toastRegion = document.getElementById("toast-region");
+let navigationController;
+let refreshController;
+let liveFormTimer;
+let refreshInFlight = false;
+let interactionInFlight = false;
+let requestEpoch = 0;
+let refreshPausedUntil = 0;
+let scheduleDrag;
+let draggedItem;
+let navigationProgressEpoch = 0;
+
+function pauseBackgroundRefresh(duration = 700) {
+  refreshPausedUntil = Math.max(refreshPausedUntil, Date.now() + duration);
+}
+
+function setSyncState(label, syncing = false) {
+  const node = document.getElementById("sync-state");
+  if (!node) return;
+  node.textContent = label;
+  node.classList.toggle("syncing", syncing);
+}
+
+function setProgress(active) {
+  if (!progressBar) return;
+  progressBar.classList.toggle("active", active);
+  if (!active) {
+    progressBar.classList.add("done");
+    setTimeout(() => progressBar.classList.remove("done"), 260);
+  }
+}
+
+function toast(message, kind = "") {
+  if (!toastRegion || !message) return;
+  const node = document.createElement("div");
+  node.className = `toast ${kind}`.trim();
+  node.textContent = message;
+  toastRegion.appendChild(node);
+  setTimeout(() => node.remove(), 3200);
+}
+
+function focusSnapshot() {
+  const active = document.activeElement;
+  if (!active || !active.matches("input, select, textarea")) return null;
+  return {
+    id: active.id,
+    name: active.name,
+    start: active.selectionStart,
+    end: active.selectionEnd
+  };
+}
+
+function restoreFocus(snapshot) {
+  if (!snapshot) return;
+  const escaped = window.CSS && CSS.escape ? CSS.escape(snapshot.name || "") : snapshot.name;
+  const node = snapshot.id
+    ? document.getElementById(snapshot.id)
+    : document.querySelector(`[name="${escaped}"]`);
+  if (!node) return;
+  node.focus({ preventScroll: true });
+  if (typeof node.setSelectionRange === "function" && snapshot.start !== null) {
+    node.setSelectionRange(snapshot.start, snapshot.end);
+  }
+}
+
+function compatibleNodes(current, next) {
+  return current?.nodeType === next.nodeType
+    && (current.nodeType !== Node.ELEMENT_NODE || current.tagName === next.tagName);
+}
+
+function nodeKey(node) {
+  if (node?.nodeType !== Node.ELEMENT_NODE) return null;
+  const key = node.getAttribute("data-key") || node.id;
+  return key ? `${node.tagName}:${key}` : null;
+}
+
+function shouldPreserveControl(element, options) {
+  return options.preserveInteraction
+    && element.matches?.("input, textarea, select")
+    && (element === document.activeElement || element.form?.classList.contains("is-dirty"));
+}
+
+function morphAttributes(current, next, options, stats) {
+  const preserveControl = shouldPreserveControl(current, options);
+  const preserveOpen = current.tagName === "DETAILS" && current.open;
+  for (const attribute of [...current.attributes]) {
+    if ((preserveControl && ["value", "checked", "selected"].includes(attribute.name))
+      || (preserveOpen && attribute.name === "open")) continue;
+    if (!next.hasAttribute(attribute.name)) {
+      current.removeAttribute(attribute.name);
+      stats.attributes += 1;
+    }
+  }
+  for (const attribute of [...next.attributes]) {
+    if ((preserveControl && ["value", "checked", "selected"].includes(attribute.name))
+      || (preserveOpen && attribute.name === "open")) continue;
+    if (current.getAttribute(attribute.name) !== attribute.value) {
+      current.setAttribute(attribute.name, attribute.value);
+      stats.attributes += 1;
+    }
+  }
+  if (!preserveControl) {
+    if (current instanceof HTMLInputElement || current instanceof HTMLTextAreaElement) {
+      if (current.value !== next.value) current.value = next.value;
+      if (current instanceof HTMLInputElement) current.checked = next.checked;
+    } else if (current instanceof HTMLSelectElement && current.value !== next.value) {
+      current.value = next.value;
+    }
+  }
+  if (preserveOpen) current.open = true;
+}
+
+function morphNode(current, next, options, stats) {
+  if (!compatibleNodes(current, next)) {
+    const replacement = next.cloneNode(true);
+    current.replaceWith(replacement);
+    stats.replaced += 1;
+    return replacement;
+  }
+  if (current.nodeType === Node.TEXT_NODE || current.nodeType === Node.COMMENT_NODE) {
+    if (current.data !== next.data) {
+      current.data = next.data;
+      stats.text += 1;
+    }
+    return current;
+  }
+  morphAttributes(current, next, options, stats);
+  if (shouldPreserveControl(current, options)) return current;
+  if (current.matches("[data-preserve-contents]")) return current;
+
+  const oldChildren = [...current.childNodes];
+  const keyed = new Map(
+    oldChildren
+      .map((child) => [nodeKey(child), child])
+      .filter(([key]) => key)
+  );
+  const used = new Set();
+  const desired = [];
+  const nextChildren = [...next.childNodes];
+  for (let index = 0; index < nextChildren.length; index += 1) {
+    const nextChild = nextChildren[index];
+    const key = nodeKey(nextChild);
+    let match = key ? keyed.get(key) : null;
+    if (!match) {
+      const samePosition = oldChildren[index];
+      if (samePosition && !used.has(samePosition) && !nodeKey(samePosition)
+        && compatibleNodes(samePosition, nextChild)) {
+        match = samePosition;
+      }
+    }
+    if (!match) {
+      match = nextChild.cloneNode(true);
+      stats.added += 1;
+    } else {
+      morphNode(match, nextChild, options, stats);
+      used.add(match);
+    }
+    desired.push(match);
+  }
+
+  let cursor = current.firstChild;
+  for (const child of desired) {
+    if (child === cursor) {
+      cursor = cursor.nextSibling;
+    } else {
+      current.insertBefore(child, cursor);
+    }
+  }
+  for (const child of [...current.childNodes]) {
+    if (!desired.includes(child)) {
+      child.remove();
+      stats.removed += 1;
+    }
+  }
+  return current;
+}
+
+function reconcileElement(current, next, preserveInteraction = true) {
+  const stats = { added: 0, removed: 0, replaced: 0, text: 0, attributes: 0 };
+  morphNode(current, next, { preserveInteraction }, stats);
+  return stats;
+}
+
+function applyDocument(nextDocument, url, historyMode = "push", preserveFocus = false) {
+  const nextBody = nextDocument.getElementById("page-body");
+  const nextHeader = nextDocument.getElementById("app-header");
+  if (!nextBody || !nextHeader) {
+    window.location.href = url;
+    return false;
+  }
+  const focus = preserveFocus ? focusSnapshot() : null;
+  const currentBody = document.getElementById("page-body");
+  const currentHeader = document.getElementById("app-header");
+  const nextPath = new URL(url, window.location.href).pathname;
+  const sameView = nextPath === window.location.pathname;
+  let bodyPatch;
+  if (sameView) {
+    bodyPatch = reconcileElement(currentBody, nextBody, preserveFocus);
+  } else {
+    currentBody.replaceWith(nextBody);
+    bodyPatch = { fullNavigation: true };
+  }
+  const headerPatch = reconcileElement(currentHeader, nextHeader, true);
+  const nextTabs = nextDocument.querySelector(".tabs");
+  const tabs = document.querySelector(".tabs");
+  const tabsPatch = nextTabs && tabs ? reconcileElement(tabs, nextTabs, true) : {};
+  window.__ariatuiLastPatch = { body: bodyPatch, header: headerPatch, tabs: tabsPatch };
+  document.title = nextDocument.title;
+  document.body.dataset.autorefresh = nextDocument.body.dataset.autorefresh || "0";
+  if (historyMode === "push") history.pushState({}, "", url);
+  if (historyMode === "replace") history.replaceState({}, "", url);
+  restoreFocus(focus);
+  syncConditionalFields();
+  return true;
+}
+
+async function fetchDocument(url, options = {}) {
+  const headers = { "X-Requested-With": "AriaTUI-Reactive", ...(options.headers || {}) };
+  const response = await fetch(url, {
+    ...options,
+    credentials: "same-origin",
+    headers
+  });
+  const text = await response.text();
+  return {
+    response,
+    document: new DOMParser().parseFromString(text, "text/html")
+  };
+}
+
+async function navigate(url, historyMode = "push", preserveFocus = false) {
+  const epoch = ++requestEpoch;
+  if (navigationProgressEpoch) navigationProgressEpoch = epoch;
+  if (navigationController) navigationController.abort();
+  if (refreshController) refreshController.abort();
+  navigationController = new AbortController();
+  interactionInFlight = true;
+  const progressTimer = setTimeout(() => {
+    if (epoch === requestEpoch) {
+      navigationProgressEpoch = epoch;
+      setProgress(true);
+    }
+  }, 220);
+  try {
+    const result = await fetchDocument(url, { signal: navigationController.signal });
+    if (epoch !== requestEpoch) return;
+    const finalUrl = result.response.url || url;
+    if (applyDocument(result.document, finalUrl, historyMode, preserveFocus)) {
+      setSyncState("Live");
+    }
+  } catch (error) {
+    if (error.name !== "AbortError" && epoch === requestEpoch) {
+      setSyncState("Offline");
+      toast("Couldn’t reach AriaTUI. Your current view is still here.", "error");
+    }
+  } finally {
+    clearTimeout(progressTimer);
+    if (epoch === requestEpoch) {
+      interactionInFlight = false;
+    }
+    if (navigationProgressEpoch === epoch) {
+      navigationProgressEpoch = 0;
+      setProgress(false);
+    }
+  }
+}
+
+function formUrl(form) {
+  const url = new URL(form.action || window.location.href, window.location.href);
+  url.search = new URLSearchParams(new FormData(form)).toString();
+  return url.toString();
+}
+
+function syncConditionalFields() {
+  const pingMode = document.querySelector('[name="ping_mode"]');
+  const pingId = document.querySelector('[name="ping_id"]');
+  if (pingMode && pingId) {
+    const enabled = pingMode.value === "specific_id";
+    pingId.readOnly = !enabled;
+    pingId.setAttribute("aria-disabled", String(!enabled));
+    pingId.closest("label")?.classList.toggle("muted", !enabled);
+  }
+  const torrentMode = document.querySelector('[name="mode"][value="off"]:checked, select[name="mode"]');
+  if (torrentMode && torrentMode.closest('form[action="/torrents"]')) {
+    const off = torrentMode.value === "off";
+    for (const name of ["head_size_mib", "tail_size_mib"]) {
+      const field = document.querySelector(`[name="${name}"]`);
+      if (field) {
+        field.readOnly = off;
+        field.setAttribute("aria-disabled", String(off));
+      }
+    }
+  }
+}
+
+function parseSpeedInput(input) {
+  const value = input.trim();
+  if (value.toLowerCase() === "unlimited") {
+    return { bps: null, label: "Unlimited — no speed cap" };
+  }
+  const match = value.match(/^(\d+(?:\.\d+)?)\s*([a-zA-Z/ ._-]*)$/);
+  if (!match) return null;
+  const amount = Number(match[1]);
+  let suffix = match[2].toUpperCase().replace(/[ ._-]/g, "").replace(/\/S$/, "").replace(/PS$/, "");
+  const multipliers = {
+    "": 1, B: 1, BYTE: 1, BYTES: 1,
+    K: 1024, KB: 1024, KIB: 1024, KBYTE: 1024, KBYTES: 1024,
+    M: 1048576, MB: 1048576, MIB: 1048576,
+    G: 1073741824, GB: 1073741824, GIB: 1073741824
+  };
+  if (!Number.isFinite(amount) || amount < 0 || !(suffix in multipliers)) return null;
+  const bps = Math.round(amount * multipliers[suffix]);
+  const units = ["B/s", "KiB/s", "MiB/s", "GiB/s"];
+  let shown = bps;
+  let unit = 0;
+  while (shown >= 1024 && unit < units.length - 1) {
+    shown /= 1024;
+    unit += 1;
+  }
+  return { bps, label: `${shown >= 10 || unit === 0 ? shown.toFixed(0) : shown.toFixed(1)} ${units[unit]}` };
+}
+
+function selectedScheduleHours() {
+  return [...document.querySelectorAll("[data-schedule-hour].is-selected")];
+}
+
+function updateSchedulePreview() {
+  const input = document.getElementById("schedule-limit");
+  const preview = document.getElementById("schedule-limit-preview");
+  const graph = document.getElementById("schedule-graph");
+  if (!input || !preview || !graph) return;
+  const parsed = parseSpeedInput(input.value);
+  input.setCustomValidity(!parsed && input.value.trim() ? "Use a speed such as 500K, 10M, 25 MB/s, or unlimited." : "");
+  preview.classList.toggle("valid", Boolean(parsed));
+  preview.classList.toggle("invalid", !parsed && input.value.trim().length > 0);
+  preview.textContent = parsed
+    ? `${parsed.label} for ${selectedScheduleHours().length} selected hour${selectedScheduleHours().length === 1 ? "" : "s"}`
+    : input.value.trim()
+      ? "Try 500K, 10M, 25 MB/s, or unlimited."
+      : "Type a speed using K, M, MB/s, or “unlimited”.";
+  for (const hour of selectedScheduleHours()) {
+    const bar = hour.querySelector(".hour-bar");
+    if (!bar) continue;
+    if (!parsed) {
+      bar.style.setProperty("--bar-height", `${hour.dataset.originalLevel}%`);
+      continue;
+    }
+    const max = Math.max(Number(graph.dataset.maxBps) || 1, parsed.bps || 0);
+    const level = parsed.bps === null ? 100 : 18 + (parsed.bps / max * 72);
+    bar.style.setProperty("--bar-height", `${level}%`);
+  }
+}
+
+function setScheduleSelection(start, end) {
+  for (const hour of document.querySelectorAll("[data-schedule-hour]")) {
+    const value = Number(hour.dataset.scheduleHour);
+    const selected = start <= value && value <= end;
+    hour.classList.toggle("is-selected", selected);
+    hour.setAttribute("aria-pressed", String(selected));
+    if (!selected) {
+      hour.querySelector(".hour-bar")?.style.setProperty("--bar-height", `${hour.dataset.originalLevel}%`);
+    }
+  }
+}
+
+function clearScheduleSelection() {
+  for (const hour of selectedScheduleHours()) {
+    hour.classList.remove("is-selected");
+    hour.setAttribute("aria-pressed", "false");
+    hour.querySelector(".hour-bar")?.style.setProperty("--bar-height", `${hour.dataset.originalLevel}%`);
+  }
+}
+
+function closeScheduleEditor() {
+  const editor = document.getElementById("schedule-editor");
+  if (!editor) return;
+  if (typeof editor.hidePopover === "function" && editor.matches(":popover-open")) {
+    editor.hidePopover();
+  } else {
+    editor.classList.remove("open");
+  }
+  clearScheduleSelection();
+}
+
+function closeAppDialog() {
+  const dialog = document.getElementById("app-dialog");
+  if (dialog?.open) dialog.close();
+  const content = document.getElementById("dialog-content");
+  if (content) content.replaceChildren();
+}
+
+function updateAppDialog(nextDocument) {
+  const nextBody = nextDocument.getElementById("page-body");
+  const content = document.getElementById("dialog-content");
+  const title = document.getElementById("dialog-title");
+  if (!nextBody || !content || !title) return false;
+  content.innerHTML = nextBody.innerHTML;
+  const heading = content.querySelector("h1, h2");
+  title.textContent = heading?.textContent || nextDocument.title || "Edit";
+  heading?.closest(".page-heading")?.classList.add("dialog-page-heading");
+  syncConditionalFields();
+  requestAnimationFrame(() => content.querySelector("[autofocus], input:not([type=hidden]), select, button")?.focus());
+  return true;
+}
+
+async function openAppDialog(url, returnPath) {
+  const dialog = document.getElementById("app-dialog");
+  if (!dialog) {
+    navigate(url);
+    return;
+  }
+  const epoch = ++requestEpoch;
+  if (navigationController) navigationController.abort();
+  if (refreshController) refreshController.abort();
+  navigationController = new AbortController();
+  interactionInFlight = true;
+  setProgress(true);
+  setSyncState("Loading", true);
+  try {
+    const result = await fetchDocument(url, { signal: navigationController.signal });
+    if (epoch !== requestEpoch) return;
+    dialog.dataset.returnPath = returnPath || window.location.pathname;
+    if (updateAppDialog(result.document)) {
+      if (!dialog.open) dialog.showModal();
+      setSyncState("Live");
+    } else {
+      window.location.href = result.response.url || url;
+    }
+  } catch (error) {
+    if (error.name !== "AbortError" && epoch === requestEpoch) {
+      toast("Couldn’t open that editor.", "error");
+      setSyncState("Offline");
+    }
+  } finally {
+    if (epoch === requestEpoch) {
+      interactionInFlight = false;
+      setProgress(false);
+    }
+  }
+}
+
+function submitReorder(item, target, position) {
+  if (!item || !target || item === target) return;
+  const form = document.createElement("form");
+  form.method = "post";
+  form.action = item.dataset.reorderUrl;
+  form.hidden = true;
+  for (const [name, value] of [
+    ["source", item.dataset.reorderId],
+    ["target", target.dataset.reorderId],
+    ["position", position]
+  ]) {
+    const input = document.createElement("input");
+    input.name = name;
+    input.value = value;
+    form.appendChild(input);
+  }
+  if (position === "before") target.before(item);
+  else target.after(item);
+  document.body.appendChild(form);
+  form.requestSubmit();
+}
+
+function showScheduleEditor(start, end, x, y) {
+  const editor = document.getElementById("schedule-editor");
+  const input = document.getElementById("schedule-limit");
+  if (!editor || !input) return;
+  const low = Math.min(start, end);
+  const high = Math.max(start, end);
+  setScheduleSelection(low, high);
+  editor.querySelector('[name="start_hour"]').value = low;
+  editor.querySelector('[name="end_hour"]').value = high + 1;
+  const count = high - low + 1;
+  document.getElementById("schedule-selection-label").textContent =
+    `${String(low).padStart(2, "0")}:00–${String(high + 1).padStart(2, "0")}:00 · ${count} hour${count === 1 ? "" : "s"}`;
+  const selected = selectedScheduleHours();
+  const limits = new Set(selected.map((hour) => hour.dataset.limit));
+  input.value = limits.size === 1 ? selected[0].dataset.limit : "";
+  const left = Math.max(16, Math.min(window.innerWidth - 366, x - 175));
+  const top = Math.max(16, Math.min(window.innerHeight - 290, y + 14));
+  editor.style.left = `${left}px`;
+  editor.style.top = `${top}px`;
+  if (typeof editor.showPopover === "function") {
+    if (!editor.matches(":popover-open")) editor.showPopover();
+  } else {
+    editor.classList.add("open");
+  }
+  updateSchedulePreview();
+  requestAnimationFrame(() => input.focus());
+}
+
+document.addEventListener("pointerdown", (event) => {
+  const hour = event.target.closest("[data-schedule-hour]");
+  if (hour && event.button === 0) {
+    event.preventDefault();
+    const value = Number(hour.dataset.scheduleHour);
+    scheduleDrag = { start: value, end: value, x: event.clientX, y: event.clientY };
+    setScheduleSelection(value, value);
+    return;
+  }
+  if (!event.target.closest("#schedule-editor")) {
+    closeScheduleEditor();
+  }
+});
+
+document.addEventListener("pointermove", (event) => {
+  if (!scheduleDrag) return;
+  const hour = document.elementFromPoint(event.clientX, event.clientY)?.closest("[data-schedule-hour]");
+  if (!hour) return;
+  scheduleDrag.end = Number(hour.dataset.scheduleHour);
+  scheduleDrag.x = event.clientX;
+  scheduleDrag.y = event.clientY;
+  setScheduleSelection(
+    Math.min(scheduleDrag.start, scheduleDrag.end),
+    Math.max(scheduleDrag.start, scheduleDrag.end)
+  );
+});
+
+document.addEventListener("pointerup", () => {
+  if (!scheduleDrag) return;
+  showScheduleEditor(scheduleDrag.start, scheduleDrag.end, scheduleDrag.x, scheduleDrag.y);
+  scheduleDrag = undefined;
+});
+
+document.addEventListener("pointercancel", () => {
+  scheduleDrag = undefined;
+  clearScheduleSelection();
+});
+
+document.addEventListener("dragstart", (event) => {
+  const item = event.target.closest("[data-reorder-kind]");
+  if (!item) return;
+  draggedItem = item;
+  item.classList.add("is-dragging");
+  event.dataTransfer.effectAllowed = "move";
+  event.dataTransfer.setData("text/plain", item.dataset.reorderId);
+});
+
+document.addEventListener("dragover", (event) => {
+  if (!draggedItem) return;
+  const target = event.target.closest(`[data-reorder-kind="${draggedItem.dataset.reorderKind}"]`);
+  if (!target || target === draggedItem) return;
+  event.preventDefault();
+  const rect = target.getBoundingClientRect();
+  const position = event.clientY < rect.top + rect.height / 2 ? "before" : "after";
+  for (const item of document.querySelectorAll(".drop-before, .drop-after")) {
+    item.classList.remove("drop-before", "drop-after");
+  }
+  target.classList.add(position === "before" ? "drop-before" : "drop-after");
+});
+
+document.addEventListener("drop", (event) => {
+  if (!draggedItem) return;
+  const target = event.target.closest(`[data-reorder-kind="${draggedItem.dataset.reorderKind}"]`);
+  if (!target || target === draggedItem) return;
+  event.preventDefault();
+  const position = target.classList.contains("drop-before") ? "before" : "after";
+  submitReorder(draggedItem, target, position);
+});
+
+document.addEventListener("dragend", () => {
+  draggedItem?.classList.remove("is-dragging");
+  for (const item of document.querySelectorAll(".drop-before, .drop-after")) {
+    item.classList.remove("drop-before", "drop-after");
+  }
+  draggedItem = undefined;
+});
+
+document.addEventListener("click", (event) => {
+  if (event.target.matches?.("#app-dialog")) {
+    closeAppDialog();
+    return;
+  }
+  const dialogClose = event.target.closest("[data-dialog-close]");
+  if (dialogClose) {
+    closeAppDialog();
+    return;
+  }
+  const dialogLink = event.target.closest("a[data-dialog]");
+  if (dialogLink) {
+    event.preventDefault();
+    openAppDialog(dialogLink.href, dialogLink.dataset.dialogReturn || window.location.pathname);
+    return;
+  }
+  const linkInsideDialog = event.target.closest("#app-dialog a[href]");
+  if (linkInsideDialog) {
+    const dialog = document.getElementById("app-dialog");
+    const returnPath = new URL(dialog.dataset.returnPath || "/", window.location.href);
+    const destination = new URL(linkInsideDialog.href, window.location.href);
+    if (destination.pathname === returnPath.pathname) {
+      event.preventDefault();
+      closeAppDialog();
+      return;
+    }
+  }
+  const close = event.target.closest("[data-close-schedule]");
+  if (close) {
+    closeScheduleEditor();
+    return;
+  }
+  const preset = event.target.closest("[data-speed-preset]");
+  if (preset) {
+    const input = document.getElementById("schedule-limit");
+    if (input) {
+      input.value = preset.dataset.speedPreset;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.focus();
+    }
+    return;
+  }
+  const keyboardHour = event.target.closest("[data-schedule-hour]");
+  if (keyboardHour && event.detail === 0) {
+    const value = Number(keyboardHour.dataset.scheduleHour);
+    const rect = keyboardHour.getBoundingClientRect();
+    showScheduleEditor(value, value, rect.left + rect.width / 2, rect.bottom);
+    return;
+  }
+  const link = event.target.closest("a[href]");
+  if (!link || event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  if (link.target || link.hasAttribute("download")) return;
+  const url = new URL(link.href, window.location.href);
+  if (url.origin !== window.location.origin) return;
+  event.preventDefault();
+  navigate(url.toString());
+});
+
+document.addEventListener("submit", async (event) => {
+  const form = event.target;
+  if (!(form instanceof HTMLFormElement)) return;
+  event.preventDefault();
+  if (!form.reportValidity()) return;
+  const method = (form.method || "get").toUpperCase();
+  if (method === "GET") {
+    navigate(formUrl(form), "push", true);
+    return;
+  }
+
+  const button = event.submitter || form.querySelector('button[type="submit"], button:not([type])');
+  const dialog = form.closest("#app-dialog");
+  const row = form.closest(".download-item, tr");
+  const epoch = ++requestEpoch;
+  if (navigationController) navigationController.abort();
+  if (refreshController) refreshController.abort();
+  navigationController = new AbortController();
+  interactionInFlight = true;
+  button?.setAttribute("disabled", "");
+  button?.classList.add("is-busy");
+  row?.classList.add("is-busy");
+  setProgress(true);
+  setSyncState("Saving", true);
+  try {
+    const body = new URLSearchParams(new FormData(form));
+    const result = await fetchDocument(form.action || window.location.href, {
+      method,
+      body,
+      signal: navigationController.signal,
+      headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" }
+    });
+    if (epoch !== requestEpoch) return;
+    const finalUrl = result.response.url || window.location.href;
+    const finalPath = new URL(finalUrl, window.location.href).pathname;
+    const returnPath = dialog
+      ? new URL(dialog.dataset.returnPath || "/", window.location.href).pathname
+      : null;
+    if (dialog && finalPath !== returnPath) {
+      updateAppDialog(result.document);
+      setSyncState("Live");
+    } else if (applyDocument(result.document, finalUrl, "replace")) {
+      if (dialog) closeAppDialog();
+      setSyncState("Saved");
+      toast(form.action.endsWith("/logout") ? "Signed out" : "Updated");
+      setTimeout(() => setSyncState("Live"), 900);
+    }
+  } catch (error) {
+    if (error.name !== "AbortError" && epoch === requestEpoch) {
+      setSyncState("Offline");
+      toast("That change didn’t go through. Please try again.", "error");
+      button?.removeAttribute("disabled");
+      button?.classList.remove("is-busy");
+      row?.classList.remove("is-busy");
+    }
+  } finally {
+    if (epoch === requestEpoch) {
+      interactionInFlight = false;
+      setProgress(false);
+    }
+  }
+});
+
+document.addEventListener("input", (event) => {
+  if (event.target.id === "schedule-limit") {
+    updateSchedulePreview();
+  }
+  if (event.target.matches("[data-speed-input]")) {
+    const parsed = parseSpeedInput(event.target.value);
+    event.target.setCustomValidity(
+      !parsed && event.target.value.trim()
+        ? "Use a speed such as 500K, 10M, 25 MB/s, or unlimited."
+        : ""
+    );
+  }
+  const form = event.target.closest("form");
+  if (!form) return;
+  form.classList.add("is-dirty");
+  if (!form.matches("[data-live-form]")) return;
+  clearTimeout(liveFormTimer);
+  liveFormTimer = setTimeout(() => navigate(formUrl(form), "replace", true), 260);
+});
+
+document.addEventListener("change", (event) => {
+  const form = event.target.closest("form");
+  if (!form) return;
+  form.classList.add("is-dirty");
+  syncConditionalFields();
+  if (form.matches("[data-live-submit]")) {
+    form.requestSubmit();
+    return;
+  }
+  if (form.matches("[data-live-form]")) {
+    clearTimeout(liveFormTimer);
+    navigate(formUrl(form), "replace", true);
+  }
+});
+
+window.addEventListener("popstate", () => navigate(window.location.href, "none"));
+window.addEventListener("online", () => { setSyncState("Live"); subtleRefresh(); });
+window.addEventListener("offline", () => setSyncState("Offline"));
+window.addEventListener("wheel", () => pauseBackgroundRefresh(), { passive: true });
+window.addEventListener("pointerdown", () => pauseBackgroundRefresh(), { passive: true });
+window.addEventListener("touchstart", () => pauseBackgroundRefresh(), { passive: true });
+window.visualViewport?.addEventListener("resize", () => pauseBackgroundRefresh(1000));
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") closeScheduleEditor();
+  const handle = event.target.closest("[data-drag-handle]");
+  if (!handle || !["ArrowUp", "ArrowDown"].includes(event.key)) return;
+  event.preventDefault();
+  const item = handle.closest("[data-reorder-kind]");
+  const peers = [...document.querySelectorAll(`[data-reorder-kind="${item.dataset.reorderKind}"]`)];
+  const index = peers.indexOf(item);
+  const target = event.key === "ArrowUp" ? peers[index - 1] : peers[index + 1];
+  if (target) {
+    submitReorder(item, target, event.key === "ArrowUp" ? "before" : "after");
+  }
+});
+document.getElementById("app-dialog")?.addEventListener("close", () => {
+  document.getElementById("dialog-content")?.replaceChildren();
+});
+
 if (pairingStatus) {
   async function probeExistingSession() {
     try {
@@ -3323,35 +4655,43 @@ if (pairingStatus) {
 }
 
 async function subtleRefresh() {
+  if (refreshInFlight || interactionInFlight || draggedItem || document.hidden || Date.now() < refreshPausedUntil) return;
+  refreshInFlight = true;
+  const epoch = requestEpoch;
+  refreshController = new AbortController();
   try {
-    const response = await fetch(window.location.href, {
-      credentials: "same-origin",
-      headers: { "X-Requested-With": "AriaTUI-WebRefresh" }
-    });
-    const text = await response.text();
-    const doc = new DOMParser().parseFromString(text, "text/html");
+    const result = await fetchDocument(window.location.href, { signal: refreshController.signal });
+    if (epoch !== requestEpoch) return;
+    const doc = result.document;
     const nextHeader = doc.getElementById("app-header");
-    const nextBody = doc.getElementById("page-body");
     const currentHeader = document.getElementById("app-header");
-    const currentBody = document.getElementById("page-body");
-    if (!nextHeader || !nextBody || !currentHeader || !currentBody) {
+    if (!nextHeader || !currentHeader) {
       window.location.href = "/login";
       return;
     }
-    currentHeader.innerHTML = nextHeader.innerHTML;
-    currentBody.innerHTML = nextBody.innerHTML;
-  } catch (_) {
+    const editing = document.querySelector("form.is-dirty:not([data-live-form]), input:focus, textarea:focus, select:focus");
+    if (editing) {
+      const headerPatch = reconcileElement(currentHeader, nextHeader, true);
+      window.__ariatuiLastPatch = { body: { skipped: "editing" }, header: headerPatch };
+    } else {
+      applyDocument(doc, window.location.href, "none", true);
+    }
+    setSyncState("Live");
+  } catch (error) {
+    if (error.name !== "AbortError" && epoch === requestEpoch) {
+      setSyncState("Reconnecting");
+    }
+  } finally {
+    refreshInFlight = false;
+    refreshController = undefined;
   }
 }
 
 if (document.body.dataset.autorefresh === "1") {
-  setInterval(() => {
-    if (!document.querySelector("input:focus, textarea:focus, select:focus")) {
-      subtleRefresh();
-    }
-  }, 1500);
+  setInterval(subtleRefresh, 1800);
 }
-"#;
+syncConditionalFields();
+"##;
     script.replace(
         "__LOGIN_NEXT__",
         &serde_json::to_string(&normalize_next_path(login_next)).unwrap(),
@@ -3400,6 +4740,7 @@ mod tests {
             daemon_marker_file: runtime_dir.join(".daemon"),
             snapshot_cache_file: runtime_dir.join(".snapshot"),
             aria2_session_file: state_dir.join("aria2.session"),
+            retry_state_file: state_dir.join("retry-state.json"),
             user_service_dir: user_service_dir.clone(),
             user_service_file: user_service_dir.join("ariatui-daemon.service"),
             system_service_file: root.join("ariatui-daemon.service"),
@@ -3426,6 +4767,127 @@ mod tests {
     async fn response_json(response: Response) -> serde_json::Value {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn response_text(response: Response) -> String {
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn current_page_renders_reactive_accessible_app_shell() {
+        let state = test_state("reactive-shell").await;
+        let app = router(state.clone());
+        let token = issue_session_cookie_value(state.as_ref(), 30)
+            .await
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/current")
+                    .header(header::COOKIE, format!("{AUTH_COOKIE_NAME}={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response_text(response).await;
+        assert!(html.contains(r#"class="app-shell""#));
+        assert!(html.contains(r#"aria-label="Main navigation""#));
+        assert!(html.contains(r#"data-live-form"#));
+        assert!(!html.contains("startViewTransition"));
+        assert!(html.contains("aria-live=\"polite\""));
+        assert!(html.contains(r#"class="speed-control""#));
+        assert!(html.contains("color-scheme: dark"));
+        assert!(html.contains("function reconcileElement"));
+        assert!(html.contains("const sameView = nextPath === window.location.pathname"));
+        assert!(!html.contains("currentHeader.replaceWith(nextHeader)"));
+        let navigate_script = html
+            .split("async function navigate")
+            .nth(1)
+            .unwrap()
+            .split("function formUrl")
+            .next()
+            .unwrap();
+        assert!(navigate_script.contains("}, 220);"));
+        assert!(!navigate_script.contains("setSyncState(\"Loading\""));
+        assert!(!html.contains(">Apply</button>"));
+    }
+
+    #[tokio::test]
+    async fn scheduler_page_renders_direct_manipulation_timeline() {
+        let state = test_state("schedule-timeline").await;
+        let app = router(state.clone());
+        let token = issue_session_cookie_value(state.as_ref(), 30)
+            .await
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/scheduler")
+                    .header(header::COOKIE, format!("{AUTH_COOKIE_NAME}={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response_text(response).await;
+        assert_eq!(html.matches("data-schedule-hour=").count(), 24);
+        assert!(html.contains(r#"popover="manual""#));
+        assert!(html.contains("Drag across hours"));
+        assert!(html.contains("Follow schedule"));
+        assert!(html.contains("Unlimited for now"));
+        assert!(!html.contains("<th>Start</th>"));
+    }
+
+    #[test]
+    fn queue_items_use_dialogs_and_direct_drag_ordering() {
+        let mut snapshot = Snapshot::empty(
+            "socket".into(),
+            "state".into(),
+            "config".into(),
+            "binary".into(),
+            "build".into(),
+        );
+        snapshot.current_downloads = ["first", "second"]
+            .into_iter()
+            .map(|gid| DownloadItem {
+                gid: gid.into(),
+                status: DownloadStatus::Waiting,
+                name: format!("{gid}.iso"),
+                primary_path: None,
+                source_uri: None,
+                info_hash: None,
+                num_seeders: None,
+                followed_by: Vec::new(),
+                belongs_to: None,
+                is_metadata_only: false,
+                total_bytes: 100,
+                completed_bytes: 10,
+                download_speed_bps: 0,
+                realtime_download_speed_bps: 0,
+                upload_speed_bps: 0,
+                eta_seconds: None,
+                connections: None,
+                error_code: None,
+                error_message: None,
+            })
+            .collect();
+        let query = CurrentListQuery::from_query(&ItemQuery::default());
+
+        let html = render_current_page(&snapshot, &query, None, None, true);
+
+        assert_eq!(html.matches(r#"data-reorder-kind="download""#).count(), 2);
+        assert!(html.contains(r#"data-dialog-return="/current"#));
+        assert!(html.contains(r#"id="app-dialog""#));
+        assert!(!html.contains("Move up"));
+        assert!(!html.contains("Move down"));
     }
 
     #[tokio::test]
