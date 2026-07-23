@@ -102,6 +102,7 @@ pub struct DaemonState {
     pub web_pairings: Mutex<HashMap<String, WebPairing>>,
     pub web_sessions: Mutex<HashMap<String, Instant>>,
     pub web_revoked_sessions: Mutex<HashMap<String, Instant>>,
+    pub qbt_categories: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +152,7 @@ impl DaemonState {
             web_pairings: Mutex::new(HashMap::new()),
             web_sessions: Mutex::new(HashMap::new()),
             web_revoked_sessions: Mutex::new(HashMap::new()),
+            qbt_categories: Mutex::new(HashMap::new()),
         })
     }
 

@@ -438,8 +438,8 @@ fn draw_webhooks(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
 fn draw_torrents(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
     let mode_label = match app.snapshot.torrents.mode {
         TorrentStreamingMode::Off => "off",
-        TorrentStreamingMode::StartFirst => "start first",
-        TorrentStreamingMode::StartAndEndFirst => "start + end first",
+        TorrentStreamingMode::StartFirst => "sequential read",
+        TorrentStreamingMode::StartAndEndFirst => "sequential read + tail hint",
     };
     let rows = app
         .snapshot
@@ -470,9 +470,9 @@ fn draw_torrents(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
         .collect::<Vec<_>>();
     let body = vec![
         Line::from(format!("Engine: {}", app.snapshot.torrents.engine)),
-        Line::from(format!("Streaming mode: {mode_label}")),
+        Line::from(format!("Media mode: {mode_label}")),
         Line::from(format!(
-            "Start-first size: {} MiB",
+            "Sequential buffer hint: {} MiB",
             app.snapshot.torrents.head_size_mib
         )),
         Line::from(format!(
@@ -481,7 +481,7 @@ fn draw_torrents(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
         )),
         Line::from("This applies to new magnet and .torrent downloads only."),
         Line::from("Magnets and remote .torrent files use librqbit, not aria2."),
-        Line::from("Start-first mode prioritizes the first file for sequential media playback."),
+        Line::from("Sequential mode reads files left-to-right through librqbit streaming reads."),
         Line::from("Press Space to cycle mode quickly. Press Enter or e to edit sizes."),
     ];
     let layout = Layout::default()
@@ -786,11 +786,11 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
                 .split(popup);
             let mode_label = match form.mode {
                 TorrentStreamingMode::Off => "off",
-                TorrentStreamingMode::StartFirst => "start first",
-                TorrentStreamingMode::StartAndEndFirst => "start + end first",
+                TorrentStreamingMode::StartFirst => "sequential read",
+                TorrentStreamingMode::StartAndEndFirst => "sequential read + tail hint",
             };
             frame.render_widget(
-                Paragraph::new("Configure librqbit defaults for new magnet and .torrent downloads. Start-first mode prioritizes the first file for sequential media playback.")
+                Paragraph::new("Configure librqbit defaults for new magnet and .torrent downloads. Sequential mode reads files left-to-right through librqbit streaming reads.")
                     .block(bordered("Torrent Settings"))
                     .style(Style::default().bg(Color::Black))
                     .wrap(Wrap { trim: false }),
@@ -821,10 +821,10 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
                         let value = match form.mode {
                             TorrentStreamingMode::Off => "standard torrent download".to_string(),
                             TorrentStreamingMode::StartFirst => {
-                                format!("prioritize first file, head hint {head} MiB")
+                                format!("sequential-read bias, buffer hint {head} MiB")
                             }
                             TorrentStreamingMode::StartAndEndFirst => {
-                                format!("prioritize first file, head/tail hints {head}/{tail} MiB")
+                                format!("sequential-read bias, head/tail hints {head}/{tail} MiB")
                             }
                         };
                         (value, Color::Green)

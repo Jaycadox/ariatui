@@ -1,4 +1,9 @@
-use std::{num::NonZeroU32, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashSet,
+    num::NonZeroU32,
+    path::PathBuf,
+    sync::{Arc, RwLock},
+};
 
 use color_eyre::eyre::{Context, Result, eyre};
 use librqbit::{
@@ -23,6 +28,7 @@ const PIECE_MAP_LIMIT: usize = 160;
 pub struct TorrentEngine {
     session: Arc<Session>,
     api: Api,
+    sequential_torrents: RwLock<HashSet<String>>,
 }
 
 impl std::fmt::Debug for TorrentEngine {
@@ -66,7 +72,11 @@ impl TorrentEngine {
         .await
         .map_err(|error| eyre!("failed to start torrent engine: {error:#}"))?;
         let api = Api::new(session.clone(), None);
-        Ok(Self { session, api })
+        Ok(Self {
+            session,
+            api,
+            sequential_torrents: RwLock::new(HashSet::new()),
+        })
     }
 
     pub fn gid(id: usize) -> String {
@@ -111,7 +121,50 @@ impl TorrentEngine {
             .into_handle()
             .ok_or_else(|| eyre!("torrent was not added"))?;
         if sequential {
-            self.prefer_first_file(handle.id()).await;
+            self.sequential_torrents
+                .write()
+                .expect("sequential torrent lock poisoned")
+                .insert(handle.info_hash().as_string());
+            self.spawn_sequential_reader(handle.clone());
+        }
+        Ok(Self::gid(handle.id()))
+    }
+
+    pub async fn add_bytes(
+        &self,
+        bytes: Vec<u8>,
+        output_folder: PathBuf,
+        limit_bps: Option<u64>,
+        sequential: bool,
+    ) -> Result<String> {
+        tokio::fs::create_dir_all(&output_folder)
+            .await
+            .wrap_err_with(|| format!("failed to create {}", output_folder.display()))?;
+        let response = self
+            .session
+            .add_torrent(
+                AddTorrent::from_bytes(bytes),
+                Some(AddTorrentOptions {
+                    overwrite: true,
+                    output_folder: Some(output_folder.display().to_string()),
+                    ratelimits: LimitsConfig {
+                        download_bps: limit_bps.and_then(nonzero_u32),
+                        upload_bps: None,
+                    },
+                    ..AddTorrentOptions::default()
+                }),
+            )
+            .await
+            .map_err(|error| eyre!("failed to add torrent: {error:#}"))?;
+        let handle = response
+            .into_handle()
+            .ok_or_else(|| eyre!("torrent was not added"))?;
+        if sequential {
+            self.sequential_torrents
+                .write()
+                .expect("sequential torrent lock poisoned")
+                .insert(handle.info_hash().as_string());
+            self.spawn_sequential_reader(handle.clone());
         }
         Ok(Self::gid(handle.id()))
     }
@@ -144,6 +197,30 @@ impl TorrentEngine {
         self.session
             .ratelimits
             .set_download_bps(limit_bps.and_then(nonzero_u32));
+    }
+
+    pub fn set_sequential_by_hash(&self, hash: &str, enabled: bool) {
+        if enabled {
+            self.sequential_torrents
+                .write()
+                .expect("sequential torrent lock poisoned")
+                .insert(hash.to_string());
+            if let Some(handle) = self.session.with_torrents(|torrents| {
+                for (_, handle) in torrents {
+                    if handle.info_hash().as_string().eq_ignore_ascii_case(hash) {
+                        return Some(handle.clone());
+                    }
+                }
+                None
+            }) {
+                self.spawn_sequential_reader(handle);
+            }
+        } else {
+            self.sequential_torrents
+                .write()
+                .expect("sequential torrent lock poisoned")
+                .remove(hash);
+        }
     }
 
     pub fn snapshot(&self) -> Vec<TorrentDownloadSnapshot> {
@@ -194,6 +271,11 @@ impl TorrentEngine {
                             .collect()
                     })
                     .unwrap_or_default();
+                let sequential_download = self
+                    .sequential_torrents
+                    .read()
+                    .expect("sequential torrent lock poisoned")
+                    .contains(torrent.info_hash.as_str());
                 Some(TorrentDownloadSnapshot {
                     gid: Self::gid(id),
                     id,
@@ -224,6 +306,7 @@ impl TorrentEngine {
                         .unwrap_or(0),
                     peer_ips,
                     piece_map,
+                    sequential_download,
                     files,
                 })
             })
@@ -265,22 +348,24 @@ impl TorrentEngine {
             .ok_or_else(|| eyre!("torrent not found: {gid}"))
     }
 
-    async fn prefer_first_file(&self, id: usize) {
-        let Some(handle) = self.session.get(TorrentIdOrHash::Id(id)) else {
-            return;
-        };
-        if handle.wait_until_initialized().await.is_err() {
-            return;
-        }
+    fn spawn_sequential_reader(&self, handle: Arc<ManagedTorrent>) {
         tokio::spawn(async move {
-            let Ok(mut stream) = handle.clone().stream(0) else {
+            if handle.wait_until_initialized().await.is_err() {
                 return;
-            };
-            let mut buf = [0u8; 64 * 1024];
-            loop {
-                match stream.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
+            }
+            let file_count = handle
+                .with_metadata(|metadata| metadata.file_infos.len())
+                .unwrap_or(0);
+            for file_id in 0..file_count {
+                let Ok(mut stream) = handle.clone().stream(file_id) else {
+                    continue;
+                };
+                let mut buf = [0u8; 256 * 1024];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
                 }
             }
         });

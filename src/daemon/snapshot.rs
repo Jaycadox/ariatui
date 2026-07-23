@@ -102,6 +102,7 @@ pub struct TorrentDownloadSnapshot {
     pub queued_peers: usize,
     pub peer_ips: Vec<String>,
     pub piece_map: String,
+    pub sequential_download: bool,
     pub files: Vec<TorrentFileSnapshot>,
 }
 
@@ -123,6 +124,7 @@ impl Default for TorrentDownloadSnapshot {
             queued_peers: 0,
             peer_ips: Vec::new(),
             piece_map: String::new(),
+            sequential_download: false,
             files: Vec::new(),
         }
     }

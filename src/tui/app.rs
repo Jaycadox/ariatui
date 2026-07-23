@@ -664,10 +664,9 @@ impl UiApp {
                 KeyCode::Char(' ') => form.cycle_mode(),
                 KeyCode::Enter => {
                     let (mode, head_size_mib, tail_size_mib) = form.values();
-                    let head_size_mib = head_size_mib
-                        .trim()
-                        .parse::<u32>()
-                        .map_err(|_| eyre!("start-first size must be a whole number of MiB"))?;
+                    let head_size_mib = head_size_mib.trim().parse::<u32>().map_err(|_| {
+                        eyre!("sequential buffer hint must be a whole number of MiB")
+                    })?;
                     let tail_size_mib = tail_size_mib
                         .trim()
                         .parse::<u32>()

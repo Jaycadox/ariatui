@@ -15,7 +15,7 @@ It provides:
 - regex-based download routing rules
 - Discord webhook notifications
 - an optional browser-facing web UI with PIN pairing and signed session cookies
-- torrent and magnet support through `librqbit`, including start-first media mode
+- torrent and magnet support through `librqbit`, including sequential-read media mode
 - a Firefox extension for sending downloads to the web UI
 
 ## Run

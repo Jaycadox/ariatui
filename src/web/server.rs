@@ -1,7 +1,8 @@
-use std::fmt::Write as _;
+use std::{collections::HashMap, fmt::Write as _, path::PathBuf};
 
 use axum::{
     Form, Json, Router,
+    extract::Multipart,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
@@ -29,6 +30,7 @@ use crate::{
         history_visible_items,
     },
     routing::{DownloadRoutingRule, describe_directory_input, match_rule, validate_rule},
+    schedule,
     state::{
         CancelBehaviorPreference, ManualOrScheduled, TorrentStreamingMode,
         validate_torrent_size_mib,
@@ -56,6 +58,36 @@ pub fn router(state: SharedDaemonState) -> Router {
         .route("/api/pairings/{request_id}", get(api_pairing_status))
         .route("/api/session", get(api_session).delete(api_delete_session))
         .route("/api/downloads", post(api_add_download))
+        .route("/api/v2/auth/login", post(qbt_login))
+        .route("/api/v2/auth/logout", post(qbt_logout))
+        .route("/api/v2/app/version", get(qbt_app_version))
+        .route("/api/v2/app/webapiVersion", get(qbt_webapi_version))
+        .route("/api/v2/app/preferences", get(qbt_preferences))
+        .route("/api/v2/app/defaultSavePath", get(qbt_default_save_path))
+        .route("/api/v2/transfer/info", get(qbt_transfer_info))
+        .route("/api/v2/sync/maindata", get(qbt_sync_maindata))
+        .route("/api/v2/torrents/categories", get(qbt_torrent_categories))
+        .route("/api/v2/torrents/createCategory", post(qbt_create_category))
+        .route("/api/v2/torrents/editCategory", post(qbt_create_category))
+        .route(
+            "/api/v2/torrents/removeCategories",
+            post(qbt_remove_categories),
+        )
+        .route("/api/v2/torrents/tags", get(qbt_torrent_tags))
+        .route("/api/v2/torrents/createTags", post(qbt_ok))
+        .route("/api/v2/torrents/deleteTags", post(qbt_ok))
+        .route(
+            "/api/v2/torrents/info",
+            get(qbt_torrents_info).post(qbt_torrents_info),
+        )
+        .route("/api/v2/torrents/add", post(qbt_torrents_add))
+        .route("/api/v2/torrents/delete", post(qbt_torrents_delete))
+        .route("/api/v2/torrents/pause", post(qbt_torrents_pause))
+        .route("/api/v2/torrents/resume", post(qbt_torrents_resume))
+        .route(
+            "/api/v2/torrents/toggleSequentialDownload",
+            post(qbt_toggle_sequential_download),
+        )
         .route("/current", get(current_page))
         .route("/current/pause-all", post(pause_all_downloads))
         .route("/current/resume-all", post(resume_all_downloads))
@@ -538,6 +570,299 @@ async fn api_delete_session(
         }
         None => ApiErrorResponse::unauthorized("authentication required").into_response(),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct QbtHashForm {
+    hashes: String,
+    #[serde(default, rename = "deleteFiles")]
+    delete_files: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QbtCategoryForm {
+    category: String,
+    #[serde(default, rename = "savePath")]
+    save_path: Option<String>,
+    #[serde(default)]
+    categories: Option<String>,
+}
+
+async fn qbt_login(jar: CookieJar) -> impl IntoResponse {
+    let cookie = Cookie::build(("SID", "ariatui-qbt"))
+        .path("/")
+        .same_site(SameSite::Lax)
+        .http_only(true)
+        .build();
+    (jar.add(cookie), "Ok.")
+}
+
+async fn qbt_logout(jar: CookieJar) -> impl IntoResponse {
+    let cookie = Cookie::build(("SID", "")).path("/").build();
+    (jar.remove(cookie), "Ok.")
+}
+
+async fn qbt_app_version() -> &'static str {
+    "v4.6.7"
+}
+
+async fn qbt_webapi_version() -> &'static str {
+    "2.8.3"
+}
+
+async fn qbt_preferences(State(state): State<SharedDaemonState>) -> impl IntoResponse {
+    let app_state = state.app.state.read().await;
+    Json(serde_json::json!({
+        "save_path": expand_tilde_web(&app_state.default_download_dir).display().to_string(),
+        "temp_path_enabled": false,
+        "auto_tmm_enabled": false,
+        "create_subfolder_enabled": false,
+        "start_paused_enabled": false,
+        "preallocate_all": false,
+        "incomplete_files_ext": false,
+    }))
+}
+
+async fn qbt_default_save_path(State(state): State<SharedDaemonState>) -> String {
+    let app_state = state.app.state.read().await;
+    expand_tilde_web(&app_state.default_download_dir)
+        .display()
+        .to_string()
+}
+
+async fn qbt_transfer_info(State(state): State<SharedDaemonState>) -> impl IntoResponse {
+    let snapshot = state.snapshot().await;
+    Json(serde_json::json!({
+        "dl_info_speed": snapshot.global.download_speed_bps,
+        "dl_info_data": 0,
+        "up_info_speed": snapshot.global.upload_speed_bps,
+        "up_info_data": 0,
+        "dl_rate_limit": snapshot.scheduler.effective_limit_bps.unwrap_or(0),
+        "up_rate_limit": 0,
+        "dht_nodes": 0,
+        "connection_status": "connected",
+        "queueing": false,
+        "use_alt_speed_limits": false,
+        "refresh_interval": 1500,
+    }))
+}
+
+async fn qbt_sync_maindata(
+    State(state): State<SharedDaemonState>,
+    Query(_query): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let snapshot = state.snapshot().await;
+    Json(serde_json::json!({
+        "rid": 1,
+        "full_update": true,
+        "torrents": qbt_torrent_map(&snapshot),
+        "torrents_removed": [],
+        "categories": {},
+        "categories_removed": [],
+        "tags": [],
+        "tags_removed": [],
+        "server_state": {
+            "dl_info_speed": snapshot.global.download_speed_bps,
+            "up_info_speed": snapshot.global.upload_speed_bps,
+            "connection_status": "connected",
+            "queueing": false,
+            "refresh_interval": 1500,
+            "free_space_on_disk": -1,
+        }
+    }))
+}
+
+async fn qbt_torrent_categories(State(state): State<SharedDaemonState>) -> impl IntoResponse {
+    let app_state = state.app.state.read().await;
+    let save_path = expand_tilde_web(&app_state.default_download_dir)
+        .display()
+        .to_string();
+    drop(app_state);
+    let mut categories = state.qbt_categories.lock().await.clone();
+    for name in ["sonarr", "radarr", "prowlarr", "tv", "movies"] {
+        categories
+            .entry(name.into())
+            .or_insert_with(|| save_path.clone());
+    }
+    Json(qbt_categories_json(&categories))
+}
+
+async fn qbt_create_category(
+    State(state): State<SharedDaemonState>,
+    Form(form): Form<QbtCategoryForm>,
+) -> impl IntoResponse {
+    let mut categories = state.qbt_categories.lock().await;
+    let save_path = form
+        .save_path
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            state
+                .snapshot
+                .blocking_read()
+                .routing
+                .default_download_dir
+                .clone()
+        });
+    categories.insert(
+        form.category.trim().to_string(),
+        expand_tilde_web(&save_path).display().to_string(),
+    );
+    "Ok."
+}
+
+async fn qbt_remove_categories(
+    State(state): State<SharedDaemonState>,
+    Form(form): Form<QbtCategoryForm>,
+) -> impl IntoResponse {
+    let mut categories = state.qbt_categories.lock().await;
+    if let Some(values) = form.categories.as_deref() {
+        for category in values.split('\n').flat_map(|value| value.split('|')) {
+            categories.remove(category.trim());
+        }
+    } else {
+        categories.remove(form.category.trim());
+    }
+    "Ok."
+}
+
+async fn qbt_torrent_tags() -> impl IntoResponse {
+    Json(Vec::<String>::new())
+}
+
+async fn qbt_ok() -> impl IntoResponse {
+    "Ok."
+}
+
+async fn qbt_torrents_info(State(state): State<SharedDaemonState>) -> impl IntoResponse {
+    Json(qbt_torrent_list(&state.snapshot().await))
+}
+
+async fn qbt_torrents_add(
+    State(state): State<SharedDaemonState>,
+    mut multipart: Multipart,
+) -> Response {
+    let mut urls = Vec::new();
+    let mut files = Vec::new();
+    let mut savepath = None;
+    let mut sequential = true;
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or_default().to_string();
+        match name.as_str() {
+            "urls" => {
+                if let Ok(value) = field.text().await {
+                    urls.extend(
+                        value
+                            .lines()
+                            .map(str::trim)
+                            .filter(|v| !v.is_empty())
+                            .map(str::to_string),
+                    );
+                }
+            }
+            "torrents" => {
+                if let Ok(bytes) = field.bytes().await {
+                    files.push(bytes.to_vec());
+                }
+            }
+            "savepath" => {
+                if let Ok(value) = field.text().await
+                    && !value.trim().is_empty()
+                {
+                    savepath = Some(PathBuf::from(value.trim()));
+                }
+            }
+            "sequentialDownload" => {
+                if let Ok(value) = field.text().await {
+                    sequential = parse_qbt_bool(&value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let app_state = state.app.state.read().await.clone();
+    let limit = schedule::resolve(Local::now(), &app_state)
+        .map(|resolved| resolved.effective_limit_bps)
+        .unwrap_or(None);
+    let output = savepath.unwrap_or_else(|| expand_tilde_web(&app_state.default_download_dir));
+
+    for url in urls {
+        if let Err(error) = state
+            .torrent_engine
+            .add_url(&url, output.clone(), limit, sequential)
+            .await
+        {
+            return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+        }
+    }
+    for file in files {
+        if let Err(error) = state
+            .torrent_engine
+            .add_bytes(file, output.clone(), limit, sequential)
+            .await
+        {
+            return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+        }
+    }
+    let _ = state.perform_refresh().await;
+    "Ok.".into_response()
+}
+
+async fn qbt_torrents_delete(
+    State(state): State<SharedDaemonState>,
+    Form(form): Form<QbtHashForm>,
+) -> impl IntoResponse {
+    let snapshot = state.snapshot().await;
+    for item in qbt_select_torrents(&snapshot, &form.hashes) {
+        let _ = state
+            .execute(ApiRequest::Cancel {
+                gid: item.gid,
+                delete_files: form.delete_files.unwrap_or(false),
+            })
+            .await;
+    }
+    "Ok."
+}
+
+async fn qbt_torrents_pause(
+    State(state): State<SharedDaemonState>,
+    Form(form): Form<QbtHashForm>,
+) -> impl IntoResponse {
+    let snapshot = state.snapshot().await;
+    for item in qbt_select_torrents(&snapshot, &form.hashes) {
+        let _ = state
+            .execute(ApiRequest::Pause {
+                gid: item.gid,
+                force: true,
+            })
+            .await;
+    }
+    "Ok."
+}
+
+async fn qbt_torrents_resume(
+    State(state): State<SharedDaemonState>,
+    Form(form): Form<QbtHashForm>,
+) -> impl IntoResponse {
+    let snapshot = state.snapshot().await;
+    for item in qbt_select_torrents(&snapshot, &form.hashes) {
+        let _ = state.execute(ApiRequest::Resume { gid: item.gid }).await;
+    }
+    "Ok."
+}
+
+async fn qbt_toggle_sequential_download(
+    State(state): State<SharedDaemonState>,
+    Form(form): Form<QbtHashForm>,
+) -> impl IntoResponse {
+    let snapshot = state.snapshot().await;
+    for item in qbt_select_torrents(&snapshot, &form.hashes) {
+        state
+            .torrent_engine
+            .set_sequential_by_hash(&item.info_hash, !item.sequential_download);
+    }
+    "Ok."
 }
 
 async fn api_add_download(
@@ -2858,19 +3183,19 @@ fn render_torrents_page(snapshot: &Snapshot, error: Option<&str>) -> String {
 <h2>Torrents</h2>
 <p>Engine: <code>{}</code></p>
 <p class="muted">These defaults apply only to new magnet and remote .torrent downloads.</p>
-<p class="muted">Magnets and remote .torrent files are handled by librqbit. Start-first mode prioritizes the first file for sequential media playback.</p>
+<p class="muted">Magnets and remote .torrent files are handled by librqbit. Sequential mode reads files left-to-right through librqbit streaming reads.</p>
 <form method="post" action="/torrents" class="stack">
 <label>Mode</label>
 <select name="mode">
 <option value="off" {}>Off</option>
-<option value="start_first" {}>Start first</option>
-<option value="start_and_end_first" {}>Start and end first</option>
+<option value="start_first" {}>Sequential read</option>
+<option value="start_and_end_first" {}>Sequential read + tail hint</option>
 </select>
-<label>Start-first size (MiB)</label>
+<label>Sequential buffer hint (MiB)</label>
 <input type="number" name="head_size_mib" min="1" max="8192" value="{}">
 <label>End-first size (MiB)</label>
 <input type="number" name="tail_size_mib" min="1" max="8192" value="{}">
-<p class="muted">Typical values: start first 32 MiB, end first 4 MiB.</p>
+<p class="muted">Typical values: sequential read 32 MiB, end first 4 MiB.</p>
 <div class="actions"><button type="submit" class="primary">Save settings</button></div>
 </form>
 </section>
@@ -2931,6 +3256,125 @@ fn format_peer_ips(peer_ips: &[String]) -> String {
     } else {
         peer_ips.join(", ")
     }
+}
+
+fn qbt_torrent_list(snapshot: &Snapshot) -> Vec<serde_json::Value> {
+    snapshot
+        .torrents
+        .downloads
+        .iter()
+        .map(qbt_torrent_json)
+        .collect()
+}
+
+fn qbt_torrent_map(snapshot: &Snapshot) -> serde_json::Map<String, serde_json::Value> {
+    snapshot
+        .torrents
+        .downloads
+        .iter()
+        .map(|torrent| (torrent.info_hash.clone(), qbt_torrent_json(torrent)))
+        .collect()
+}
+
+fn qbt_categories_json(categories: &HashMap<String, String>) -> serde_json::Value {
+    let mut response = serde_json::Map::new();
+    for (name, save_path) in categories {
+        response.insert(
+            name.clone(),
+            serde_json::json!({
+                "name": name,
+                "savePath": save_path,
+            }),
+        );
+    }
+    serde_json::Value::Object(response)
+}
+
+fn qbt_torrent_json(
+    torrent: &crate::daemon::snapshot::TorrentDownloadSnapshot,
+) -> serde_json::Value {
+    let progress = if torrent.total_bytes > 0 {
+        torrent.completed_bytes as f64 / torrent.total_bytes as f64
+    } else {
+        0.0
+    };
+    serde_json::json!({
+        "hash": torrent.info_hash,
+        "name": torrent.name,
+        "state": qbt_state(&torrent.status),
+        "progress": progress,
+        "size": torrent.total_bytes,
+        "completed": torrent.completed_bytes,
+        "downloaded": torrent.completed_bytes,
+        "uploaded": 0,
+        "dlspeed": torrent.download_speed_bps,
+        "upspeed": torrent.upload_speed_bps,
+        "num_seeds": torrent.live_peers,
+        "num_complete": torrent.live_peers,
+        "num_leechs": 0,
+        "num_incomplete": 0,
+        "save_path": torrent.output_folder,
+        "content_path": torrent.output_folder,
+        "category": "",
+        "tags": "",
+        "seq_dl": torrent.sequential_download,
+        "f_l_piece_prio": false,
+        "eta": -1,
+        "ratio": 0.0,
+        "priority": 0,
+        "added_on": 0,
+        "completion_on": if torrent.status == DownloadStatus::Complete { 1 } else { 0 },
+    })
+}
+
+fn qbt_select_torrents(
+    snapshot: &Snapshot,
+    hashes: &str,
+) -> Vec<crate::daemon::snapshot::TorrentDownloadSnapshot> {
+    if hashes == "all" {
+        return snapshot.torrents.downloads.clone();
+    }
+    let wanted = hashes
+        .split('|')
+        .map(str::trim)
+        .filter(|hash| !hash.is_empty())
+        .collect::<Vec<_>>();
+    snapshot
+        .torrents
+        .downloads
+        .iter()
+        .filter(|torrent| {
+            wanted
+                .iter()
+                .any(|hash| hash.eq_ignore_ascii_case(&torrent.info_hash))
+        })
+        .cloned()
+        .collect()
+}
+
+fn qbt_state(status: &DownloadStatus) -> &'static str {
+    match status {
+        DownloadStatus::Active => "downloading",
+        DownloadStatus::Waiting => "queuedDL",
+        DownloadStatus::Paused => "pausedDL",
+        DownloadStatus::Complete => "uploading",
+        DownloadStatus::Error => "error",
+        DownloadStatus::Removed => "missingFiles",
+        DownloadStatus::Unknown => "unknown",
+    }
+}
+
+fn parse_qbt_bool(value: &str) -> bool {
+    matches!(value.trim(), "true" | "1" | "on" | "yes")
+}
+
+fn expand_tilde_web(value: &str) -> PathBuf {
+    if let Some(stripped) = value.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(stripped);
+    }
+    PathBuf::from(value)
 }
 
 fn render_limit_editor_page(
