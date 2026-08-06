@@ -233,6 +233,10 @@ pub struct ResolvedHttpUrl {
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum ApiPayload {
     ResolvedHttpUrl(ResolvedHttpUrl),
+    Download {
+        download: DownloadItem,
+        created: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -247,6 +251,17 @@ pub enum ApiRequest {
         url: String,
         #[serde(default)]
         filename: Option<String>,
+    },
+    AddDownload {
+        url: String,
+        #[serde(default)]
+        filename: Option<String>,
+        #[serde(default)]
+        directory: Option<String>,
+        #[serde(default)]
+        options: std::collections::BTreeMap<String, String>,
+        #[serde(default)]
+        idempotency_key: Option<String>,
     },
     Pause {
         gid: String,
@@ -305,6 +320,7 @@ pub enum ApiRequest {
     ApproveWebUiPin {
         pin: String,
     },
+    RevokeAllWebUiSessions,
     SetRememberedCancelBehavior {
         behavior: CancelBehaviorPreference,
     },

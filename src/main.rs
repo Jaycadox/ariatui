@@ -2,6 +2,7 @@ mod binary_info;
 mod bootstrap;
 mod cli;
 mod config;
+mod control;
 mod daemon;
 mod download_uri;
 mod eta;
@@ -57,6 +58,14 @@ async fn main() -> color_eyre::Result<()> {
 
     let paths = AppPaths::discover()?;
     startup.mark("paths.discovered");
+    if let Some(command) = cli.command.clone()
+        && control::is_control_command(&command)
+    {
+        return match control::run(&cli, &paths, command).await {
+            Ok(()) => Ok(()),
+            Err(error) => std::process::exit(control::report_error(&cli, &error)),
+        };
+    }
     let current_executable = current_executable_path()?;
     startup.mark("current_executable.resolved");
     let current_build_id = current_build_id();
@@ -99,6 +108,16 @@ async fn main() -> color_eyre::Result<()> {
                 .wrap_err("failed to uninstall user service"),
             ServiceCommands::UninstallSystem => service::uninstall_system(context.as_ref())
                 .wrap_err("failed to uninstall system service"),
+            ServiceCommands::StartUser => service::start_user(),
+            ServiceCommands::StartSystem => service::start_system(),
+            ServiceCommands::RestartUser => service::restart_user(),
+            ServiceCommands::RestartSystem => service::restart_system(),
+            ServiceCommands::Status => {
+                println!("User service active: {}", service::is_user_active());
+                println!("System service active: {}", service::is_system_active());
+                Ok(())
+            }
         },
+        _ => unreachable!("control commands are dispatched before app initialization"),
     }
 }

@@ -34,10 +34,14 @@ impl AppPaths {
             .state_dir()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| dirs.data_local_dir().join("state"));
-        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| state_dir.clone())
-            .join("ariatui");
+        let runtime_dir = if unsafe { libc::geteuid() } == 0 {
+            PathBuf::from("/run/ariatui")
+        } else {
+            std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| state_dir.clone())
+                .join("ariatui")
+        };
         let config_file = config_dir.join("config.toml");
         let state_file = state_dir.join("state.toml");
         let socket_path = runtime_dir.join("daemon.sock");
@@ -87,6 +91,10 @@ impl AppPaths {
         ] {
             fs::create_dir_all(dir)
                 .wrap_err_with(|| format!("failed to create {}", dir.display()))?;
+        }
+        if unsafe { libc::geteuid() } == 0 && self.runtime_dir == Path::new("/run/ariatui") {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&self.runtime_dir, fs::Permissions::from_mode(0o755))?;
         }
         Ok(())
     }

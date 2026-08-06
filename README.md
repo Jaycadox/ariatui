@@ -40,6 +40,22 @@ Run the daemon directly:
 cargo run -- daemon
 ```
 
+## CLI and agent automation
+
+AriaTUI also provides a structured local CLI covering downloads, queues, history, speed limits, schedules, routing, torrents, the Web UI, webhooks, and service management:
+
+```bash
+ariatui status
+ariatui download list --json
+ariatui download add 'https://example.com/file.iso' \
+  --dir "$HOME/Downloads" \
+  --idempotency-key example-file \
+  --json
+ariatui download wait --gid 2089b05ecca3d829 --until complete,error --json
+```
+
+Run `ariatui capabilities --json` for machine-readable discovery and see [ariatui-skill.md](ariatui-skill.md) for the full agent-oriented guide.
+
 Enable verbose startup logging:
 
 ```bash

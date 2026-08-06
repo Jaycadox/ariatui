@@ -1,5 +1,6 @@
 pub mod child;
 pub mod marker;
+pub mod permissions;
 pub mod reconcile;
 pub mod server;
 pub mod service;

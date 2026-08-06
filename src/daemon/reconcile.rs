@@ -103,6 +103,7 @@ pub struct DaemonState {
     pub web_sessions: Mutex<HashMap<String, Instant>>,
     pub web_revoked_sessions: Mutex<HashMap<String, Instant>>,
     pub qbt_categories: Mutex<HashMap<String, String>>,
+    pub cli_idempotency: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +154,7 @@ impl DaemonState {
             web_sessions: Mutex::new(HashMap::new()),
             web_revoked_sessions: Mutex::new(HashMap::new()),
             qbt_categories: Mutex::new(HashMap::new()),
+            cli_idempotency: Mutex::new(HashMap::new()),
         })
     }
 
@@ -608,6 +610,130 @@ impl DaemonState {
                 self.save_aria2_session().await;
                 self.perform_refresh().await?;
             }
+            crate::daemon::ApiRequest::AddDownload {
+                url,
+                filename,
+                directory,
+                options,
+                idempotency_key,
+            } => {
+                if let Some(key) = idempotency_key.as_deref()
+                    && (key.trim().is_empty() || key.len() > 200)
+                {
+                    return Err(eyre!("idempotency key must contain 1 to 200 characters"));
+                }
+                if let Some(key) = idempotency_key.as_deref()
+                    && let Some(gid) = self.cli_idempotency.lock().await.get(key).cloned()
+                {
+                    let snapshot = self.snapshot().await;
+                    if let Some(item) = snapshot
+                        .current_downloads
+                        .iter()
+                        .chain(snapshot.history_downloads.iter())
+                        .find(|item| item.gid == gid)
+                        .cloned()
+                    {
+                        return Ok(ApiReply {
+                            snapshot,
+                            payload: Some(ApiPayload::Download {
+                                download: item,
+                                created: false,
+                            }),
+                        });
+                    }
+                }
+                let state = self.app.state.read().await.clone();
+                let uri_kind = classify_download_uri(&url)?;
+                let routing_name = match uri_kind {
+                    DownloadUriKind::Magnet => filename
+                        .clone()
+                        .or_else(|| magnet_display_name(&url))
+                        .unwrap_or_else(|| "torrent".into()),
+                    DownloadUriKind::HttpLike => {
+                        filename.clone().unwrap_or_else(|| filename_from_url(&url))
+                    }
+                };
+                let output_dir = if let Some(directory) = directory {
+                    crate::routing::validate_directory_input(&directory)?
+                } else {
+                    match_rule(
+                        &state.default_download_dir,
+                        &state.download_rules,
+                        &routing_name,
+                    )?
+                    .resolved_directory
+                };
+                tokio::fs::create_dir_all(&output_dir).await?;
+                let effective_limit_bps =
+                    schedule::resolve(Local::now(), &state)?.effective_limit_bps;
+                let remote_torrent = matches!(uri_kind, DownloadUriKind::HttpLike)
+                    && (url.starts_with("http://") || url.starts_with("https://"))
+                    && self
+                        .resolve_http_url(&url)
+                        .await
+                        .map(|resolved| resolved.is_torrent)
+                        .unwrap_or(false);
+                let gid = if matches!(uri_kind, DownloadUriKind::Magnet) || remote_torrent {
+                    let paused = options.get("pause").is_some_and(|value| value == "true");
+                    if options.keys().any(|key| key != "pause") {
+                        return Err(eyre!(
+                            "aria2 options are not supported for torrent downloads"
+                        ));
+                    }
+                    let gid = self
+                        .torrent_engine
+                        .add_url(
+                            &url,
+                            output_dir,
+                            effective_limit_bps,
+                            state.torrent_streaming_mode != crate::state::TorrentStreamingMode::Off,
+                        )
+                        .await?;
+                    if paused {
+                        self.torrent_engine.pause(&gid).await?;
+                    }
+                    gid
+                } else {
+                    let filename = validate_download_filename(
+                        filename.unwrap_or_else(|| filename_from_url(&url)).trim(),
+                    )?;
+                    let mut rpc_options = serde_json::Map::new();
+                    for (key, value) in options {
+                        validate_aria2_option_name(&key)?;
+                        if matches!(key.as_str(), "dir" | "out") {
+                            return Err(eyre!(
+                                "aria2 option '{key}' is managed by --dir/--output-name"
+                            ));
+                        }
+                        rpc_options.insert(key, json!(value));
+                    }
+                    rpc_options.insert("dir".into(), json!(output_dir.display().to_string()));
+                    rpc_options.insert("out".into(), json!(filename));
+                    self.call::<String>(
+                        "aria2.addUri",
+                        vec![json!([url]), Value::Object(rpc_options)],
+                    )
+                    .await?
+                };
+                self.save_aria2_session().await;
+                self.perform_refresh().await?;
+                let snapshot = self.snapshot().await;
+                if let Some(key) = idempotency_key {
+                    self.cli_idempotency.lock().await.insert(key, gid.clone());
+                }
+                if let Some(item) = snapshot
+                    .current_downloads
+                    .iter()
+                    .chain(snapshot.history_downloads.iter())
+                    .find(|item| item.gid == gid)
+                    .cloned()
+                {
+                    payload = Some(ApiPayload::Download {
+                        download: item,
+                        created: true,
+                    });
+                }
+            }
             crate::daemon::ApiRequest::Pause { gid, force } => {
                 if TorrentEngine::is_torrent_gid(&gid) {
                     self.torrent_engine.pause(&gid).await?;
@@ -807,6 +933,19 @@ impl DaemonState {
             }
             crate::daemon::ApiRequest::ApproveWebUiPin { pin } => {
                 web::approve_pairing_pin(self, &pin).await?;
+                self.perform_refresh().await?;
+            }
+            crate::daemon::ApiRequest::RevokeAllWebUiSessions => {
+                let tokens = self
+                    .web_sessions
+                    .lock()
+                    .await
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for token in tokens {
+                    web::revoke_session(self, &token).await;
+                }
                 self.perform_refresh().await?;
             }
             crate::daemon::ApiRequest::SetRememberedCancelBehavior { behavior } => {
@@ -1329,6 +1468,17 @@ fn validate_download_filename(input: &str) -> Result<String> {
         return Err(eyre!("filename must not contain path separators"));
     }
     Ok(filename.to_string())
+}
+
+fn validate_aria2_option_name(input: &str) -> Result<()> {
+    if input.is_empty()
+        || !input
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(eyre!("invalid aria2 option name '{input}'"));
+    }
+    Ok(())
 }
 
 async fn delete_paths(files: Vec<Aria2File>) -> Vec<String> {
