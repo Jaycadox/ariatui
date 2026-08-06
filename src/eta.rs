@@ -252,19 +252,15 @@ pub(crate) fn project_scheduled_eta(
         for &index in completed_indexes.iter().rev() {
             downloads.remove(index);
         }
-        if let Some(new_index) = downloads
+        let new_index = downloads
             .iter()
-            .position(|download| download.gid == item.gid)
-        {
-            selected_index = new_index;
-            if seconds_until_boundary <= phase_duration_seconds + EPSILON {
-                hour = (hour + 1) % 24;
-                seconds_until_boundary = 3600.0;
-            } else {
-                seconds_until_boundary -= phase_duration_seconds;
-            }
+            .position(|download| download.gid == item.gid)?;
+        selected_index = new_index;
+        if seconds_until_boundary <= phase_duration_seconds + EPSILON {
+            hour = (hour + 1) % 24;
+            seconds_until_boundary = 3600.0;
         } else {
-            return None;
+            seconds_until_boundary -= phase_duration_seconds;
         }
     }
 

@@ -222,9 +222,7 @@ fn matches_search(item: &DownloadItem, search: &str) -> bool {
 fn sort_current(items: &mut Vec<&DownloadItem>, sort: CurrentSort) {
     match sort {
         CurrentSort::Queue => {}
-        CurrentSort::Name => {
-            items.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-        }
+        CurrentSort::Name => items.sort_by_key(|item| item.name.to_lowercase()),
         CurrentSort::Progress => items.sort_by(|left, right| {
             cmp_u64_desc(left.completed_bytes, right.completed_bytes)
                 .then(cmp_u64_desc(left.total_bytes, right.total_bytes))
@@ -240,15 +238,11 @@ fn sort_current(items: &mut Vec<&DownloadItem>, sort: CurrentSort) {
 fn sort_history(items: &mut Vec<&DownloadItem>, sort: HistorySort) {
     match sort {
         HistorySort::Recent => {}
-        HistorySort::Name => {
-            items.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-        }
+        HistorySort::Name => items.sort_by_key(|item| item.name.to_lowercase()),
         HistorySort::Size => {
             items.sort_by(|left, right| cmp_u64_desc(left.total_bytes, right.total_bytes))
         }
-        HistorySort::Status => {
-            items.sort_by(|left, right| status_rank(&left.status).cmp(&status_rank(&right.status)))
-        }
+        HistorySort::Status => items.sort_by_key(|item| status_rank(&item.status)),
     }
 }
 

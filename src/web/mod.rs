@@ -300,18 +300,10 @@ struct ParsedSessionToken<'a> {
 
 fn parse_session_token(token: &str) -> Option<ParsedSessionToken<'_>> {
     let mut parts = token.split('.');
-    let Some(version) = parts.next() else {
-        return None;
-    };
-    let Some(expiry) = parts.next() else {
-        return None;
-    };
-    let Some(nonce) = parts.next() else {
-        return None;
-    };
-    let Some(signature) = parts.next() else {
-        return None;
-    };
+    let version = parts.next()?;
+    let expiry = parts.next()?;
+    let nonce = parts.next()?;
+    let signature = parts.next()?;
     if parts.next().is_some() {
         return None;
     }

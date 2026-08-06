@@ -376,11 +376,8 @@ impl DaemonState {
         snapshot.web_ui.pending_pair_pins = pending_pair_pins;
         snapshot.web_ui.active_session_count = active_session_count;
         snapshot.global = parse_global(global);
-        let mut current_downloads: Vec<DownloadItem> = active
-            .into_iter()
-            .chain(waiting.into_iter())
-            .map(map_status)
-            .collect();
+        let mut current_downloads: Vec<DownloadItem> =
+            active.into_iter().chain(waiting).map(map_status).collect();
         current_downloads.extend(TorrentEngine::current_download_items(&torrent_downloads));
         self.speed_tracker
             .lock()
