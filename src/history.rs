@@ -26,7 +26,11 @@ pub fn load(path: &Path) -> Result<Vec<DownloadItem>> {
     }
     let history: HistoryFile = serde_json::from_str(&contents)
         .wrap_err_with(|| format!("failed to parse {}", path.display()))?;
-    Ok(deduplicate(history.items))
+    let canonical = deduplicate(history.items.clone());
+    if canonical != history.items {
+        save(path, &canonical)?;
+    }
+    Ok(canonical)
 }
 
 pub fn save(path: &Path, items: &[DownloadItem]) -> Result<()> {
@@ -100,16 +104,47 @@ pub fn is_persistable_history_item(item: &DownloadItem) -> bool {
         )
 }
 
+/// Identifies the logical download shared by aria2 attempts with different GIDs.
+///
+/// aria2 assigns a fresh GID when an errored URI is submitted again. The source
+/// and output path stay stable across those attempts, so history must use both
+/// values to prevent an obsolete error from becoming a second download.
+pub fn download_identity(item: &DownloadItem) -> Option<String> {
+    let source_uri = item.source_uri.as_deref()?;
+    Some(download_identity_parts(
+        source_uri,
+        item.primary_path.as_deref(),
+    ))
+}
+
+pub fn download_identity_parts(source_uri: &str, output_path: Option<&str>) -> String {
+    format!("{source_uri}\n{}", output_path.unwrap_or_default())
+}
+
 fn deduplicate(items: Vec<DownloadItem>) -> Vec<DownloadItem> {
-    let mut seen = HashSet::new();
+    let mut seen_gids = HashSet::new();
+    let mut seen_downloads = HashSet::new();
     items
         .into_iter()
-        .filter(|item| seen.insert(item.gid.clone()))
+        .filter(|item| {
+            if !seen_gids.insert(item.gid.clone()) {
+                return false;
+            }
+            if !matches!(
+                item.status,
+                DownloadStatus::Complete | DownloadStatus::Error
+            ) {
+                return true;
+            }
+            download_identity(item).is_none_or(|key| seen_downloads.insert(key))
+        })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
 
     fn item(gid: &str, status: DownloadStatus, completed_bytes: u64) -> DownloadItem {
@@ -136,6 +171,14 @@ mod tests {
         }
     }
 
+    fn attempt(gid: &str, status: DownloadStatus, completed_bytes: u64) -> DownloadItem {
+        let mut item = item(gid, status, completed_bytes);
+        item.name = "release.iso".into();
+        item.primary_path = Some("/tmp/release.iso".into());
+        item.source_uri = Some("https://example.com/release.iso".into());
+        item
+    }
+
     #[test]
     fn merge_keeps_existing_when_aria2_drops_old_results() {
         let existing = vec![item("old", DownloadStatus::Complete, 100)];
@@ -152,6 +195,78 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].status, DownloadStatus::Complete);
         assert_eq!(merged[0].completed_bytes, 100);
+    }
+
+    #[test]
+    fn completed_retry_replaces_failed_attempt_with_a_different_gid() {
+        let existing = vec![attempt("failed", DownloadStatus::Error, 25)];
+        let merged = merge_terminal_events(
+            &existing,
+            vec![attempt("retry", DownloadStatus::Complete, 100)],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].gid, "retry");
+        assert_eq!(merged[0].status, DownloadStatus::Complete);
+    }
+
+    #[test]
+    fn newest_failed_retry_replaces_older_failed_attempts() {
+        let existing = vec![
+            attempt("failed-2", DownloadStatus::Error, 50),
+            attempt("failed-1", DownloadStatus::Error, 25),
+        ];
+        let merged = merge_terminal_events(
+            &existing,
+            vec![attempt("failed-3", DownloadStatus::Error, 75)],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].gid, "failed-3");
+        assert_eq!(merged[0].completed_bytes, 75);
+    }
+
+    #[test]
+    fn separate_output_paths_remain_separate_downloads() {
+        let mut first = item("first", DownloadStatus::Error, 25);
+        first.primary_path = Some("/tmp/first/release.iso".into());
+        let mut second = item("second", DownloadStatus::Complete, 100);
+        second.primary_path = Some("/tmp/second/release.iso".into());
+
+        let merged = merge_terminal_events(&[first], vec![second]);
+
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn load_repairs_duplicate_attempts_on_disk() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "ariatui-history-{}-{suffix}.json",
+            std::process::id()
+        ));
+        let file = HistoryFile {
+            items: vec![
+                attempt("successful-retry", DownloadStatus::Complete, 100),
+                attempt("failed-2", DownloadStatus::Error, 75),
+                attempt("failed-1", DownloadStatus::Error, 25),
+            ],
+        };
+        fs::write(&path, serde_json::to_vec(&file).expect("encode history"))
+            .expect("write history");
+
+        let loaded = load(&path).expect("load history");
+        let repaired: HistoryFile =
+            serde_json::from_slice(&fs::read(&path).expect("read repaired history"))
+                .expect("decode repaired history");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].gid, "successful-retry");
+        assert_eq!(repaired.items, loaded);
     }
 
     #[test]

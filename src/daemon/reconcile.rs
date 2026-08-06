@@ -420,17 +420,7 @@ impl DaemonState {
         let mut state = self.retry_state.lock().await;
         let mut changed = false;
 
-        let completed_gids = snapshot
-            .history_downloads
-            .iter()
-            .filter(|item| item.status == DownloadStatus::Complete)
-            .map(|item| item.gid.as_str())
-            .collect::<HashSet<_>>();
-        let before = state.entries.len();
-        state
-            .entries
-            .retain(|_, entry| !completed_gids.contains(entry.current_gid.as_str()));
-        changed |= before != state.entries.len();
+        changed |= remove_completed_retry_entries(&mut state, &snapshot.history_downloads);
 
         for item in snapshot
             .history_downloads
@@ -1368,8 +1358,26 @@ fn retry_delay_secs(retries: u32) -> i64 {
     (60_i64.saturating_mul(1_i64 << retries.min(6))).min(60 * 60)
 }
 
+fn remove_completed_retry_entries(state: &mut RetryState, history: &[DownloadItem]) -> bool {
+    let completed_gids = history
+        .iter()
+        .filter(|item| item.status == DownloadStatus::Complete)
+        .map(|item| item.gid.as_str())
+        .collect::<HashSet<_>>();
+    let completed_downloads = history
+        .iter()
+        .filter(|item| item.status == DownloadStatus::Complete)
+        .filter_map(history::download_identity)
+        .collect::<HashSet<_>>();
+    let before = state.entries.len();
+    state.entries.retain(|key, entry| {
+        !completed_gids.contains(entry.current_gid.as_str()) && !completed_downloads.contains(key)
+    });
+    before != state.entries.len()
+}
+
 fn retry_key(source_uri: &str, output_path: Option<&str>) -> String {
-    format!("{source_uri}\n{}", output_path.unwrap_or_default())
+    history::download_identity_parts(source_uri, output_path)
 }
 
 fn retry_options(entry: &RetryEntry) -> Value {
@@ -1527,6 +1535,30 @@ impl IfEmptyThen for String {
 mod retry_tests {
     use super::*;
 
+    fn history_item(gid: &str, status: DownloadStatus) -> DownloadItem {
+        DownloadItem {
+            gid: gid.into(),
+            status,
+            name: "release.iso".into(),
+            primary_path: Some("/downloads/release.iso".into()),
+            source_uri: Some("https://example.com/release.iso".into()),
+            info_hash: None,
+            num_seeders: None,
+            followed_by: Vec::new(),
+            belongs_to: None,
+            is_metadata_only: false,
+            total_bytes: 100,
+            completed_bytes: 100,
+            download_speed_bps: 0,
+            realtime_download_speed_bps: 0,
+            upload_speed_bps: 0,
+            eta_seconds: None,
+            connections: None,
+            error_code: None,
+            error_message: None,
+        }
+    }
+
     #[test]
     fn retry_backoff_grows_and_caps_at_one_hour() {
         assert_eq!(retry_delay_secs(0), 60);
@@ -1550,5 +1582,32 @@ mod retry_tests {
             retry_options(&entry),
             json!({"dir": "/downloads", "out": "release.iso"})
         );
+    }
+
+    #[test]
+    fn completed_retry_clears_state_when_aria2_changed_the_gid() {
+        let source_uri = "https://example.com/release.iso";
+        let output_path = "/downloads/release.iso";
+        let key = retry_key(source_uri, Some(output_path));
+        let mut state = RetryState::default();
+        state.entries.insert(
+            key,
+            RetryEntry {
+                source_uri: source_uri.into(),
+                output_path: Some(output_path.into()),
+                current_gid: "failed-attempt".into(),
+                retries: 2,
+                next_attempt_at: None,
+                daily: false,
+            },
+        );
+
+        let changed = remove_completed_retry_entries(
+            &mut state,
+            &[history_item("successful-retry", DownloadStatus::Complete)],
+        );
+
+        assert!(changed);
+        assert!(state.entries.is_empty());
     }
 }
