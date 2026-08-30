@@ -117,6 +117,23 @@ panel with the slot count and per-batch `Hold`/`Start` buttons. The Firefox
 extension has a per-server `default batch number` option so links it sends land
 in a batch of your choosing.
 
+### Speed and ETA estimation
+
+Displayed transfer speeds come from byte-counter deltas rather than directly
+from aria2's instantaneous sample. AriaTUI rejects isolated outliers, combines
+fast and slow exponential estimates, limits abrupt display changes, and treats
+sustained changes as a new baseline. Short stalls decay smoothly; long stalls
+clear the ETA. Pauses and batch holds reset sampling boundaries so idle time is
+never averaged into a resumed transfer.
+
+In scheduled mode, ETA is a queue simulation rather than a simple
+`remaining / current speed` calculation. It accounts for hourly caps, usual
+Internet speed, measured utilization, active sharing ratios, slot backfilling,
+numbered and unassigned batch order, scheduler-held downloads, and bandwidth
+redistribution as peers finish. Manually paused downloads are never assumed to
+resume. Schedule transitions use local-time boundaries, including DST skips and
+repeated hours.
+
 ## Web UI
 
 The web UI is optional and starts disabled by default.

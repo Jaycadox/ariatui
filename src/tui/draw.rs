@@ -1414,6 +1414,13 @@ fn phase_summary(phase: &ScheduledEtaPhase) -> String {
 }
 
 fn peer_summary(phase: &ScheduledEtaPhase) -> String {
+    if phase.projected_item_speed_bps == 0 {
+        return if phase.peer_count == 0 {
+            "waiting for its batch".into()
+        } else {
+            format!("queued behind {}", peer_names_summary(phase))
+        };
+    }
     if phase.peer_count == 0 {
         "full observed share".into()
     } else {

@@ -1,10 +1,14 @@
-use chrono::{DateTime, Local, Timelike};
+use std::collections::BTreeSet;
 
-use crate::daemon::{DownloadItem, DownloadStatus, Snapshot};
+use chrono::{DateTime, Duration, Local, Timelike};
+
+use crate::daemon::{DownloadItem, DownloadStatus, QueueBatchTarget, Snapshot};
 use crate::state::ManualOrScheduled;
 
 const HORIZON_SECONDS: u64 = 24 * 365 * 3600;
 const PEER_NAME_LIMIT: usize = 3;
+const MAX_RECORDED_PHASES: usize = 96;
+const COLD_START_UTILIZATION: f64 = 0.80;
 const EPSILON: f64 = 1e-9;
 
 #[derive(Debug, Clone)]
@@ -33,20 +37,83 @@ pub(crate) enum ProjectionPhaseEnd {
     SelectedCompleted,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum AggregateSpeedModel {
-    Utilization(f64),
-    Observed(u64),
-}
-
 #[derive(Debug, Clone)]
 struct SimDownload {
     gid: String,
     name: String,
+    batch: QueueBatchTarget,
     remaining_bytes: f64,
     weight: f64,
+    was_active: bool,
+    order: usize,
 }
 
+/// A calibrated model of usable aggregate bandwidth. `ceiling_bps` is either
+/// the configured usual Internet speed, an observed uncapped speed, or the
+/// current cap when no observations exist. `utilization` preserves protocol,
+/// server, and connection overhead when projecting into another schedule slot.
+#[derive(Debug, Clone, Copy)]
+struct CapacityModel {
+    ceiling_bps: f64,
+    utilization: f64,
+}
+
+impl CapacityModel {
+    fn from_snapshot(snapshot: &Snapshot) -> Option<Self> {
+        let observed = snapshot
+            .current_downloads
+            .iter()
+            .filter(|item| item.status == DownloadStatus::Active)
+            .map(|item| item.download_speed_bps as f64)
+            .sum::<f64>();
+        let usual = snapshot
+            .scheduler
+            .usual_internet_speed_bps
+            .map(|v| v as f64);
+        let current_limit = snapshot.scheduler.effective_limit_bps.map(|v| v as f64);
+
+        let inferred_ceiling = if current_limit.is_some() {
+            // When the current hour is capped, the observation cannot tell us
+            // the uncapped line rate. A larger configured future cap is still
+            // useful evidence; utilization below preserves measured overhead.
+            snapshot
+                .scheduler
+                .schedule_limits_bps
+                .iter()
+                .flatten()
+                .copied()
+                .max()
+                .map(|limit| limit as f64)
+                .unwrap_or(observed)
+        } else {
+            observed
+        };
+        let ceiling = usual.unwrap_or(inferred_ceiling).max(observed);
+        if ceiling <= 0.0 {
+            return None;
+        }
+        let currently_available = current_limit.map_or(ceiling, |limit| limit.min(ceiling));
+        let utilization = if observed > 0.0 && currently_available > 0.0 {
+            (observed / currently_available).clamp(0.05, 1.0)
+        } else {
+            COLD_START_UTILIZATION
+        };
+        Some(Self {
+            ceiling_bps: ceiling,
+            utilization,
+        })
+    }
+
+    fn speed_for_limit(self, limit: Option<u64>) -> f64 {
+        let available = limit.map_or(self.ceiling_bps, |limit| self.ceiling_bps.min(limit as f64));
+        available * self.utilization
+    }
+}
+
+/// Simulate the queue as a small discrete-event system. Unlike the former
+/// active-only projection, this includes slot backfilling, scheduler-held
+/// batches, waiting downloads, fair redistribution after peers finish, hourly
+/// caps, and cold-start estimates when a just-started item has no rate yet.
 pub(crate) fn project_scheduled_eta(
     now: DateTime<Local>,
     snapshot: &Snapshot,
@@ -55,10 +122,6 @@ pub(crate) fn project_scheduled_eta(
     if snapshot.scheduler.mode != ManualOrScheduled::Scheduled {
         return None;
     }
-    if item.status != DownloadStatus::Active || item.download_speed_bps == 0 {
-        return None;
-    }
-
     let selected_remaining = remaining_bytes(item)?;
     if selected_remaining == 0 {
         return Some(ScheduledEtaProjection {
@@ -68,148 +131,145 @@ pub(crate) fn project_scheduled_eta(
             phases: Vec::new(),
         });
     }
+    if !is_projectable(item) {
+        return None;
+    }
+
+    let capacity = CapacityModel::from_snapshot(snapshot)?;
+    let active_rates = snapshot
+        .current_downloads
+        .iter()
+        .filter(|item| item.status == DownloadStatus::Active && item.download_speed_bps > 0)
+        .map(|item| item.download_speed_bps as f64)
+        .collect::<Vec<_>>();
+    let typical_weight = if active_rates.is_empty() {
+        capacity.ceiling_bps / f64::from(snapshot.queue.slots.max(1))
+    } else {
+        median(&active_rates)
+    }
+    .max(1.0);
 
     let mut downloads = snapshot
         .current_downloads
         .iter()
-        .filter_map(sim_download_from_item)
+        .enumerate()
+        .filter_map(|(order, candidate)| {
+            if !is_projectable(candidate) {
+                return None;
+            }
+            Some(SimDownload {
+                gid: candidate.gid.clone(),
+                name: candidate.name.clone(),
+                batch: QueueBatchTarget::of(candidate.batch),
+                remaining_bytes: remaining_bytes(candidate)? as f64,
+                weight: if candidate.status == DownloadStatus::Active
+                    && candidate.download_speed_bps > 0
+                {
+                    candidate.download_speed_bps as f64
+                } else {
+                    typical_weight
+                },
+                was_active: candidate.status == DownloadStatus::Active,
+                order,
+            })
+        })
         .collect::<Vec<_>>();
-    let mut selected_index = downloads
-        .iter()
-        .position(|download| download.gid == item.gid)?;
-
-    let observed_total_speed_bps = downloads
-        .iter()
-        .map(|download| download.weight)
-        .sum::<f64>();
-    if observed_total_speed_bps <= 0.0 {
+    if !downloads.iter().any(|download| download.gid == item.gid) {
         return None;
     }
-    let observed_total_speed_bps_u64 = observed_total_speed_bps.round() as u64;
-    let effective_usual_speed_bps = if snapshot.scheduler.effective_limit_bps.is_some() {
-        snapshot
-            .scheduler
-            .usual_internet_speed_bps
-            .map(|usual| usual.max(observed_total_speed_bps_u64))
-    } else {
-        None
-    };
 
-    let current_cap = min_limit(
-        snapshot.scheduler.effective_limit_bps,
-        effective_usual_speed_bps,
-    );
-    let aggregate_model = match current_cap {
-        Some(limit) if limit > 0 => AggregateSpeedModel::Utilization(
-            (observed_total_speed_bps / limit as f64).clamp(0.0, 1.0),
-        ),
-        _ => AggregateSpeedModel::Observed(observed_total_speed_bps_u64),
-    };
-
-    let mut projected_now_speed_bps = None;
-    let mut phases = Vec::new();
-    let mut phase_count = 0usize;
+    let batch_order = projected_batch_order(snapshot, &downloads);
+    let slots = usize::from(snapshot.queue.slots.max(1));
     let mut elapsed_seconds = 0.0f64;
     let mut hour = now.hour() as usize;
-    let seconds_past_hour = now.minute() as u64 * 60 + now.second() as u64;
-    let mut seconds_until_boundary = (3600 - seconds_past_hour).max(1) as f64;
+    let seconds_past_hour = now.minute() as f64 * 60.0
+        + now.second() as f64
+        + now.nanosecond() as f64 / 1_000_000_000.0;
+    let mut seconds_until_boundary = (3600.0 - seconds_past_hour).max(0.001);
+    let mut projected_now_speed_bps = None;
+    let mut phase_count = 0usize;
+    let mut phases = Vec::new();
 
     while elapsed_seconds <= HORIZON_SECONDS as f64 + EPSILON {
-        if downloads.is_empty() {
+        let batch = batch_order.iter().copied().find(|batch| {
+            downloads
+                .iter()
+                .any(|download| download.batch == *batch && download.remaining_bytes > EPSILON)
+        })?;
+        let running = running_indexes(&downloads, batch, slots);
+        if running.is_empty() {
             return None;
         }
-        let slot_cap = min_limit(
-            snapshot.scheduler.schedule_limits_bps[hour],
-            effective_usual_speed_bps,
-        );
-        let aggregate_speed_bps =
-            estimated_aggregate_speed_bps(aggregate_model, observed_total_speed_bps_u64, slot_cap)
-                as f64;
-        if aggregate_speed_bps <= 0.0 {
+
+        let aggregate_speed =
+            capacity.speed_for_limit(snapshot.scheduler.schedule_limits_bps[hour]);
+        if aggregate_speed <= EPSILON {
             elapsed_seconds += seconds_until_boundary;
-            hour = (hour + 1) % 24;
+            hour = projected_hour(now, elapsed_seconds);
             seconds_until_boundary = 3600.0;
             continue;
         }
-
-        let total_weight = downloads
+        let total_weight = running
             .iter()
-            .map(|download| download.weight)
+            .map(|index| downloads[*index].weight)
             .sum::<f64>();
-        if total_weight <= 0.0 {
+        if total_weight <= EPSILON {
             return None;
         }
-
-        let speeds = downloads
+        let speeds = running
             .iter()
-            .map(|download| aggregate_speed_bps * (download.weight / total_weight))
-            .collect::<Vec<_>>();
-        let selected_speed_bps = speeds[selected_index];
-        if projected_now_speed_bps.is_none() {
-            projected_now_speed_bps = Some(round_speed(selected_speed_bps));
-        }
-        if selected_speed_bps <= 0.0 {
-            return None;
-        }
-
-        let completion_times = downloads
-            .iter()
-            .zip(speeds.iter())
-            .map(|(download, speed)| {
-                if *speed <= 0.0 {
-                    f64::INFINITY
-                } else {
-                    download.remaining_bytes / speed
-                }
+            .map(|index| {
+                (
+                    *index,
+                    aggregate_speed * downloads[*index].weight / total_weight,
+                )
             })
             .collect::<Vec<_>>();
-        let earliest_completion_seconds = completion_times
+        let selected_speed = speeds
             .iter()
-            .copied()
-            .fold(f64::INFINITY, f64::min);
-        if !earliest_completion_seconds.is_finite() {
-            elapsed_seconds += seconds_until_boundary;
-            hour = (hour + 1) % 24;
-            seconds_until_boundary = 3600.0;
-            continue;
-        }
+            .find(|(index, _)| downloads[*index].gid == item.gid)
+            .map(|(_, speed)| *speed)
+            .unwrap_or(0.0);
+        projected_now_speed_bps.get_or_insert_with(|| round_speed(selected_speed));
 
-        let phase_duration_seconds = seconds_until_boundary.min(earliest_completion_seconds);
-        if !phase_duration_seconds.is_finite() || phase_duration_seconds <= EPSILON {
+        let earliest_completion = speeds
+            .iter()
+            .map(|(index, speed)| downloads[*index].remaining_bytes / speed.max(EPSILON))
+            .fold(f64::INFINITY, f64::min);
+        let phase_duration = seconds_until_boundary.min(earliest_completion);
+        if !phase_duration.is_finite() || phase_duration <= EPSILON {
             return None;
         }
 
-        let peer_names = downloads
+        let peer_names = running
             .iter()
-            .enumerate()
-            .filter(|(index, _)| *index != selected_index)
-            .map(|(_, download)| download.name.clone())
+            .filter(|index| downloads[**index].gid != item.gid)
+            .map(|index| downloads[*index].name.clone())
             .take(PEER_NAME_LIMIT)
             .collect::<Vec<_>>();
-        let peer_count = downloads.len().saturating_sub(1);
+        let selected_is_running = selected_speed > 0.0;
+        let peer_count = running
+            .len()
+            .saturating_sub(usize::from(selected_is_running));
 
-        for (download, speed) in downloads.iter_mut().zip(speeds.iter()) {
-            download.remaining_bytes =
-                (download.remaining_bytes - (speed * phase_duration_seconds)).max(0.0);
+        for (index, speed) in &speeds {
+            downloads[*index].remaining_bytes =
+                (downloads[*index].remaining_bytes - speed * phase_duration).max(0.0);
         }
-
-        let completed_indexes = completion_times
+        let completed = speeds
             .iter()
-            .enumerate()
-            .filter_map(|(index, seconds)| {
-                if *seconds <= phase_duration_seconds + EPSILON {
-                    Some(index)
-                } else {
-                    None
-                }
+            .filter_map(|(index, _)| {
+                (downloads[*index].remaining_bytes <= EPSILON).then_some(*index)
             })
             .collect::<Vec<_>>();
-        let selected_completed = completed_indexes.contains(&selected_index);
-        let peer_completion_name = completed_indexes
+        let selected_completed = completed
             .iter()
-            .copied()
-            .filter(|index| *index != selected_index)
-            .find_map(|index| downloads.get(index).map(|download| download.name.clone()));
+            .any(|index| downloads[*index].gid == item.gid);
+        let peer_completion_name = completed
+            .iter()
+            .find(|index| downloads[**index].gid != item.gid)
+            .map(|index| downloads[*index].name.clone());
+        let hit_boundary = seconds_until_boundary <= phase_duration + EPSILON;
         let end = if selected_completed {
             ProjectionPhaseEnd::SelectedCompleted
         } else if let Some(name) = peer_completion_name {
@@ -219,17 +279,18 @@ pub(crate) fn project_scheduled_eta(
         };
 
         phase_count += 1;
-        phases.push(ScheduledEtaPhase {
-            start_offset_seconds: elapsed_seconds.ceil() as u64,
-            duration_seconds: phase_duration_seconds.ceil().max(1.0) as u64,
-            projected_item_speed_bps: round_speed(selected_speed_bps),
-            projected_aggregate_speed_bps: round_speed(aggregate_speed_bps),
-            peer_count,
-            peer_names,
-            end: end.clone(),
-        });
-
-        elapsed_seconds += phase_duration_seconds;
+        if phases.len() < MAX_RECORDED_PHASES {
+            phases.push(ScheduledEtaPhase {
+                start_offset_seconds: elapsed_seconds.ceil() as u64,
+                duration_seconds: phase_duration.ceil().max(1.0) as u64,
+                projected_item_speed_bps: round_speed(selected_speed),
+                projected_aggregate_speed_bps: round_speed(aggregate_speed),
+                peer_count,
+                peer_names,
+                end,
+            });
+        }
+        elapsed_seconds += phase_duration;
         if selected_completed {
             return Some(ScheduledEtaProjection {
                 eta_seconds: elapsed_seconds.ceil() as u64,
@@ -238,89 +299,82 @@ pub(crate) fn project_scheduled_eta(
                 phases,
             });
         }
-
-        let transferred_weight = completed_indexes
-            .iter()
-            .copied()
-            .filter(|index| *index != selected_index)
-            .filter_map(|index| downloads.get(index).map(|download| download.weight))
-            .sum::<f64>();
-        if transferred_weight > 0.0 {
-            downloads[selected_index].weight += transferred_weight;
-        }
-
-        for &index in completed_indexes.iter().rev() {
-            downloads.remove(index);
-        }
-        let new_index = downloads
-            .iter()
-            .position(|download| download.gid == item.gid)?;
-        selected_index = new_index;
-        if seconds_until_boundary <= phase_duration_seconds + EPSILON {
-            hour = (hour + 1) % 24;
+        if hit_boundary {
+            // Derive the next local hour from an absolute instant. This handles
+            // daylight-saving skipped and repeated hours correctly.
+            hour = projected_hour(now, elapsed_seconds);
             seconds_until_boundary = 3600.0;
         } else {
-            seconds_until_boundary -= phase_duration_seconds;
+            seconds_until_boundary -= phase_duration;
         }
     }
-
     None
 }
 
-fn sim_download_from_item(item: &DownloadItem) -> Option<SimDownload> {
-    if item.status != DownloadStatus::Active || item.download_speed_bps == 0 {
-        return None;
-    }
-    let remaining_bytes = remaining_bytes(item)?;
-    if remaining_bytes == 0 {
-        return None;
-    }
-    Some(SimDownload {
-        gid: item.gid.clone(),
-        name: item.name.clone(),
-        remaining_bytes: remaining_bytes as f64,
-        weight: item.download_speed_bps as f64,
-    })
+fn is_projectable(item: &DownloadItem) -> bool {
+    matches!(
+        item.status,
+        DownloadStatus::Active | DownloadStatus::Waiting
+    ) || (item.status == DownloadStatus::Paused && item.queue_held)
 }
 
 fn remaining_bytes(item: &DownloadItem) -> Option<u64> {
     item.total_bytes.checked_sub(item.completed_bytes)
 }
 
-fn estimated_aggregate_speed_bps(
-    model: AggregateSpeedModel,
-    observed_total_speed_bps: u64,
-    scheduled_limit_bps: Option<u64>,
-) -> u64 {
-    match model {
-        AggregateSpeedModel::Utilization(ratio) => {
-            if ratio <= 0.0 {
-                0
-            } else {
-                match scheduled_limit_bps {
-                    Some(limit) => ((limit as f64 * ratio).round() as u64).max(1),
-                    None => observed_total_speed_bps,
-                }
-            }
-        }
-        AggregateSpeedModel::Observed(speed) => match scheduled_limit_bps {
-            Some(limit) => speed.min(limit),
-            None => speed,
-        },
+fn projected_batch_order(snapshot: &Snapshot, downloads: &[SimDownload]) -> Vec<QueueBatchTarget> {
+    let mut batches = downloads
+        .iter()
+        .map(|download| download.batch)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if let Some(active) = snapshot.queue.active_batch
+        && let Some(position) = batches.iter().position(|batch| *batch == active)
+    {
+        batches.remove(position);
+        batches.insert(0, active);
     }
+    batches
 }
 
-fn min_limit(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-    match (left, right) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    }
+fn running_indexes(downloads: &[SimDownload], batch: QueueBatchTarget, slots: usize) -> Vec<usize> {
+    let mut candidates = downloads
+        .iter()
+        .enumerate()
+        .filter(|(_, download)| download.batch == batch && download.remaining_bytes > EPSILON)
+        .map(|(index, download)| (index, !download.was_active, download.order))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(_, was_not_active, order)| (*was_not_active, *order));
+    let observed_active = candidates
+        .iter()
+        .filter(|(index, _, _)| downloads[*index].was_active)
+        .count();
+    candidates
+        .into_iter()
+        .take(slots.max(observed_active))
+        .map(|(index, _, _)| index)
+        .collect()
 }
 
 fn round_speed(speed_bps: f64) -> u64 {
-    speed_bps.round().max(1.0) as u64
+    speed_bps.round().max(0.0) as u64
+}
+
+fn projected_hour(now: DateTime<Local>, elapsed_seconds: f64) -> usize {
+    let millis = (elapsed_seconds * 1_000.0).round().min(i64::MAX as f64) as i64;
+    (now + Duration::milliseconds(millis)).hour() as usize
+}
+
+fn median(values: &[f64]) -> f64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let middle = sorted.len() / 2;
+    if sorted.len().is_multiple_of(2) {
+        (sorted[middle - 1] + sorted[middle]) / 2.0
+    } else {
+        sorted[middle]
+    }
 }
 
 #[cfg(test)]
@@ -328,16 +382,20 @@ mod tests {
     use chrono::{Local, TimeZone};
 
     use super::*;
-    use crate::daemon::{
-        DownloadItem,
-        snapshot::{SchedulerSnapshot, Snapshot},
-    };
-    use crate::state::{CancelBehaviorPreference, ManualOrScheduled};
+    use crate::daemon::snapshot::{QueueSnapshot, SchedulerSnapshot, Snapshot};
+    use crate::state::CancelBehaviorPreference;
 
-    fn active_item(name: &str, remaining_bytes: u64, speed_bps: u64) -> DownloadItem {
+    fn item(
+        name: &str,
+        remaining: u64,
+        speed: u64,
+        status: DownloadStatus,
+        batch: Option<u32>,
+        held: bool,
+    ) -> DownloadItem {
         DownloadItem {
             gid: format!("gid-{name}"),
-            status: DownloadStatus::Active,
+            status,
             name: name.into(),
             primary_path: None,
             source_uri: None,
@@ -346,30 +404,26 @@ mod tests {
             followed_by: Vec::new(),
             belongs_to: None,
             is_metadata_only: false,
-            total_bytes: remaining_bytes,
+            total_bytes: remaining,
             completed_bytes: 0,
-            download_speed_bps: speed_bps,
-            realtime_download_speed_bps: speed_bps,
+            download_speed_bps: speed,
+            realtime_download_speed_bps: speed,
             upload_speed_bps: 0,
-            eta_seconds: Some(remaining_bytes / speed_bps.max(1)),
+            eta_seconds: None,
             connections: None,
             error_code: None,
             error_message: None,
-            batch: None,
-            queue_held: false,
+            batch,
+            queue_held: held,
         }
     }
 
-    fn with_status(mut item: DownloadItem, status: DownloadStatus, speed_bps: u64) -> DownloadItem {
-        item.status = status;
-        item.download_speed_bps = speed_bps;
-        item
-    }
-
     fn snapshot_with(
-        effective_limit_bps: Option<u64>,
-        usual_internet_speed_bps: Option<u64>,
-        schedule_limits_bps: [Option<u64>; 24],
+        effective_limit: Option<u64>,
+        usual: Option<u64>,
+        schedule: [Option<u64>; 24],
+        slots: u8,
+        active_batch: Option<QueueBatchTarget>,
         downloads: Vec<DownloadItem>,
     ) -> Snapshot {
         let mut snapshot = Snapshot::empty(
@@ -382,56 +436,80 @@ mod tests {
         snapshot.scheduler = SchedulerSnapshot {
             mode: ManualOrScheduled::Scheduled,
             manual_limit_bps: None,
-            usual_internet_speed_bps,
-            schedule_limits_bps,
-            effective_limit_bps,
+            usual_internet_speed_bps: usual,
+            schedule_limits_bps: schedule,
+            effective_limit_bps: effective_limit,
             current_hour: 0,
             next_change_at_local: "00:00".into(),
             remembered_cancel_behavior: CancelBehaviorPreference::Ask,
+        };
+        snapshot.queue = QueueSnapshot {
+            slots,
+            active_batch,
+            ..QueueSnapshot::default()
         };
         snapshot.current_downloads = downloads;
         snapshot
     }
 
     #[test]
-    fn single_active_download_tracks_schedule_change() {
+    fn schedule_boundary_changes_completion_rate() {
         let now = Local.with_ymd_and_hms(2026, 4, 9, 10, 59, 50).unwrap();
         let mut schedule = [Some(100); 24];
         schedule[11] = Some(200);
-        let selected = active_item("alpha.iso", 2_400, 100);
-        let snapshot = snapshot_with(Some(100), None, schedule, vec![selected.clone()]);
-
-        let projection = project_scheduled_eta(now, &snapshot, &selected).expect("projection");
-
+        let selected = item("alpha", 2_400, 100, DownloadStatus::Active, Some(0), false);
+        let snapshot = snapshot_with(
+            Some(100),
+            None,
+            schedule,
+            1,
+            Some(QueueBatchTarget::Number(0)),
+            vec![selected.clone()],
+        );
+        let projection = project_scheduled_eta(now, &snapshot, &selected).unwrap();
         assert_eq!(projection.eta_seconds, 17);
-        assert_eq!(projection.projected_now_speed_bps, 100);
-        assert_eq!(projection.phase_count, 2);
-        assert!(matches!(
-            projection.phases[0].end,
-            ProjectionPhaseEnd::HourBoundary
-        ));
-        assert!(matches!(
-            projection.phases[1].end,
-            ProjectionPhaseEnd::SelectedCompleted
-        ));
+        assert_eq!(projection.phases.len(), 2);
         assert_eq!(projection.phases[1].projected_item_speed_bps, 200);
     }
 
     #[test]
-    fn smaller_peer_finishing_early_increases_selected_speed() {
+    fn later_batch_eta_includes_earlier_batch_and_slot_backfill() {
         let now = Local.with_ymd_and_hms(2026, 4, 9, 10, 0, 0).unwrap();
-        let schedule = [Some(300); 24];
-        let selected = active_item("alpha.iso", 1_000, 100);
-        let peer = active_item("beta.iso", 200, 200);
-        let snapshot = snapshot_with(Some(300), None, schedule, vec![selected.clone(), peer]);
+        let first = item("first", 100, 100, DownloadStatus::Active, Some(0), false);
+        let second = item("second", 100, 0, DownloadStatus::Waiting, Some(0), false);
+        let selected = item("later", 100, 0, DownloadStatus::Paused, Some(1), true);
+        let snapshot = snapshot_with(
+            Some(100),
+            Some(100),
+            [Some(100); 24],
+            1,
+            Some(QueueBatchTarget::Number(0)),
+            vec![first, second, selected.clone()],
+        );
+        let projection = project_scheduled_eta(now, &snapshot, &selected).unwrap();
+        assert_eq!(projection.eta_seconds, 3);
+        assert_eq!(projection.projected_now_speed_bps, 0);
+        assert_eq!(projection.phases.len(), 3);
+        assert_eq!(projection.phases[2].projected_item_speed_bps, 100);
+    }
 
-        let projection = project_scheduled_eta(now, &snapshot, &selected).expect("projection");
-
-        assert_eq!(projection.eta_seconds, 4);
-        assert_eq!(projection.phase_count, 2);
-        assert_eq!(projection.phases[0].projected_item_speed_bps, 100);
-        assert_eq!(projection.phases[1].projected_item_speed_bps, 300);
-        assert_eq!(projection.phases[1].peer_count, 0);
+    #[test]
+    fn slots_share_capacity_and_backfill_in_order() {
+        let now = Local.with_ymd_and_hms(2026, 4, 9, 10, 0, 0).unwrap();
+        let short = item("short", 50, 50, DownloadStatus::Active, Some(0), false);
+        let long = item("long", 300, 50, DownloadStatus::Active, Some(0), false);
+        let selected = item("queued", 100, 0, DownloadStatus::Waiting, Some(0), false);
+        let snapshot = snapshot_with(
+            Some(100),
+            Some(100),
+            [Some(100); 24],
+            2,
+            Some(QueueBatchTarget::Number(0)),
+            vec![short, long, selected.clone()],
+        );
+        let projection = project_scheduled_eta(now, &snapshot, &selected).unwrap();
+        assert_eq!(projection.projected_now_speed_bps, 0);
+        assert_eq!(projection.eta_seconds, 3);
         assert!(matches!(
             projection.phases[0].end,
             ProjectionPhaseEnd::PeerCompleted { .. }
@@ -439,179 +517,139 @@ mod tests {
     }
 
     #[test]
-    fn conservative_utilization_preserves_observed_aggregate_after_peer_finishes() {
+    fn manual_pause_is_not_assumed_to_resume() {
         let now = Local.with_ymd_and_hms(2026, 4, 9, 10, 0, 0).unwrap();
-        let schedule = [Some(900); 24];
-        let selected = active_item("alpha.iso", 1_000, 100);
-        let peer = active_item("beta.iso", 200, 200);
-        let snapshot = snapshot_with(Some(900), None, schedule, vec![selected.clone(), peer]);
-
-        let projection = project_scheduled_eta(now, &snapshot, &selected).expect("projection");
-
-        assert_eq!(projection.projected_now_speed_bps, 100);
-        assert_eq!(projection.phases[1].projected_item_speed_bps, 300);
-        assert_ne!(projection.phases[1].projected_item_speed_bps, 900);
-    }
-
-    #[test]
-    fn scheduler_boundary_before_peer_completion_changes_aggregate_then_peer_finishes() {
-        let now = Local.with_ymd_and_hms(2026, 4, 9, 10, 59, 58).unwrap();
-        let mut schedule = [Some(300); 24];
-        schedule[11] = Some(150);
-        let selected = active_item("alpha.iso", 3_000, 100);
-        let peer = active_item("beta.iso", 1_000, 200);
-        let snapshot = snapshot_with(Some(300), None, schedule, vec![selected.clone(), peer]);
-
-        let projection = project_scheduled_eta(now, &snapshot, &selected).expect("projection");
-
-        assert_eq!(projection.phase_count, 3);
-        assert!(matches!(
-            projection.phases[0].end,
-            ProjectionPhaseEnd::HourBoundary
-        ));
-        assert_eq!(projection.phases[1].projected_aggregate_speed_bps, 150);
-        assert!(matches!(
-            projection.phases[1].end,
-            ProjectionPhaseEnd::PeerCompleted { .. }
-        ));
-        assert_eq!(projection.phases[2].projected_item_speed_bps, 150);
-    }
-
-    #[test]
-    fn later_capped_slot_clamps_unlimited_observed_total() {
-        let now = Local.with_ymd_and_hms(2026, 4, 9, 10, 59, 58).unwrap();
-        let mut schedule = [None; 24];
-        schedule[11] = Some(150);
-        let selected = active_item("alpha.iso", 3_000, 100);
-        let peer = active_item("beta.iso", 2_000, 200);
-        let snapshot = snapshot_with(None, None, schedule, vec![selected.clone(), peer]);
-
-        let projection = project_scheduled_eta(now, &snapshot, &selected).expect("projection");
-
-        assert_eq!(projection.phases[0].projected_aggregate_speed_bps, 300);
-        assert_eq!(projection.phases[1].projected_aggregate_speed_bps, 150);
-        assert_eq!(projection.phases[1].projected_item_speed_bps, 50);
-    }
-
-    #[test]
-    fn finishing_peer_transfers_its_speed_to_selected_download() {
-        let now = Local.with_ymd_and_hms(2026, 4, 9, 10, 0, 0).unwrap();
-        let schedule = [Some(500); 24];
-        let selected = active_item("alpha.iso", 1_000, 100);
-        let fast_peer = active_item("beta.iso", 100, 100);
-        let steady_peer = active_item("gamma.iso", 10_000, 300);
+        let selected = item("paused", 100, 0, DownloadStatus::Paused, Some(0), false);
         let snapshot = snapshot_with(
-            Some(500),
+            Some(100),
+            Some(100),
+            [Some(100); 24],
+            1,
             None,
-            schedule,
-            vec![selected.clone(), fast_peer, steady_peer],
+            vec![selected.clone()],
         );
-
-        let projection = project_scheduled_eta(now, &snapshot, &selected).expect("projection");
-
-        assert!(matches!(
-            projection.phases[0].end,
-            ProjectionPhaseEnd::PeerCompleted { ref name } if name == "beta.iso"
-        ));
-        assert_eq!(projection.phases[1].projected_aggregate_speed_bps, 500);
-        assert_eq!(projection.phases[1].projected_item_speed_bps, 200);
-    }
-
-    #[test]
-    fn observed_total_above_usual_speed_is_not_clamped_down() {
-        let now = Local.with_ymd_and_hms(2026, 4, 9, 10, 0, 0).unwrap();
-        let schedule = [Some(3_000); 24];
-        let selected = active_item("alpha.iso", 4_400, 2_200);
-        let snapshot = snapshot_with(Some(3_000), Some(1_800), schedule, vec![selected.clone()]);
-
-        let projection = project_scheduled_eta(now, &snapshot, &selected).expect("projection");
-
-        assert_eq!(projection.projected_now_speed_bps, 2_200);
-        assert_eq!(projection.phases[0].projected_aggregate_speed_bps, 2_200);
-        assert_eq!(projection.phases[0].projected_item_speed_bps, 2_200);
-        assert_eq!(projection.eta_seconds, 2);
-    }
-
-    #[test]
-    fn unlimited_current_cap_ignores_usual_speed_entirely() {
-        let now = Local.with_ymd_and_hms(2026, 4, 9, 10, 0, 0).unwrap();
-        let schedule = [Some(3_000); 24];
-        let selected = active_item("alpha.iso", 4_400, 2_200);
-        let snapshot = snapshot_with(None, Some(1_800), schedule, vec![selected.clone()]);
-
-        let projection = project_scheduled_eta(now, &snapshot, &selected).expect("projection");
-
-        assert_eq!(projection.projected_now_speed_bps, 2_200);
-        assert_eq!(projection.phases[0].projected_aggregate_speed_bps, 2_200);
-        assert_eq!(projection.phases[0].projected_item_speed_bps, 2_200);
-        assert_eq!(projection.eta_seconds, 2);
-    }
-
-    #[test]
-    fn ignores_waiting_and_paused_downloads() {
-        let now = Local.with_ymd_and_hms(2026, 4, 9, 10, 0, 0).unwrap();
-        let schedule = [Some(200); 24];
-        let selected = active_item("alpha.iso", 1_000, 100);
-        let peer = active_item("beta.iso", 1_000, 100);
-        let waiting = with_status(
-            active_item("waiting.iso", 500, 500),
-            DownloadStatus::Waiting,
-            500,
-        );
-        let paused = with_status(
-            active_item("paused.iso", 500, 500),
-            DownloadStatus::Paused,
-            500,
-        );
-        let snapshot = snapshot_with(
-            Some(200),
-            None,
-            schedule,
-            vec![selected.clone(), peer, waiting, paused],
-        );
-
-        let projection = project_scheduled_eta(now, &snapshot, &selected).expect("projection");
-
-        assert_eq!(projection.projected_now_speed_bps, 100);
-        assert_eq!(projection.phases[0].peer_count, 1);
-        assert_eq!(
-            projection.phases[0].peer_names,
-            vec!["beta.iso".to_string()]
-        );
-    }
-
-    #[test]
-    fn returns_none_when_selected_item_has_zero_speed() {
-        let now = Local.with_ymd_and_hms(2026, 4, 9, 10, 0, 0).unwrap();
-        let schedule = [Some(200); 24];
-        let selected = active_item("alpha.iso", 1_000, 0);
-        let snapshot = snapshot_with(Some(200), None, schedule, vec![selected.clone()]);
-
         assert!(project_scheduled_eta(now, &snapshot, &selected).is_none());
     }
 
     #[test]
-    fn final_phase_shows_full_observed_share_after_all_peers_finish() {
+    fn cold_start_uses_conservative_fraction_of_known_capacity() {
         let now = Local.with_ymd_and_hms(2026, 4, 9, 10, 0, 0).unwrap();
-        let schedule = [Some(200); 24];
-        let selected = active_item("alpha.iso", 700, 100);
-        let peer_one = active_item("beta.iso", 50, 50);
-        let peer_two = active_item("gamma.iso", 50, 50);
+        let selected = item("starting", 800, 0, DownloadStatus::Active, Some(0), false);
         let snapshot = snapshot_with(
-            Some(200),
-            None,
-            schedule,
-            vec![selected.clone(), peer_one, peer_two],
+            Some(1_000),
+            Some(1_000),
+            [Some(1_000); 24],
+            1,
+            Some(QueueBatchTarget::Number(0)),
+            vec![selected.clone()],
         );
+        let projection = project_scheduled_eta(now, &snapshot, &selected).unwrap();
+        assert_eq!(projection.projected_now_speed_bps, 800);
+        assert_eq!(projection.eta_seconds, 1);
+    }
 
-        let projection = project_scheduled_eta(now, &snapshot, &selected).expect("projection");
-        let final_phase = projection.phases.last().expect("final phase");
+    #[test]
+    fn freed_bandwidth_is_redistributed_without_selected_row_bias() {
+        let now = Local.with_ymd_and_hms(2026, 4, 9, 10, 0, 0).unwrap();
+        let selected = item("alpha", 1_000, 100, DownloadStatus::Active, Some(0), false);
+        let short = item("short", 100, 100, DownloadStatus::Active, Some(0), false);
+        let long = item("long", 10_000, 300, DownloadStatus::Active, Some(0), false);
+        let snapshot = snapshot_with(
+            Some(500),
+            Some(500),
+            [Some(500); 24],
+            3,
+            Some(QueueBatchTarget::Number(0)),
+            vec![selected.clone(), short, long.clone()],
+        );
+        let selected_projection = project_scheduled_eta(now, &snapshot, &selected).unwrap();
+        let long_projection = project_scheduled_eta(now, &snapshot, &long).unwrap();
+        assert_eq!(selected_projection.phases[1].projected_item_speed_bps, 125);
+        assert_eq!(long_projection.phases[1].projected_item_speed_bps, 375);
+    }
 
-        assert_eq!(final_phase.peer_count, 0);
-        assert_eq!(final_phase.projected_item_speed_bps, 200);
-        assert!(matches!(
-            final_phase.end,
-            ProjectionPhaseEnd::SelectedCompleted
-        ));
+    #[test]
+    fn explicitly_started_batch_runs_before_lower_held_batch() {
+        let now = Local.with_ymd_and_hms(2026, 4, 9, 10, 0, 0).unwrap();
+        let selected = item("lower", 100, 0, DownloadStatus::Paused, Some(0), true);
+        let current = item("started", 100, 100, DownloadStatus::Active, Some(2), false);
+        let snapshot = snapshot_with(
+            Some(100),
+            Some(100),
+            [Some(100); 24],
+            1,
+            Some(QueueBatchTarget::Number(2)),
+            vec![selected.clone(), current],
+        );
+        let projection = project_scheduled_eta(now, &snapshot, &selected).unwrap();
+        assert_eq!(projection.eta_seconds, 2);
+        assert_eq!(projection.projected_now_speed_bps, 0);
+    }
+
+    #[test]
+    fn unassigned_batch_projects_after_numbered_batches() {
+        let now = Local.with_ymd_and_hms(2026, 4, 9, 10, 0, 0).unwrap();
+        let numbered = item("numbered", 100, 100, DownloadStatus::Active, Some(9), false);
+        let selected = item("unassigned", 100, 0, DownloadStatus::Paused, None, true);
+        let snapshot = snapshot_with(
+            Some(100),
+            Some(100),
+            [Some(100); 24],
+            1,
+            Some(QueueBatchTarget::Number(9)),
+            vec![numbered, selected.clone()],
+        );
+        assert_eq!(
+            project_scheduled_eta(now, &snapshot, &selected)
+                .unwrap()
+                .eta_seconds,
+            2
+        );
+    }
+
+    #[test]
+    fn midnight_wrap_uses_the_next_days_schedule() {
+        let now = Local.with_ymd_and_hms(2026, 4, 9, 23, 59, 59).unwrap();
+        let mut schedule = [Some(100); 24];
+        schedule[0] = Some(200);
+        let selected = item(
+            "overnight",
+            300,
+            100,
+            DownloadStatus::Active,
+            Some(0),
+            false,
+        );
+        let snapshot = snapshot_with(
+            Some(100),
+            Some(200),
+            schedule,
+            1,
+            Some(QueueBatchTarget::Number(0)),
+            vec![selected.clone()],
+        );
+        let projection = project_scheduled_eta(now, &snapshot, &selected).unwrap();
+        assert_eq!(projection.eta_seconds, 2);
+        assert_eq!(projection.phases[1].projected_item_speed_bps, 200);
+    }
+
+    #[test]
+    fn manual_mode_and_corrupt_byte_totals_do_not_invent_a_projection() {
+        let now = Local.with_ymd_and_hms(2026, 4, 9, 10, 0, 0).unwrap();
+        let mut selected = item("invalid", 100, 100, DownloadStatus::Active, Some(0), false);
+        selected.completed_bytes = 101;
+        let mut snapshot = snapshot_with(
+            Some(100),
+            Some(100),
+            [Some(100); 24],
+            1,
+            Some(QueueBatchTarget::Number(0)),
+            vec![selected.clone()],
+        );
+        assert!(project_scheduled_eta(now, &snapshot, &selected).is_none());
+        selected.completed_bytes = 0;
+        snapshot.current_downloads = vec![selected.clone()];
+        snapshot.scheduler.mode = ManualOrScheduled::Manual;
+        assert!(project_scheduled_eta(now, &snapshot, &selected).is_none());
     }
 }

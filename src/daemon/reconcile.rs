@@ -422,6 +422,14 @@ impl DaemonState {
             .lock()
             .await
             .refresh(refresh_started, &mut current_downloads);
+        // Keep the aggregate surface as steady as the per-download rows. The
+        // sum also avoids a second, independently jittery aria2 estimator.
+        snapshot.global.download_speed_bps = current_downloads
+            .iter()
+            .filter(|item| item.status == DownloadStatus::Active)
+            .fold(0u64, |total, item| {
+                total.saturating_add(item.download_speed_bps)
+            });
         snapshot.current_downloads = current_downloads;
         snapshot.history_downloads = history_downloads;
         let snapshot_copy = snapshot.clone();

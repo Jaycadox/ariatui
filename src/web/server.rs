@@ -4221,12 +4221,12 @@ fn render_projection_timeline(
     now: chrono::DateTime<Local>,
     projection: &ScheduledEtaProjection,
 ) -> String {
-    let total_duration = projection
+    let recorded_duration = projection
         .phases
         .iter()
         .map(|phase| phase.duration_seconds.max(1))
-        .sum::<u64>()
-        .max(1);
+        .sum::<u64>();
+    let total_duration = projection.eta_seconds.max(recorded_duration).max(1);
     let view_width = 580.0;
     let mut x = 0.0;
     let mut body = String::new();
@@ -4268,7 +4268,15 @@ fn render_projection_timeline(
         body.push_str("</g>");
         x += width;
     }
-    body.push_str(r##"<text x="16" y="72" fill="#bdbdbd" font-size="11">Blue: schedule change · Green: peer finished · Gold: selected download finished</text>"##);
+    if projection.phase_count > projection.phases.len() && x < view_width {
+        let width = view_width - x;
+        let omitted = projection.phase_count - projection.phases.len();
+        let _ = write!(
+            body,
+            r##"<g><rect x="{x:.1}" y="18" width="{width:.1}" height="32" rx="4" fill="#555"><title>{omitted} later phases summarized</title></rect></g>"##,
+        );
+    }
+    body.push_str(r##"<text x="16" y="72" fill="#bdbdbd" font-size="11">Blue: schedule · Green: peer · Gold: done · Gray: summarized</text>"##);
     body.push_str("</svg>");
     body
 }
@@ -4285,6 +4293,13 @@ fn render_projection_phase_list(
             esc(&phase_range_label(now, phase)),
             esc(&format_bytes_per_sec(phase.projected_item_speed_bps)),
             esc(&phase_summary(phase))
+        );
+    }
+    if projection.phase_count > projection.phases.len() {
+        let _ = write!(
+            body,
+            "<li>+{} later projected phases summarized</li>",
+            projection.phase_count - projection.phases.len()
         );
     }
     body
@@ -4334,6 +4349,13 @@ fn phase_event_summary(phase: &ScheduledEtaPhase) -> &'static str {
 }
 
 fn peer_summary(phase: &ScheduledEtaPhase) -> String {
+    if phase.projected_item_speed_bps == 0 {
+        return if phase.peer_count == 0 {
+            "waiting for its batch".into()
+        } else {
+            format!("queued behind {}", peer_names_summary(phase))
+        };
+    }
     if phase.peer_count == 0 {
         "full observed share".into()
     } else {
