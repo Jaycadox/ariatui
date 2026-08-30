@@ -10,6 +10,12 @@ The extension is intentionally thin:
 
 It does not manage authentication itself. Sign into each remote web UI in a normal browser tab first, then the extension popups reuse those browser cookies.
 
+## Batch Numbers
+
+AriatUI downloads in batches. Every download carries an optional batch number: lower numbers download first, downloads sharing a number transfer together, and a download with no batch number goes last. Only the batch in play transfers, and at most the configured number of downloads share it, so a long list of links does not all start at once.
+
+Give a remote a **Default batch number** in the options page and every link you send to that remote prefills with that batch. Leave it blank to keep sending unassigned downloads that wait until your numbered batches are done. You can still change the number in the popup before confirming.
+
 ## Temporary Load
 
 Use this only while iterating on the extension. Firefox removes temporary add-ons when the browser exits.

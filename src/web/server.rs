@@ -20,8 +20,8 @@ use url::form_urlencoded;
 
 use crate::{
     daemon::{
-        ApiPayload, ApiRequest, DownloadItem, DownloadStatus, ResolvedHttpUrl, SharedDaemonState,
-        Snapshot,
+        ApiPayload, ApiRequest, DownloadItem, DownloadStatus, QueueBatchTarget, ResolvedHttpUrl,
+        SharedDaemonState, Snapshot,
     },
     download_uri::{DownloadUriKind, classify_download_uri, magnet_display_name},
     eta::{ProjectionPhaseEnd, ScheduledEtaPhase, ScheduledEtaProjection, project_scheduled_eta},
@@ -32,8 +32,8 @@ use crate::{
     routing::{DownloadRoutingRule, describe_directory_input, match_rule, validate_rule},
     schedule,
     state::{
-        CancelBehaviorPreference, ManualOrScheduled, TorrentStreamingMode,
-        validate_torrent_size_mib,
+        CancelBehaviorPreference, ManualOrScheduled, TorrentStreamingMode, parse_queue_batch_token,
+        validate_queue_batch, validate_queue_slots, validate_torrent_size_mib,
     },
     units::{self, Percentage, format_bytes, format_bytes_per_sec, format_eta, format_limit},
     web::{
@@ -58,6 +58,7 @@ pub fn router(state: SharedDaemonState) -> Router {
         .route("/api/pairings/{request_id}", get(api_pairing_status))
         .route("/api/session", get(api_session).delete(api_delete_session))
         .route("/api/downloads", post(api_add_download))
+        .route("/api/downloads/{gid}/batch", post(api_set_download_batch))
         .route("/api/v2/auth/login", post(qbt_login))
         .route("/api/v2/auth/logout", post(qbt_logout))
         .route("/api/v2/app/version", get(qbt_app_version))
@@ -94,9 +95,13 @@ pub fn router(state: SharedDaemonState) -> Router {
         .route("/current/add", get(add_url_page))
         .route("/current/add/resolve", post(add_url_resolve))
         .route("/current/add/confirm", post(add_url_confirm))
+        .route("/current/slots", post(save_queue_slots))
+        .route("/current/batch/hold", post(hold_queue_batch))
+        .route("/current/batch/start", post(start_queue_batch))
         .route("/current/{gid}/move/up", post(move_download_up))
         .route("/current/{gid}/move/down", post(move_download_down))
         .route("/current/{gid}/reorder", post(reorder_download))
+        .route("/current/{gid}/batch", post(set_download_batch))
         .route("/current/{gid}/pause", post(pause_download))
         .route("/current/{gid}/resume", post(resume_download))
         .route(
@@ -197,6 +202,8 @@ struct ItemQuery {
 #[derive(Debug, Deserialize)]
 struct UrlFormData {
     url: String,
+    #[serde(default)]
+    batch: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,6 +211,25 @@ struct ConfirmAddFormData {
     url: String,
     filename_choice: String,
     custom_filename: Option<String>,
+    #[serde(default)]
+    batch: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchFormData {
+    #[serde(default)]
+    batch: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueueSlotsFormData {
+    slots: u8,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueueBatchFormData {
+    #[serde(default)]
+    batch: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,6 +294,13 @@ struct WebUiFormData {
 struct ApiAddDownloadBody {
     url: String,
     filename: Option<String>,
+    #[serde(default)]
+    batch: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiBatchBody {
+    batch: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,6 +311,7 @@ struct LoginQuery {
 #[derive(Debug, Deserialize)]
 struct ExtensionAddQuery {
     url: Option<String>,
+    batch: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -285,6 +319,8 @@ struct ExtensionAddFormData {
     url: String,
     filename_choice: String,
     custom_filename: Option<String>,
+    #[serde(default)]
+    batch: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -382,6 +418,8 @@ struct ApiAddDownloadQueuedResponse {
     display_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     final_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -393,6 +431,8 @@ struct ApiAddDownloadPromptResponse {
     remote_filename: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     final_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -877,7 +917,7 @@ async fn api_add_download(
     {
         return ApiErrorResponse::unauthorized("authentication required").into_response();
     }
-    match prepare_download_submission(&state, &body.url).await {
+    match prepare_download_submission(&state, &body.url, body.batch).await {
         Ok(prepared) => {
             if body.filename.is_none()
                 && let PreparedDownloadSubmission::Prompt {
@@ -886,6 +926,7 @@ async fn api_add_download(
                     remote_label,
                     remote_filename,
                     final_url,
+                    batch,
                 } = &prepared
             {
                 return Json(ApiAddDownloadPromptResponse {
@@ -895,6 +936,7 @@ async fn api_add_download(
                     remote_label,
                     remote_filename: remote_filename.clone(),
                     final_url: final_url.clone(),
+                    batch: *batch,
                 })
                 .into_response();
             }
@@ -907,11 +949,13 @@ async fn api_add_download(
                 queued: true,
                 display_name: queued.display_name.clone(),
                 final_url: queued.final_url.clone(),
+                batch: queued.batch,
             };
             match state
                 .execute(ApiRequest::AddHttpUrl {
                     url: queued.url,
                     filename: queued.filename,
+                    batch: queued.batch,
                 })
                 .await
             {
@@ -928,24 +972,32 @@ async fn extension_add_page(
     jar: CookieJar,
     Query(query): Query<ExtensionAddQuery>,
 ) -> Response {
-    let url = query.url.unwrap_or_default().trim().to_string();
-    let next = extension_add_path(&url);
+    let url = query.url.clone().unwrap_or_default().trim().to_string();
+    let Some(batch) = optional_batch_token(query.batch.as_deref()) else {
+        return Html(render_extension_add_error(
+            "Batch must be a whole number from 0 to 9999, or blank for unassigned.",
+        ))
+        .into_response();
+    };
+    let next = extension_add_path(&url, batch);
     if let Some(response) = auth_redirect_with_next(&state, &jar, Some(&next)).await {
         return response;
     }
-    match prepare_download_submission(&state, &url).await {
+    match prepare_download_submission(&state, &url, batch).await {
         Ok(PreparedDownloadSubmission::Prompt {
             url,
             url_filename,
             remote_label,
             remote_filename,
             final_url,
+            batch,
         }) => Html(render_extension_add_prompt(
             &url,
             &url_filename,
             remote_label,
             &remote_filename,
             final_url.as_deref(),
+            batch,
             None,
         ))
         .into_response(),
@@ -958,12 +1010,14 @@ async fn extension_add_page(
                 .execute(ApiRequest::AddHttpUrl {
                     url: queued.url,
                     filename: queued.filename,
+                    batch: queued.batch,
                 })
                 .await
             {
                 Ok(_) => Html(render_extension_add_done(
                     &queued.display_name,
                     queued.final_url.as_deref(),
+                    queued.batch,
                 ))
                 .into_response(),
                 Err(error) => Html(render_extension_add_error(&error.to_string())).into_response(),
@@ -978,11 +1032,17 @@ async fn extension_add_submit(
     jar: CookieJar,
     Form(form): Form<ExtensionAddFormData>,
 ) -> Response {
-    let next = extension_add_path(&form.url);
+    let Some(batch) = optional_batch_token(form.batch.as_deref()) else {
+        return Html(render_extension_add_error(
+            "Batch must be a whole number from 0 to 9999, or blank for unassigned.",
+        ))
+        .into_response();
+    };
+    let next = extension_add_path(&form.url, batch);
     if let Some(response) = auth_redirect_with_next(&state, &jar, Some(&next)).await {
         return response;
     }
-    let prepared = match prepare_download_submission(&state, &form.url).await {
+    let prepared = match prepare_download_submission(&state, &form.url, batch).await {
         Ok(prepared) => prepared,
         Err(error) => return Html(render_extension_add_error(&error.message)).into_response(),
     };
@@ -996,6 +1056,7 @@ async fn extension_add_submit(
         Err(error) => {
             return Html(render_extension_add_prompt_from_submission(
                 &form.url,
+                batch,
                 error.message.as_str(),
             ))
             .into_response();
@@ -1005,16 +1066,19 @@ async fn extension_add_submit(
         .execute(ApiRequest::AddHttpUrl {
             url: queued.url,
             filename: queued.filename,
+            batch: queued.batch,
         })
         .await
     {
         Ok(_) => Html(render_extension_add_done(
             &queued.display_name,
             queued.final_url.as_deref(),
+            queued.batch,
         ))
         .into_response(),
         Err(error) => Html(render_extension_add_prompt_from_submission(
             &form.url,
+            batch,
             &error.to_string(),
         ))
         .into_response(),
@@ -1050,6 +1114,7 @@ struct QueuedDownload {
     filename: Option<String>,
     display_name: String,
     final_url: Option<String>,
+    batch: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -1061,6 +1126,7 @@ enum PreparedDownloadSubmission {
         remote_label: &'static str,
         remote_filename: String,
         final_url: Option<String>,
+        batch: Option<u32>,
     },
 }
 
@@ -1072,12 +1138,14 @@ impl PreparedDownloadSubmission {
                 url,
                 remote_filename,
                 final_url,
+                batch,
                 ..
             } => QueuedDownload {
                 url,
                 filename: Some(remote_filename.clone()),
                 display_name: remote_filename,
                 final_url,
+                batch,
             },
         }
     }
@@ -1097,7 +1165,12 @@ impl PreparedDownloadSubmission {
                 }
                 Ok(queue)
             }
-            Self::Prompt { url, final_url, .. } => {
+            Self::Prompt {
+                url,
+                final_url,
+                batch,
+                ..
+            } => {
                 let Some(filename) = custom else {
                     return Err(ApiErrorResponse::bad_request("filename is required"));
                 };
@@ -1106,6 +1179,7 @@ impl PreparedDownloadSubmission {
                     filename: Some(filename.clone()),
                     display_name: filename,
                     final_url,
+                    batch,
                 })
             }
         }
@@ -1159,7 +1233,10 @@ fn filename_from_url_fallback(url: &str) -> String {
 async fn prepare_download_submission(
     state: &SharedDaemonState,
     url: &str,
+    batch: Option<u32>,
 ) -> Result<PreparedDownloadSubmission, ApiErrorResponse> {
+    let batch = validate_queue_batch(batch)
+        .map_err(|error| ApiErrorResponse::bad_request(&error.to_string()))?;
     let url = url.trim().to_string();
     if url.is_empty() {
         return Err(ApiErrorResponse::bad_request("URI cannot be empty"));
@@ -1173,6 +1250,7 @@ async fn prepare_download_submission(
             filename: None,
             final_url: None,
             url,
+            batch,
         })),
         DownloadUriKind::HttpLike => match state
             .execute(ApiRequest::ResolveHttpUrl { url: url.clone() })
@@ -1180,13 +1258,14 @@ async fn prepare_download_submission(
         {
             Ok(reply) => match reply.payload {
                 Some(ApiPayload::ResolvedHttpUrl(resolved)) => {
-                    Ok(prepared_download_from_resolved(resolved))
+                    Ok(prepared_download_from_resolved(resolved, batch))
                 }
                 _ => Ok(PreparedDownloadSubmission::Queue(QueuedDownload {
                     display_name: filename_from_url_fallback(&url),
                     filename: None,
                     final_url: None,
                     url,
+                    batch,
                 })),
             },
             Err(_) => Ok(PreparedDownloadSubmission::Queue(QueuedDownload {
@@ -1194,12 +1273,16 @@ async fn prepare_download_submission(
                 filename: None,
                 final_url: None,
                 url,
+                batch,
             })),
         },
     }
 }
 
-fn prepared_download_from_resolved(resolved: ResolvedHttpUrl) -> PreparedDownloadSubmission {
+fn prepared_download_from_resolved(
+    resolved: ResolvedHttpUrl,
+    batch: Option<u32>,
+) -> PreparedDownloadSubmission {
     if resolved.is_torrent {
         return PreparedDownloadSubmission::Queue(QueuedDownload {
             display_name: resolved
@@ -1210,6 +1293,7 @@ fn prepared_download_from_resolved(resolved: ResolvedHttpUrl) -> PreparedDownloa
             filename: None,
             final_url: resolved.final_url,
             url: resolved.url,
+            batch,
         });
     }
     if let Some((label, remote_filename)) = prompt_candidate(&resolved) {
@@ -1219,6 +1303,7 @@ fn prepared_download_from_resolved(resolved: ResolvedHttpUrl) -> PreparedDownloa
             remote_label: label,
             remote_filename,
             final_url: resolved.final_url,
+            batch,
         }
     } else {
         PreparedDownloadSubmission::Queue(QueuedDownload {
@@ -1226,6 +1311,7 @@ fn prepared_download_from_resolved(resolved: ResolvedHttpUrl) -> PreparedDownloa
             filename: Some(resolved.url_filename),
             final_url: resolved.final_url,
             url: resolved.url,
+            batch,
         })
     }
 }
@@ -1272,7 +1358,7 @@ async fn add_url_page(State(state): State<SharedDaemonState>, jar: CookieJar) ->
         return response;
     }
     let snapshot = state.snapshot().await;
-    Html(render_add_url_page(&snapshot, None, None, None)).into_response()
+    Html(render_add_url_page(&snapshot, None, None, None, None)).into_response()
 }
 
 async fn add_url_resolve(
@@ -1285,7 +1371,17 @@ async fn add_url_resolve(
     }
     let snapshot = state.snapshot().await;
     let url = form.url.trim().to_string();
-    match prepare_download_submission(&state, &url).await {
+    let Some(batch) = optional_batch_token(form.batch.as_deref()) else {
+        return Html(render_add_url_page(
+            &snapshot,
+            Some("Batch must be a whole number from 0 to 9999, or blank for unassigned."),
+            None,
+            None,
+            Some(&url),
+        ))
+        .into_response();
+    };
+    match prepare_download_submission(&state, &url, batch).await {
         Ok(PreparedDownloadSubmission::Prompt {
             url,
             url_filename,
@@ -1296,7 +1392,8 @@ async fn add_url_resolve(
             &snapshot,
             None,
             Some((&url, &url_filename, remote_label, &remote_filename)),
-            None,
+            batch,
+            Some(&url),
         ))
         .into_response(),
         Ok(prepared) => {
@@ -1305,6 +1402,7 @@ async fn add_url_resolve(
                 .execute(ApiRequest::AddHttpUrl {
                     url: queued.url,
                     filename: queued.filename,
+                    batch: queued.batch,
                 })
                 .await
             {
@@ -1313,6 +1411,7 @@ async fn add_url_resolve(
                     &snapshot,
                     Some(&error.to_string()),
                     None,
+                    batch,
                     Some(&url),
                 ))
                 .into_response(),
@@ -1322,6 +1421,7 @@ async fn add_url_resolve(
             &snapshot,
             Some(&error.message),
             None,
+            batch,
             Some(&url),
         ))
         .into_response(),
@@ -1342,11 +1442,22 @@ async fn add_url_confirm(
     } else {
         form.filename_choice.trim().to_string()
     };
+    let Some(batch) = optional_batch_token(form.batch.as_deref()) else {
+        return Html(render_add_url_page(
+            &snapshot,
+            Some("Batch must be a whole number from 0 to 9999, or blank for unassigned."),
+            None,
+            None,
+            Some(&form.url),
+        ))
+        .into_response();
+    };
     if filename.is_empty() {
         return Html(render_add_url_page(
             &snapshot,
             Some("Filename cannot be empty"),
             None,
+            batch,
             Some(&form.url),
         ))
         .into_response();
@@ -1355,6 +1466,7 @@ async fn add_url_confirm(
         .execute(ApiRequest::AddHttpUrl {
             url: form.url.clone(),
             filename: Some(filename),
+            batch,
         })
         .await
     {
@@ -1363,6 +1475,7 @@ async fn add_url_confirm(
             &snapshot,
             Some(&error.to_string()),
             None,
+            batch,
             Some(&form.url),
         ))
         .into_response(),
@@ -1461,6 +1574,176 @@ async fn reorder_download(
         }
     }
     Redirect::to(&current_path(&query)).into_response()
+}
+
+async fn set_download_batch(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Path(gid): Path<String>,
+    Query(query): Query<ItemQuery>,
+    Form(form): Form<BatchFormData>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let list = CurrentListQuery::from_query(&query);
+    let Some(batch) = parse_queue_batch_token(&form.batch) else {
+        let snapshot = state.snapshot().await;
+        return Html(render_current_page(
+            &snapshot,
+            &list,
+            None,
+            Some("Batch must be a whole number from 0 to 9999, or blank for unassigned."),
+            true,
+        ))
+        .into_response();
+    };
+    match state
+        .execute(ApiRequest::SetDownloadBatch { gid, batch })
+        .await
+    {
+        Ok(_) => Redirect::to(&current_path(&query)).into_response(),
+        Err(error) => {
+            let snapshot = state.snapshot().await;
+            Html(render_current_page(
+                &snapshot,
+                &list,
+                None,
+                Some(&error.to_string()),
+                true,
+            ))
+            .into_response()
+        }
+    }
+}
+
+async fn api_set_download_batch(
+    State(state): State<SharedDaemonState>,
+    headers: HeaderMap,
+    jar: CookieJar,
+    Path(gid): Path<String>,
+    Json(body): Json<ApiBatchBody>,
+) -> Response {
+    if authenticated_api_token(&state, &headers, &jar)
+        .await
+        .is_none()
+    {
+        return ApiErrorResponse::unauthorized("authentication required").into_response();
+    }
+    match state
+        .execute(ApiRequest::SetDownloadBatch {
+            gid,
+            batch: body.batch,
+        })
+        .await
+    {
+        Ok(_) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "status": "updated", "batch": body.batch })),
+        )
+            .into_response(),
+        Err(error) => ApiErrorResponse::bad_request(&error.to_string()).into_response(),
+    }
+}
+
+async fn save_queue_slots(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Query(query): Query<ItemQuery>,
+    Form(form): Form<QueueSlotsFormData>,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let list = CurrentListQuery::from_query(&query);
+    match validate_queue_slots(form.slots) {
+        Ok(slots) => match state.execute(ApiRequest::SetQueueSlots { slots }).await {
+            Ok(_) => Redirect::to(&current_path(&query)).into_response(),
+            Err(error) => {
+                let snapshot = state.snapshot().await;
+                Html(render_current_page(
+                    &snapshot,
+                    &list,
+                    None,
+                    Some(&error.to_string()),
+                    true,
+                ))
+                .into_response()
+            }
+        },
+        Err(error) => {
+            let snapshot = state.snapshot().await;
+            Html(render_current_page(
+                &snapshot,
+                &list,
+                None,
+                Some(&error.to_string()),
+                true,
+            ))
+            .into_response()
+        }
+    }
+}
+
+async fn hold_queue_batch(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Query(query): Query<ItemQuery>,
+    Form(form): Form<QueueBatchFormData>,
+) -> Response {
+    queue_batch_action(state, jar, query, form, false).await
+}
+
+async fn start_queue_batch(
+    State(state): State<SharedDaemonState>,
+    jar: CookieJar,
+    Query(query): Query<ItemQuery>,
+    Form(form): Form<QueueBatchFormData>,
+) -> Response {
+    queue_batch_action(state, jar, query, form, true).await
+}
+
+async fn queue_batch_action(
+    state: SharedDaemonState,
+    jar: CookieJar,
+    query: ItemQuery,
+    form: QueueBatchFormData,
+    start: bool,
+) -> Response {
+    if let Some(response) = auth_redirect(&state, &jar).await {
+        return response;
+    }
+    let list = CurrentListQuery::from_query(&query);
+    let Some(target) = QueueBatchTarget::from_token(&form.batch) else {
+        let snapshot = state.snapshot().await;
+        return Html(render_current_page(
+            &snapshot,
+            &list,
+            None,
+            Some("Batch must be a whole number from 0 to 9999, or “unassigned”."),
+            true,
+        ))
+        .into_response();
+    };
+    let request = if start {
+        ApiRequest::StartQueueBatch { target }
+    } else {
+        ApiRequest::HoldQueueBatch { target }
+    };
+    match state.execute(request).await {
+        Ok(_) => Redirect::to(&current_path(&query)).into_response(),
+        Err(error) => {
+            let snapshot = state.snapshot().await;
+            Html(render_current_page(
+                &snapshot,
+                &list,
+                None,
+                Some(&error.to_string()),
+                true,
+            ))
+            .into_response()
+        }
+    }
 }
 
 async fn cancel_page(
@@ -2451,6 +2734,7 @@ fn render_header(snapshot: &Snapshot, return_to: &str) -> String {
 <span data-key="upload-speed"><small>Up</small><strong>{}</strong></span>
 <span data-key="active-count"><small>Active</small><strong>{}</strong></span>
 <span data-key="queue-count"><small>Queued</small><strong>{}</strong></span>
+<span data-key="batch-count"><small>Batch</small><strong>{}</strong></span>
 </div>
 <details class="speed-control" data-key="speed-control">
 <summary><span><small>{}</small><strong>{}</strong></span><span aria-hidden="true">⌄</span></summary>
@@ -2481,6 +2765,11 @@ fn render_header(snapshot: &Snapshot, return_to: &str) -> String {
         esc(&format_bytes_per_sec(snapshot.global.upload_speed_bps)),
         snapshot.global.num_active,
         snapshot.global.num_waiting,
+        esc(&snapshot
+            .queue
+            .active_batch
+            .map(|target| target.label())
+            .unwrap_or_else(|| "idle".to_string()),),
         esc(mode_label),
         esc(&effective_limit),
         esc(&effective_limit),
@@ -2671,15 +2960,39 @@ fn render_current_page(
         } else {
             (item.completed_bytes as f64 / item.total_bytes as f64 * 100.0).clamp(0.0, 100.0)
         };
+        let status_word = if item.queue_held {
+            "held".to_string()
+        } else {
+            status_label(&item.status).to_string()
+        };
+        let batch_badge = format!(
+            r#"<span class="batch-badge" title="Batch {}">{}</span>"#,
+            esc(&batch_label(item.batch)),
+            esc(&batch_label(item.batch)),
+        );
+        let batch_editor = format!(
+            r#"<form method="post" action="/current/{gid}/batch{query}" class="batch-form" draggable="false">
+<label class="sr-only" for="batch-{gid}">Batch number for {name}</label>
+<input id="batch-{gid}" type="number" name="batch" min="0" max="9999" value="{batch}" placeholder="–" draggable="false">
+<button class="icon-button" type="submit" title="Set batch" aria-label="Set batch for {name}">↵</button>
+</form>"#,
+            gid = esc(&item.gid),
+            query = esc(&item_query),
+            name = esc(&item.name),
+            batch = item
+                .batch
+                .map(|batch| batch.to_string())
+                .unwrap_or_default(),
+        );
         let _ = write!(
             rows,
             r#"<article class="download-item {selected_class}" data-key="download-{gid}" data-gid="{gid}" data-status="{status}"{reorder_attributes}>
 <a class="download-main" href="/current{item_href}" aria-label="View details for {name}">
-<div class="download-heading"><strong>{name}</strong><span class="status-badge {status}">{status}</span></div>
+<div class="download-heading"><strong>{name}</strong>{batch_badge}<span class="status-badge {status_word}">{status_word}</span></div>
 <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{progress:.0}"><span style="width:{progress:.2}%"></span></div>
 <div class="download-meta"><span>{progress_text} · {done} of {total}</span><span>{speed}</span><span>{eta}</span></div>
 </a>
-<div class="item-actions">{actions}</div>
+<div class="item-actions">{batch_editor}{actions}</div>
 </article>"#,
             gid = esc(&item.gid),
             status = esc(status_label(&item.status)),
@@ -2698,6 +3011,9 @@ fn render_current_page(
             eta = esc(&format_eta(list_eta)),
             actions = actions,
             reorder_attributes = reorder_attributes,
+            batch_badge = batch_badge,
+            batch_editor = batch_editor,
+            status_word = esc(&status_word),
         );
     }
     if rows.is_empty() {
@@ -2728,9 +3044,11 @@ fn render_current_page(
 <option value="active" {filter_active}>Active</option>
 <option value="waiting" {filter_waiting}>Waiting</option>
 <option value="paused" {filter_paused}>Paused</option>
+<option value="held" {filter_held}>Held for turn</option>
 </select>
 <select name="sort">
 <option value="queue" {sort_queue}>Queue</option>
+<option value="batch" {sort_batch}>Batch</option>
 <option value="name" {sort_name}>Name</option>
 <option value="progress" {sort_progress}>Progress</option>
 <option value="speed" {sort_speed}>Speed</option>
@@ -2742,14 +3060,17 @@ fn render_current_page(
 <form method="post" action="/current/resume-all{query}"><button class="button subtle">Resume all</button></form>
 </div>
 </div>
-<p class="interaction-hint"><span class="drag-handle-symbol">⠿</span> Drag queued or paused downloads to change their order.</p>
+<p class="interaction-hint"><span class="drag-handle-symbol">⠿</span> Set a batch number on every download: same number means “transfer together”, lower numbers go first.</p>
+{queue_panel}
 "#,
         search = esc(&query.search),
         filter_all = selected_attr(query.filter == CurrentFilter::All),
         filter_active = selected_attr(query.filter == CurrentFilter::Active),
         filter_waiting = selected_attr(query.filter == CurrentFilter::Waiting),
         filter_paused = selected_attr(query.filter == CurrentFilter::Paused),
+        filter_held = selected_attr(query.filter == CurrentFilter::Held),
         sort_queue = selected_attr(query.sort == CurrentSort::Queue),
+        sort_batch = selected_attr(query.sort == CurrentSort::Batch),
         sort_name = selected_attr(query.sort == CurrentSort::Name),
         sort_progress = selected_attr(query.sort == CurrentSort::Progress),
         sort_speed = selected_attr(query.sort == CurrentSort::Speed),
@@ -2757,6 +3078,7 @@ fn render_current_page(
         query = esc(&current_query),
         visible_count = visible.len(),
         total_count = snapshot.current_downloads.len(),
+        queue_panel = render_queue_panel(snapshot, &current_query),
     );
     body.push_str("<div class=\"split\">");
     let _ = write!(
@@ -2775,10 +3097,72 @@ fn render_current_page(
     render_shell(snapshot, WebTab::Current, &body, auto_refresh, "Current")
 }
 
+fn render_queue_panel(snapshot: &Snapshot, query_suffix: &str) -> String {
+    let queue = &snapshot.queue;
+    let active = match queue.active_batch {
+        Some(target) => format!("Batch {} is in play", target.label()),
+        None => "Nothing is downloading right now".into(),
+    };
+    let mut rows = String::new();
+    for batch in &queue.batches {
+        let is_active = queue.active_batch == Some(batch.target);
+        let token = batch.target.label();
+        let turn = if is_active {
+            r#"<span class="turn-badge">in play</span>"#
+        } else {
+            r#"<span class="turn-badge muted-turn">waits</span>"#
+        };
+        let _ = write!(
+            rows,
+            r#"<tr data-key="queue-batch-{token}">
+<td><span class="batch-badge">{token}</span></td>
+<td>{turn}</td>
+<td class="queue-count">{running}</td>
+<td class="queue-count">{waiting}</td>
+<td class="queue-count">{paused}</td>
+<td class="queue-count">{held}</td>
+<td class="queue-actions"><form method="post" action="/current/batch/hold{query}"><input type="hidden" name="batch" value="{token}"><button class="button subtle" title="Pause batch {token}. It stays paused until you start it again.">Hold</button></form><form method="post" action="/current/batch/start{query}"><input type="hidden" name="batch" value="{token}"><button class="button subtle" title="Pause other batches and start batch {token} now">Start now</button></form></td>
+</tr>"#,
+            token = esc(&token),
+            query = esc(query_suffix),
+            running = batch.running,
+            waiting = batch.waiting,
+            paused = batch.paused,
+            held = batch.held,
+        );
+    }
+    if rows.is_empty() {
+        rows.push_str(r#"<tr><td colspan="7" class="muted">Nothing queued. Add a download and give it a batch number.</td></tr>"#);
+    }
+    format!(
+        r#"<section class="card queue-card" data-key="queue-panel" aria-label="Queue control">
+<div class="queue-head">
+<div><p class="eyebrow">Queue control</p><h2>Batches</h2><p class="muted">{active} · up to {slots} transferring together. Batches run lowest number first; unassigned files go last.</p></div>
+<form method="post" action="/current/slots{query}" class="inline-setting">
+<label class="sr-only" for="queue-slots">Downloads allowed at once</label>
+<input id="queue-slots" type="number" name="slots" min="1" max="16" value="{slots}">
+<button type="submit">Save</button>
+</form>
+</div>
+<div class="table-wrap">
+<table class="queue-table">
+<thead><tr><th scope="col">Batch</th><th scope="col">Turn</th><th scope="col">Active</th><th scope="col">Waiting</th><th scope="col">Paused</th><th scope="col">Held</th><th scope="col"><span class="sr-only">Batch actions</span></th></tr></thead>
+<tbody>{rows}</tbody>
+</table>
+</div>
+</section>"#,
+        active = esc(&active),
+        slots = queue.slots,
+        query = esc(query_suffix),
+        rows = rows,
+    )
+}
+
 fn render_add_url_page(
     snapshot: &Snapshot,
     error: Option<&str>,
     chooser: Option<(&str, &str, &str, &str)>,
+    batch: Option<u32>,
     initial_url: Option<&str>,
 ) -> String {
     let mut body = String::new();
@@ -2794,11 +3178,14 @@ fn render_add_url_page(
 <form method="post" action="/current/add/resolve" class="stack">
 <label for="download-url">Download link</label>
 <input id="download-url" type="text" inputmode="url" name="url" value="{}" placeholder="https://example.com/file.iso" autocomplete="off" autofocus required />
-<p class="muted">HTTP, HTTPS, FTP, SFTP and magnet links are supported.</p>
+<label for="download-batch">Batch number <span class="muted">(optional)</span></label>
+<input id="download-batch" type="number" name="batch" min="0" max="9999" value="{}" placeholder="blank = unassigned">
+<p class="muted">HTTP, HTTPS, FTP, SFTP and magnet links are supported. Lower batch numbers download first, and files sharing a batch number download together.</p>
 <div class="actions"><button type="submit" class="primary">Continue</button><a class="button" href="/current">Cancel</a></div>
 </form>
 </section>"#,
-        esc(initial_url.unwrap_or(""))
+        esc(initial_url.unwrap_or("")),
+        batch.map(|batch| batch.to_string()).unwrap_or_default()
     );
     if let Some((url, url_filename, remote_label, remote_filename)) = chooser {
         let preview = match match_rule(
@@ -2819,6 +3206,9 @@ fn render_add_url_page(
 <h2>Choose filename</h2>
 <form method="post" action="/current/add/confirm" class="stack">
 <input type="hidden" name="url" value="{}" />
+<label for="confirm-batch">Batch number <span class="muted">(optional)</span></label>
+<input id="confirm-batch" type="number" name="batch" min="0" max="9999" value="{}" placeholder="blank = unassigned">
+<p class="muted">Lower batch numbers download first. Files sharing a batch number download together.</p>
 <label><input type="radio" name="filename_choice" value="{}"> URL filename: {}</label>
 <label><input type="radio" name="filename_choice" value="{}" checked> {}: {}</label>
 <label><input type="radio" name="filename_choice" value="__custom__"> Use a custom filename</label>
@@ -2829,6 +3219,7 @@ fn render_add_url_page(
 </form>
 </section>"#,
             esc(url),
+            batch.map(|batch| batch.to_string()).unwrap_or_default(),
             esc(url_filename),
             esc(url_filename),
             esc(remote_filename),
@@ -2841,11 +3232,30 @@ fn render_add_url_page(
     render_shell(snapshot, WebTab::Current, &body, false, "Add URI")
 }
 
-fn extension_add_path(url: &str) -> String {
-    let query = form_urlencoded::Serializer::new(String::new())
-        .append_pair("url", url)
-        .finish();
-    format!("/extension/add?{query}")
+fn extension_add_path(url: &str, batch: Option<u32>) -> String {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("url", url);
+    if let Some(batch) = batch {
+        serializer.append_pair("batch", &batch.to_string());
+    }
+    format!("/extension/add?{}", serializer.finish())
+}
+
+/// Human wording for a batch number, used wherever a batch is shown.
+fn batch_label(batch: Option<u32>) -> String {
+    match batch {
+        Some(number) => number.to_string(),
+        None => "unassigned".into(),
+    }
+}
+
+/// Reads an optional batch number out of a form or query value. The outer
+/// option distinguishes malformed input from a valid unassigned batch.
+fn optional_batch_token(value: Option<&str>) -> Option<Option<u32>> {
+    match value {
+        Some(value) => parse_queue_batch_token(value),
+        None => Some(None),
+    }
 }
 
 fn render_extension_add_shell(title: &str, body: &str, close_on_load: bool) -> String {
@@ -2887,6 +3297,7 @@ fn render_extension_add_prompt(
     remote_label: &str,
     remote_filename: &str,
     final_url: Option<&str>,
+    batch: Option<u32>,
     error: Option<&str>,
 ) -> String {
     let mut body = String::new();
@@ -2904,6 +3315,9 @@ fn render_extension_add_prompt(
 <label><input type="radio" name="filename_choice" value="__custom__"> Use a custom filename</label>
 <label>Custom filename</label>
 <input type="text" name="custom_filename" value="{}" />
+<label for="extension-batch">Batch number</label>
+<input id="extension-batch" type="number" name="batch" min="0" max="9999" value="{}" placeholder="blank = unassigned">
+<small class="input-hint">Lower numbers download first. Files sharing a number download together.</small>
 <div class="actions"><button type="submit">Add download</button></div>
 </form>"#,
         esc(final_url.unwrap_or(url)),
@@ -2914,28 +3328,39 @@ fn render_extension_add_prompt(
         esc(remote_label),
         esc(remote_filename),
         esc(remote_filename),
+        batch.map(|batch| batch.to_string()).unwrap_or_default(),
     );
     render_extension_add_shell("Choose Filename", &body, false)
 }
 
-fn render_extension_add_prompt_from_submission(url: &str, error: &str) -> String {
+fn render_extension_add_prompt_from_submission(
+    url: &str,
+    batch: Option<u32>,
+    error: &str,
+) -> String {
     let body = format!(
         r#"<h2>Download not queued</h2>
 <p class="error">{}</p>
 <div class="actions"><a class="button" href="{}">Back</a></div>"#,
         esc(error),
-        esc(&extension_add_path(url))
+        esc(&extension_add_path(url, batch))
     );
     render_extension_add_shell("Download Not Queued", &body, false)
 }
 
-fn render_extension_add_done(display_name: &str, final_url: Option<&str>) -> String {
+fn render_extension_add_done(
+    display_name: &str,
+    final_url: Option<&str>,
+    batch: Option<u32>,
+) -> String {
     let body = format!(
         r#"<h2>Queued</h2>
 <p>{}</p>
-<p class="muted">{}</p>"#,
+<p class="muted">{}</p>
+<p class="muted">Batch: <strong>{}</strong></p>"#,
         esc(display_name),
-        esc(final_url.unwrap_or("This window will close automatically."))
+        esc(final_url.unwrap_or("This window will close automatically.")),
+        esc(&batch_label(batch)),
     );
     render_extension_add_shell("Queued", &body, true)
 }
@@ -3741,6 +4166,7 @@ fn render_download_details(item: Option<&DownloadItem>, snapshot: &Snapshot) -> 
         r#"<dl class="details">
 <dt>Name</dt><dd>{}</dd>
 <dt>GID</dt><dd>{}</dd>
+<dt>Batch</dt><dd>{} {}</dd>
 <dt>Progress</dt><dd>{} / {}</dd>
 <dt>Speed</dt><dd>{}</dd>
 <dt>Realtime speed</dt><dd>{}</dd>
@@ -3755,6 +4181,12 @@ fn render_download_details(item: Option<&DownloadItem>, snapshot: &Snapshot) -> 
 </dl>{}"#,
         esc(&item.name),
         esc(&item.gid),
+        esc(&batch_label(item.batch)),
+        if item.queue_held {
+            r#"<span class="status-badge held">held for its turn</span>"#
+        } else {
+            ""
+        },
         esc(&format_bytes(item.completed_bytes)),
         esc(&format_bytes(item.total_bytes)),
         esc(&format_bytes_per_sec(item.download_speed_bps)),
@@ -4258,6 +4690,23 @@ button[disabled], .is-busy { opacity: .58; cursor: wait; }
 .status-badge.active, .status-badge.complete { color: var(--brand-dark); background: var(--brand-soft); }
 .status-badge.error, .status-badge.removed { color: var(--danger); background: var(--danger-soft); }
 .status-badge.waiting { color: var(--warning); background: #392d1c; }
+.status-badge.held { color: #b6c2ff; background: #262a45; }
+.batch-badge { border-radius: 8px; padding: .16rem .48rem; color: var(--brand-dark); background: var(--brand-soft); font-size: .7rem; font-weight: 750; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.batch-badge::before { content: "batch "; color: var(--muted); font-weight: 600; }
+.batch-form { display: flex; gap: .25rem; align-items: center; }
+.batch-form input { width: 5.5rem; min-height: 34px; padding: .3rem .45rem; font-variant-numeric: tabular-nums; }
+.queue-card { max-width: 980px; }
+.queue-head { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 1rem; margin-bottom: 1rem; }
+.queue-head p { margin-bottom: 0; }
+.queue-head .inline-setting { width: 210px; }
+.queue-table { font-size: .85rem; }
+.queue-table th:nth-child(n+3):nth-child(-n+6), .queue-table td.queue-count { text-align: right; }
+.queue-count { font-variant-numeric: tabular-nums; }
+.queue-actions { display: flex; gap: .35rem; justify-content: flex-end; }
+.queue-actions form { display: inline-flex; margin: 0; }
+.queue-actions button { min-height: 32px; padding: .3rem .55rem; font-size: .78rem; }
+.turn-badge { border-radius: 999px; padding: .16rem .5rem; font-size: .7rem; font-weight: 700; background: var(--brand-soft); color: var(--brand-dark); white-space: nowrap; }
+.turn-badge.muted-turn { background: #222c26; color: var(--muted); }
 .progress-track { height: 6px; overflow: hidden; border-radius: 999px; background: #29342d; }
 .progress-track span { display: block; height: 100%; border-radius: inherit; background: var(--brand); transition: width .35s ease; }
 .download-meta { display: flex; gap: 1rem; color: var(--muted); font-size: .78rem; margin-top: .55rem; }
@@ -4328,6 +4777,10 @@ code { background: #0b100d; border: 1px solid var(--line); border-radius: 5px; p
   .filter-bar .search-field { grid-column: 1 / -1; }
   .filter-bar select { min-width: 0; }
   .bulk-actions { justify-content: flex-end; }
+  .queue-head { align-items: stretch; flex-direction: column; }
+  .queue-head .inline-setting { width: 100%; }
+  .queue-table { font-size: .78rem; }
+  .queue-actions { flex-wrap: wrap; }
   .download-item { grid-template-columns: minmax(0, 1fr); }
   .item-actions { justify-content: flex-end; }
   .download-meta span:first-child { display: none; }
@@ -5193,7 +5646,7 @@ mod tests {
 
     use crate::{
         config::AppConfig,
-        daemon::{AppContext, DaemonState},
+        daemon::{AppContext, DaemonState, QueueSnapshot, snapshot::QueueBatchSummary},
         paths::AppPaths,
         state::PersistedState,
         web::{
@@ -5220,6 +5673,7 @@ mod tests {
             torrent_session_dir: state_dir.join("rqbit-session"),
             aria2_session_file: state_dir.join("aria2.session"),
             retry_state_file: state_dir.join("retry-state.json"),
+            queue_state_file: state_dir.join("queue-state.json"),
             user_service_dir: user_service_dir.clone(),
             user_service_file: user_service_dir.join("ariatui-daemon.service"),
             system_service_file: root.join("ariatui-daemon.service"),
@@ -5356,6 +5810,8 @@ mod tests {
                 connections: None,
                 error_code: None,
                 error_message: None,
+                batch: None,
+                queue_held: false,
             })
             .collect();
         let query = CurrentListQuery::from_query(&ItemQuery::default());
@@ -5367,6 +5823,182 @@ mod tests {
         assert!(html.contains(r#"id="app-dialog""#));
         assert!(!html.contains("Move up"));
         assert!(!html.contains("Move down"));
+    }
+
+    fn queued_download(gid: &str, status: DownloadStatus, batch: Option<u32>) -> DownloadItem {
+        DownloadItem {
+            gid: gid.into(),
+            status,
+            name: format!("{gid}.iso"),
+            primary_path: None,
+            source_uri: None,
+            info_hash: None,
+            num_seeders: None,
+            followed_by: Vec::new(),
+            belongs_to: None,
+            is_metadata_only: false,
+            total_bytes: 100,
+            completed_bytes: 10,
+            download_speed_bps: 0,
+            realtime_download_speed_bps: 0,
+            upload_speed_bps: 0,
+            eta_seconds: None,
+            connections: None,
+            error_code: None,
+            error_message: None,
+            batch,
+            queue_held: false,
+        }
+    }
+
+    fn snapshot_with_batches() -> Snapshot {
+        let mut snapshot = Snapshot::empty(
+            "socket".into(),
+            "state".into(),
+            "config".into(),
+            "binary".into(),
+            "build".into(),
+        );
+        let mut held = queued_download("later", DownloadStatus::Paused, Some(1));
+        held.queue_held = true;
+        snapshot.current_downloads = vec![
+            queued_download("running", DownloadStatus::Active, Some(0)),
+            queued_download("unassigned", DownloadStatus::Waiting, None),
+            held,
+        ];
+        snapshot.queue = QueueSnapshot {
+            slots: 2,
+            active_batch: Some(QueueBatchTarget::Number(0)),
+            batches: vec![
+                QueueBatchSummary {
+                    target: QueueBatchTarget::Number(0),
+                    running: 1,
+                    waiting: 0,
+                    paused: 0,
+                    held: 0,
+                },
+                QueueBatchSummary {
+                    target: QueueBatchTarget::Number(1),
+                    running: 0,
+                    waiting: 0,
+                    paused: 0,
+                    held: 1,
+                },
+            ],
+            held_count: 1,
+            pending_count: 3,
+        };
+        snapshot
+    }
+
+    #[test]
+    fn queue_page_exposes_batch_editors_and_batch_control() {
+        let snapshot = snapshot_with_batches();
+        let query = CurrentListQuery::from_query(&ItemQuery::default());
+
+        let html = render_current_page(&snapshot, &query, None, None, true);
+
+        assert!(html.contains(r#"data-key="queue-panel""#));
+        assert!(html.contains(r#"name="slots""#));
+        assert!(html.contains(r#"/current/slots"#));
+        assert!(html.contains(r#"/current/batch/hold"#));
+        assert!(html.contains(r#"/current/batch/start"#));
+        assert!(html.contains(r#"action="/current/running/batch"#));
+        assert!(html.contains(r#"<span class="batch-badge" title="Batch 0">0</span>"#));
+        assert!(
+            html.contains(
+                r#"<span class="batch-badge" title="Batch unassigned">unassigned</span>"#
+            )
+        );
+        assert!(html.contains(r#"<option value="held" "#));
+        assert!(html.contains(r#"<option value="batch" "#));
+        assert!(html.contains(r#"class="status-badge held""#));
+        assert!(html.contains("Batch 0 is in play"));
+    }
+
+    #[test]
+    fn queue_page_batch_counts_come_from_snapshot() {
+        let snapshot = snapshot_with_batches();
+        let query = CurrentListQuery::from_query(&ItemQuery::default());
+
+        let html = render_current_page(&snapshot, &query, None, None, true);
+        let panel = html
+            .split(r#"data-key="queue-panel""#)
+            .nth(1)
+            .expect("queue panel");
+
+        assert!(panel.contains(r#"<td class="queue-count">1</td>"#));
+        assert!(panel.contains("waits"));
+        assert!(panel.contains("in play"));
+    }
+
+    #[test]
+    fn add_forms_offer_an_optional_batch_number() {
+        let snapshot = Snapshot::empty(
+            "socket".into(),
+            "state".into(),
+            "config".into(),
+            "binary".into(),
+            "build".into(),
+        );
+        let html = render_add_url_page(&snapshot, None, None, Some(4), None);
+        assert!(html.contains(r#"name="batch""#));
+        assert!(html.contains(r#"value="4""#));
+
+        let html = render_add_url_page(
+            &snapshot,
+            None,
+            Some((
+                "https://example.com/download",
+                "download",
+                "server filename",
+                "release.iso",
+            )),
+            Some(2),
+            Some("https://example.com/download"),
+        );
+        assert_eq!(html.matches(r#"name="batch""#).count(), 2);
+        assert!(html.contains(r#"value="2""#));
+    }
+
+    #[test]
+    fn browser_extension_page_carries_batch_number() {
+        let html = render_extension_add_prompt(
+            "https://example.com/file",
+            "file",
+            "server filename",
+            "release.iso",
+            None,
+            Some(7),
+            None,
+        );
+        assert!(html.contains(r#"name="batch""#));
+        assert!(html.contains(r#"value="7""#));
+
+        let done = render_extension_add_done("release.iso", None, Some(7));
+        assert!(done.contains("Batch: <strong>7</strong>"));
+    }
+
+    #[test]
+    fn batch_tokens_parse_numbers_unassigned_and_garbage() {
+        assert_eq!(
+            QueueBatchTarget::from_token("3"),
+            Some(QueueBatchTarget::Number(3))
+        );
+        assert_eq!(
+            QueueBatchTarget::from_token("unassigned"),
+            Some(QueueBatchTarget::Unassigned)
+        );
+        assert_eq!(
+            QueueBatchTarget::from_token(""),
+            Some(QueueBatchTarget::Unassigned)
+        );
+        assert_eq!(QueueBatchTarget::from_token("nope"), None);
+        assert_eq!(QueueBatchTarget::from_token("10000"), None);
+        assert_eq!(optional_batch_token(Some("5")), Some(Some(5)));
+        assert_eq!(optional_batch_token(None), Some(None));
+        assert_eq!(optional_batch_token(Some("")), Some(None));
+        assert_eq!(optional_batch_token(Some("invalid")), None);
     }
 
     #[tokio::test]
@@ -5521,14 +6153,17 @@ mod tests {
 
     #[test]
     fn prepared_download_helper_auto_selects_remote_filename_for_api_queue() {
-        let prepared = prepared_download_from_resolved(ResolvedHttpUrl {
-            url: "https://example.com/download".into(),
-            url_filename: "download".into(),
-            remote_filename: Some("server-name.iso".into()),
-            redirect_filename: None,
-            final_url: Some("https://cdn.example.com/server-name.iso".into()),
-            is_torrent: false,
-        });
+        let prepared = prepared_download_from_resolved(
+            ResolvedHttpUrl {
+                url: "https://example.com/download".into(),
+                url_filename: "download".into(),
+                remote_filename: Some("server-name.iso".into()),
+                redirect_filename: None,
+                final_url: Some("https://cdn.example.com/server-name.iso".into()),
+                is_torrent: false,
+            },
+            None,
+        );
 
         let queued = prepared.into_api_queue();
         assert_eq!(queued.filename.as_deref(), Some("server-name.iso"));
@@ -5541,14 +6176,17 @@ mod tests {
 
     #[test]
     fn prompt_download_requires_filename_for_queue_submission() {
-        let prepared = prepared_download_from_resolved(ResolvedHttpUrl {
-            url: "https://example.com/download".into(),
-            url_filename: "download".into(),
-            remote_filename: Some("server-name.iso".into()),
-            redirect_filename: None,
-            final_url: Some("https://cdn.example.com/server-name.iso".into()),
-            is_torrent: false,
-        });
+        let prepared = prepared_download_from_resolved(
+            ResolvedHttpUrl {
+                url: "https://example.com/download".into(),
+                url_filename: "download".into(),
+                remote_filename: Some("server-name.iso".into()),
+                redirect_filename: None,
+                final_url: Some("https://cdn.example.com/server-name.iso".into()),
+                is_torrent: false,
+            },
+            None,
+        );
 
         assert!(prepared.clone().into_queue_with_filename(None).is_err());
         let queued = prepared

@@ -20,6 +20,7 @@ pub struct AppPaths {
     pub torrent_session_dir: PathBuf,
     pub aria2_session_file: PathBuf,
     pub retry_state_file: PathBuf,
+    pub queue_state_file: PathBuf,
     pub user_service_dir: PathBuf,
     pub user_service_file: PathBuf,
     pub system_service_file: PathBuf,
@@ -51,6 +52,7 @@ impl AppPaths {
         let torrent_session_dir = state_dir.join("rqbit-session");
         let aria2_session_file = state_dir.join("aria2.session");
         let retry_state_file = state_dir.join("retry-state.json");
+        let queue_state_file = state_dir.join("queue-state.json");
         let user_service_dir = config_dir
             .parent()
             .map(|base| base.join("systemd/user"))
@@ -76,6 +78,7 @@ impl AppPaths {
             torrent_session_dir,
             aria2_session_file,
             retry_state_file,
+            queue_state_file,
             user_service_dir,
             user_service_file,
             system_service_file,
@@ -115,6 +118,7 @@ mod tests {
         assert!(paths.retry_state_file.ends_with("retry-state.json"));
         assert!(paths.history_file.ends_with("history.json"));
         assert!(paths.torrent_session_dir.ends_with("rqbit-session"));
+        assert!(paths.queue_state_file.ends_with("queue-state.json"));
         assert!(
             paths
                 .user_service_file

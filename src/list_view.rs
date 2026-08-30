@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use crate::daemon::{DownloadItem, DownloadStatus};
+use crate::daemon::{DownloadItem, DownloadStatus, QueueBatchTarget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CurrentFilter {
@@ -8,6 +8,7 @@ pub enum CurrentFilter {
     Active,
     Waiting,
     Paused,
+    Held,
 }
 
 impl CurrentFilter {
@@ -16,7 +17,8 @@ impl CurrentFilter {
             Self::All => Self::Active,
             Self::Active => Self::Waiting,
             Self::Waiting => Self::Paused,
-            Self::Paused => Self::All,
+            Self::Paused => Self::Held,
+            Self::Held => Self::All,
         }
     }
 
@@ -26,6 +28,7 @@ impl CurrentFilter {
             Self::Active => "active",
             Self::Waiting => "waiting",
             Self::Paused => "paused",
+            Self::Held => "held",
         }
     }
 
@@ -34,6 +37,7 @@ impl CurrentFilter {
             "active" => Self::Active,
             "waiting" => Self::Waiting,
             "paused" => Self::Paused,
+            "held" => Self::Held,
             _ => Self::All,
         }
     }
@@ -42,6 +46,7 @@ impl CurrentFilter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CurrentSort {
     Queue,
+    Batch,
     Name,
     Progress,
     Speed,
@@ -51,7 +56,8 @@ pub enum CurrentSort {
 impl CurrentSort {
     pub fn cycle(self) -> Self {
         match self {
-            Self::Queue => Self::Name,
+            Self::Queue => Self::Batch,
+            Self::Batch => Self::Name,
             Self::Name => Self::Progress,
             Self::Progress => Self::Speed,
             Self::Speed => Self::Eta,
@@ -62,6 +68,7 @@ impl CurrentSort {
     pub fn label(self) -> &'static str {
         match self {
             Self::Queue => "queue",
+            Self::Batch => "batch",
             Self::Name => "name",
             Self::Progress => "progress",
             Self::Speed => "speed",
@@ -71,6 +78,7 @@ impl CurrentSort {
 
     pub fn from_query(value: &str) -> Self {
         match value {
+            "batch" => Self::Batch,
             "name" => Self::Name,
             "progress" => Self::Progress,
             "speed" => Self::Speed,
@@ -190,6 +198,7 @@ fn matches_current_filter(item: &DownloadItem, filter: CurrentFilter) -> bool {
         CurrentFilter::Active => item.status == DownloadStatus::Active,
         CurrentFilter::Waiting => item.status == DownloadStatus::Waiting,
         CurrentFilter::Paused => item.status == DownloadStatus::Paused,
+        CurrentFilter::Held => item.queue_held,
     }
 }
 
@@ -222,6 +231,7 @@ fn matches_search(item: &DownloadItem, search: &str) -> bool {
 fn sort_current(items: &mut Vec<&DownloadItem>, sort: CurrentSort) {
     match sort {
         CurrentSort::Queue => {}
+        CurrentSort::Batch => items.sort_by_key(|item| QueueBatchTarget::of(item.batch)),
         CurrentSort::Name => items.sort_by_key(|item| item.name.to_lowercase()),
         CurrentSort::Progress => items.sort_by(|left, right| {
             cmp_u64_desc(left.completed_bytes, right.completed_bytes)
@@ -296,7 +306,38 @@ mod tests {
             connections: Some(4),
             error_code: None,
             error_message: None,
+            batch: None,
+            queue_held: false,
         }
+    }
+
+    #[test]
+    fn batch_sort_puts_lowest_numbers_first_and_unassigned_last() {
+        let mut first = item("first.iso", DownloadStatus::Waiting, 100);
+        first.batch = Some(1);
+        let mut second = item("second.iso", DownloadStatus::Waiting, 100);
+        second.batch = Some(0);
+        let mut unassigned = item("later.iso", DownloadStatus::Waiting, 100);
+        unassigned.batch = None;
+        let items = vec![first, unassigned, second];
+        let visible = current_visible_items(&items, "", CurrentFilter::All, CurrentSort::Batch);
+        assert_eq!(
+            visible
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second.iso", "first.iso", "later.iso"]
+        );
+    }
+
+    #[test]
+    fn held_filter_shows_only_scheduler_held_downloads() {
+        let mut held = item("held.iso", DownloadStatus::Paused, 100);
+        held.queue_held = true;
+        let items = vec![held, item("plain.iso", DownloadStatus::Paused, 100)];
+        let visible = current_visible_items(&items, "", CurrentFilter::Held, CurrentSort::Queue);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].name, "held.iso");
     }
 
     #[test]

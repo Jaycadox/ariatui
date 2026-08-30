@@ -172,6 +172,11 @@ button.danger {
   word-break: break-all;
 }
 
+.remote-batch {
+  margin-top: 0.3rem;
+  font-size: 0.85rem;
+}
+
 .remote-state {
   border: 1px solid var(--border-strong);
   background: var(--panel-alt);

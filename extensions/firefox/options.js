@@ -16,7 +16,8 @@ function formRemote() {
   return {
     id: document.getElementById("remote-id").value || null,
     label: document.getElementById("remote-label").value,
-    base_url: document.getElementById("remote-base-url").value
+    base_url: document.getElementById("remote-base-url").value,
+    default_batch: document.getElementById("remote-default-batch").value
   };
 }
 
@@ -24,6 +25,13 @@ function fillForm(remote) {
   document.getElementById("remote-id").value = remote ? remote.id : "";
   document.getElementById("remote-label").value = remote ? remote.label : "Local";
   document.getElementById("remote-base-url").value = remote ? remote.base_url : "http://127.0.0.1:39123";
+  document.getElementById("remote-default-batch").value = remote?.default_batch ?? "";
+}
+
+function batchSummary(remote) {
+  return remote.default_batch === null || remote.default_batch === undefined || remote.default_batch === ""
+    ? "Batch: unassigned (downloads last)"
+    : `Batch: ${remote.default_batch}`;
 }
 
 function renderRemotes() {
@@ -38,6 +46,7 @@ function renderRemotes() {
     node.dataset.remoteId = remote.id;
     node.querySelector(".remote-label").textContent = remote.label;
     node.querySelector(".remote-url").textContent = remote.base_url;
+    node.querySelector(".remote-batch").textContent = batchSummary(remote);
     remotesRoot.append(node);
   }
 }

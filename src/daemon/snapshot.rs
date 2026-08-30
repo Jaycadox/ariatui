@@ -6,6 +6,78 @@ use crate::{
     webhook::WebhookPingMode,
 };
 
+/// Identifies one download batch. `Number` batches run in ascending order and
+/// every download sharing a number belongs to the same batch. `Unassigned`
+/// downloads form a single final batch that runs after all numbered batches.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[serde(rename_all = "snake_case")]
+#[serde(untagged)]
+pub enum QueueBatchTarget {
+    Number(u32),
+    #[default]
+    Unassigned,
+}
+
+impl QueueBatchTarget {
+    pub fn of(batch: Option<u32>) -> Self {
+        match batch {
+            Some(number) => Self::Number(number),
+            None => Self::Unassigned,
+        }
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            Self::Number(number) => number.to_string(),
+            Self::Unassigned => "unassigned".into(),
+        }
+    }
+
+    pub fn batch(self) -> Option<u32> {
+        match self {
+            Self::Number(number) => Some(number),
+            Self::Unassigned => None,
+        }
+    }
+
+    /// Parses `"7"`, `"unassigned"`, or `""` (unassigned) into a batch target.
+    pub fn from_token(token: &str) -> Option<Self> {
+        crate::state::parse_queue_batch_token(token).map(Self::of)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct QueueBatchSummary {
+    pub target: QueueBatchTarget,
+    pub running: usize,
+    pub waiting: usize,
+    pub paused: usize,
+    pub held: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QueueSnapshot {
+    pub slots: u8,
+    pub active_batch: Option<QueueBatchTarget>,
+    pub batches: Vec<QueueBatchSummary>,
+    pub held_count: usize,
+    pub pending_count: usize,
+}
+
+impl Default for QueueSnapshot {
+    fn default() -> Self {
+        Self {
+            slots: crate::state::DEFAULT_QUEUE_SLOTS,
+            active_batch: None,
+            batches: Vec::new(),
+            held_count: 0,
+            pending_count: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChildLifecycle {
@@ -26,6 +98,7 @@ pub struct Snapshot {
     pub webhooks: WebhookSnapshot,
     pub web_ui: WebUiSnapshot,
     pub global: GlobalStats,
+    pub queue: QueueSnapshot,
     pub current_downloads: Vec<DownloadItem>,
     pub history_downloads: Vec<DownloadItem>,
     pub warnings: Vec<String>,
@@ -216,6 +289,10 @@ pub struct DownloadItem {
     pub connections: Option<u32>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
+    #[serde(default)]
+    pub batch: Option<u32>,
+    #[serde(default)]
+    pub queue_held: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -251,6 +328,8 @@ pub enum ApiRequest {
         url: String,
         #[serde(default)]
         filename: Option<String>,
+        #[serde(default)]
+        batch: Option<u32>,
     },
     AddDownload {
         url: String,
@@ -280,6 +359,19 @@ pub enum ApiRequest {
     ChangePosition {
         gid: String,
         offset: i32,
+    },
+    SetDownloadBatch {
+        gid: String,
+        batch: Option<u32>,
+    },
+    HoldQueueBatch {
+        target: QueueBatchTarget,
+    },
+    StartQueueBatch {
+        target: QueueBatchTarget,
+    },
+    SetQueueSlots {
+        slots: u8,
     },
     PauseAll,
     ResumeAll,
@@ -399,6 +491,7 @@ impl Snapshot {
             webhooks: WebhookSnapshot::default(),
             web_ui: WebUiSnapshot::default(),
             global: GlobalStats::default(),
+            queue: QueueSnapshot::default(),
             current_downloads: Vec::new(),
             history_downloads: Vec::new(),
             warnings: Vec::new(),

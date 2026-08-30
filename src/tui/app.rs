@@ -11,7 +11,7 @@ use tokio::{
 use crate::{
     daemon::{
         ApiEnvelope, ApiPayload, ApiRequest, ApiResponse, AppContext, DownloadItem,
-        ResolvedHttpUrl, Snapshot,
+        QueueBatchTarget, ResolvedHttpUrl, Snapshot,
     },
     download_uri::{classify_download_uri, is_http_like_uri},
     list_view::{
@@ -20,16 +20,16 @@ use crate::{
     },
     routing::{DownloadRoutingRule, validate_directory_input, validate_rule},
     state::{
-        CancelBehaviorPreference, ManualOrScheduled, TorrentStreamingMode,
-        validate_torrent_size_mib,
+        CancelBehaviorPreference, MAX_QUEUE_SLOTS, MIN_QUEUE_SLOTS, ManualOrScheduled,
+        TorrentStreamingMode, validate_queue_slots, validate_torrent_size_mib,
     },
     tui::{
         draw,
         event::{UiEvent, next_event},
         focus::TabKind,
         forms::{
-            AddUrlForm, CancelChoice, CancelForm, FilenameChoice, FilenameChoiceForm, PinForm,
-            RangeField, RangeForm, RoutingField, RoutingRuleForm, SearchForm, SpeedForm,
+            AddUrlForm, CancelChoice, CancelForm, FilenameChoice, FilenameChoiceForm, NumberForm,
+            PinForm, RangeField, RangeForm, RoutingField, RoutingRuleForm, SearchForm, SpeedForm,
             TorrentStreamingForm, WebUiForm, WebhookForm,
         },
         input::InputField,
@@ -42,6 +42,8 @@ use crate::{
 #[derive(Debug)]
 pub enum ModalState {
     AddUrl(AddUrlForm),
+    SetBatch(NumberForm),
+    QueueSettings(NumberForm),
     Search {
         form: SearchForm,
         tab: TabKind,
@@ -348,10 +350,8 @@ impl UiApp {
                     .await?;
                 }
             }
-            KeyCode::Char('X') => {
-                if self.tab == TabKind::History {
-                    self.issue(ApiRequest::PurgeHistory).await?;
-                }
+            KeyCode::Char('X') if self.tab == TabKind::History => {
+                self.issue(ApiRequest::PurgeHistory).await?;
             }
             KeyCode::Char('m') | KeyCode::Char(' ') => {
                 if self.tab == TabKind::Scheduler {
@@ -416,17 +416,15 @@ impl UiApp {
                     self.normalize_indices();
                 }
             }
-            KeyCode::Char('u') => {
-                if self.tab == TabKind::Scheduler {
-                    if self.schedule_index == 0 {
-                        self.issue(ApiRequest::SetManualLimit { limit_bps: None })
-                            .await?;
-                    } else if self.schedule_index == 1 {
-                        self.issue(ApiRequest::SetUsualInternetSpeed { limit_bps: None })
-                            .await?;
-                    } else {
-                        self.set_selected_range_limit(None).await?;
-                    }
+            KeyCode::Char('u') if self.tab == TabKind::Scheduler => {
+                if self.schedule_index == 0 {
+                    self.issue(ApiRequest::SetManualLimit { limit_bps: None })
+                        .await?;
+                } else if self.schedule_index == 1 {
+                    self.issue(ApiRequest::SetUsualInternetSpeed { limit_bps: None })
+                        .await?;
+                } else {
+                    self.set_selected_range_limit(None).await?;
                 }
             }
             KeyCode::Char('d') => {
@@ -450,15 +448,44 @@ impl UiApp {
                     self.move_selected_rule(-1).await?;
                 }
             }
-            KeyCode::Char('P') => {
-                if self.tab == TabKind::Current {
-                    self.issue(ApiRequest::PauseAll).await?;
+            KeyCode::Char('P') if self.tab == TabKind::Current => {
+                self.issue(ApiRequest::PauseAll).await?;
+            }
+            KeyCode::Char('R') if self.tab == TabKind::Current => {
+                self.issue(ApiRequest::ResumeAll).await?;
+            }
+            KeyCode::Char('b') if self.tab == TabKind::Current => {
+                self.open_batch_editor();
+            }
+            KeyCode::Char('[') if self.tab == TabKind::Current => {
+                self.nudge_selected_batch(-1).await?;
+            }
+            KeyCode::Char(']') if self.tab == TabKind::Current => {
+                self.nudge_selected_batch(1).await?;
+            }
+            KeyCode::Char('H') => {
+                if self.tab == TabKind::Current
+                    && let Some(item) = self.current_selected()
+                {
+                    let target = QueueBatchTarget::of(item.batch);
+                    self.issue(ApiRequest::HoldQueueBatch { target }).await?;
                 }
             }
-            KeyCode::Char('R') => {
-                if self.tab == TabKind::Current {
-                    self.issue(ApiRequest::ResumeAll).await?;
+            KeyCode::Char('S') => {
+                if self.tab == TabKind::Current
+                    && let Some(item) = self.current_selected()
+                {
+                    let target = QueueBatchTarget::of(item.batch);
+                    self.issue(ApiRequest::StartQueueBatch { target }).await?;
                 }
+            }
+            KeyCode::Char('Q') if self.tab == TabKind::Current => {
+                self.modal = Some(ModalState::QueueSettings(NumberForm::new(
+                    "Downloads at once",
+                    &self.snapshot.queue.slots.to_string(),
+                    "3",
+                    "How many downloads may transfer together inside a batch.",
+                )));
             }
             KeyCode::Char('t') => {
                 if self.tab == TabKind::Routing {
@@ -477,15 +504,66 @@ impl UiApp {
         match self.modal.as_mut().expect("modal") {
             ModalState::AddUrl(form) => match key.code {
                 KeyCode::Esc => self.modal = None,
+                KeyCode::Tab => form.next_focus(),
+                KeyCode::BackTab => form.previous_focus(),
                 KeyCode::Enter => {
                     let value = form.value();
+                    let Some(batch) = form.batch_value() else {
+                        self.modal = Some(ModalState::Error(
+                            "Batch must be a whole number from 0 to 9999, or blank".into(),
+                        ));
+                        return Ok(false);
+                    };
                     if classify_download_uri(&value).is_ok() {
-                        self.resolve_add_url(value).await?;
+                        self.resolve_add_url(value, batch).await?;
                     } else {
                         self.modal = Some(ModalState::Error(
                             "URI must use http, https, ftp, sftp, or magnet".into(),
                         ));
                     }
+                }
+                _ => {
+                    form.active_input().input(key);
+                }
+            },
+            ModalState::SetBatch(form) => match key.code {
+                KeyCode::Esc => self.modal = None,
+                KeyCode::Enter => {
+                    let Some(batch) = form.batch_value() else {
+                        self.modal = Some(ModalState::Error(
+                            "Batch must be a whole number from 0 to 9999, or blank for unassigned"
+                                .into(),
+                        ));
+                        return Ok(false);
+                    };
+                    if let Some(item) = self.current_selected() {
+                        let gid = item.gid.clone();
+                        self.issue(ApiRequest::SetDownloadBatch { gid, batch })
+                            .await?;
+                    }
+                    self.modal = None;
+                }
+                _ => {
+                    form.input.input(key);
+                }
+            },
+            ModalState::QueueSettings(form) => match key.code {
+                KeyCode::Esc => self.modal = None,
+                KeyCode::Enter => {
+                    let slots = form
+                        .value()
+                        .trim()
+                        .parse::<u8>()
+                        .ok()
+                        .and_then(|slots| validate_queue_slots(slots).ok());
+                    let Some(slots) = slots else {
+                        self.modal = Some(ModalState::Error(format!(
+                            "Slots must be a whole number from {MIN_QUEUE_SLOTS} to {MAX_QUEUE_SLOTS}."
+                        )));
+                        return Ok(false);
+                    };
+                    self.issue(ApiRequest::SetQueueSlots { slots }).await?;
+                    self.modal = None;
                 }
                 _ => {
                     form.input.input(key);
@@ -521,9 +599,11 @@ impl UiApp {
                         self.modal = Some(ModalState::Error("Filename cannot be empty".into()));
                     } else {
                         let url = form.url.clone();
+                        let batch = form.batch;
                         self.issue(ApiRequest::AddHttpUrl {
                             url,
                             filename: Some(filename),
+                            batch,
                         })
                         .await?;
                         self.modal = None;
@@ -1028,11 +1108,45 @@ impl UiApp {
         .await
     }
 
-    async fn resolve_add_url(&mut self, url: String) -> Result<()> {
+    fn open_batch_editor(&mut self) {
+        let Some(item) = self.current_selected() else {
+            return;
+        };
+        let initial = item
+            .batch
+            .map(|batch| batch.to_string())
+            .unwrap_or_default();
+        self.modal = Some(ModalState::SetBatch(NumberForm::new(
+            "Batch number",
+            &initial,
+            "0 (lower goes first, blank = unassigned)",
+            "Downloads sharing a batch number transfer together. Batches run lowest number first.",
+        )));
+    }
+
+    async fn nudge_selected_batch(&mut self, delta: i32) -> Result<()> {
+        let Some(item) = self.current_selected() else {
+            return Ok(());
+        };
+        let next = match item.batch {
+            Some(current) if delta < 0 => current.saturating_sub(1),
+            Some(current) => current.saturating_add(1).min(crate::state::MAX_QUEUE_BATCH),
+            None => 0,
+        };
+        let gid = item.gid.clone();
+        self.issue(ApiRequest::SetDownloadBatch {
+            gid,
+            batch: Some(next),
+        })
+        .await
+    }
+
+    async fn resolve_add_url(&mut self, url: String, batch: Option<u32>) -> Result<()> {
         if !is_http_like_uri(&url) {
             self.issue(ApiRequest::AddHttpUrl {
                 url,
                 filename: None,
+                batch,
             })
             .await?;
             self.modal = None;
@@ -1044,12 +1158,13 @@ impl UiApp {
         {
             Ok(response) => match response.payload {
                 Some(ApiPayload::ResolvedHttpUrl(resolved)) => {
-                    self.open_resolved_url(resolved).await
+                    self.open_resolved_url(resolved, batch).await
                 }
                 _ => {
                     self.issue(ApiRequest::AddHttpUrl {
                         url,
                         filename: None,
+                        batch,
                     })
                     .await?;
                     self.modal = None;
@@ -1060,6 +1175,7 @@ impl UiApp {
                 self.issue(ApiRequest::AddHttpUrl {
                     url,
                     filename: None,
+                    batch,
                 })
                 .await?;
                 self.modal = None;
@@ -1068,11 +1184,16 @@ impl UiApp {
         }
     }
 
-    async fn open_resolved_url(&mut self, resolved: ResolvedHttpUrl) -> Result<()> {
+    async fn open_resolved_url(
+        &mut self,
+        resolved: ResolvedHttpUrl,
+        batch: Option<u32>,
+    ) -> Result<()> {
         if resolved.is_torrent {
             self.issue(ApiRequest::AddHttpUrl {
                 url: resolved.url,
                 filename: None,
+                batch,
             })
             .await?;
             self.modal = None;
@@ -1094,12 +1215,14 @@ impl UiApp {
                 &resolved.url_filename,
                 label,
                 &remote_filename,
+                batch,
             )));
             Ok(())
         } else {
             self.issue(ApiRequest::AddHttpUrl {
                 url: resolved.url,
                 filename: Some(resolved.url_filename),
+                batch,
             })
             .await?;
             self.modal = None;

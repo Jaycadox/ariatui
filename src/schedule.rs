@@ -44,6 +44,7 @@ mod tests {
             usual_internet_speed: "unlimited".into(),
             remembered_cancel_behavior: Default::default(),
             schedule: (0..24).map(|i| format!("{}K", i + 1)).collect(),
+            queue_slots: crate::state::DEFAULT_QUEUE_SLOTS,
             default_download_dir: "~/Downloads".into(),
             download_rules: vec![crate::routing::DownloadRoutingRule {
                 pattern: "*".into(),

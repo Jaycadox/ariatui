@@ -4,11 +4,22 @@ use ratatui::{
 };
 
 use crate::webhook::WebhookPingMode;
-use crate::{state::TorrentStreamingMode, tui::input::InputField};
+use crate::{
+    state::{TorrentStreamingMode, parse_queue_batch_token},
+    tui::input::InputField,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddUrlField {
+    Url,
+    Batch,
+}
 
 #[derive(Debug)]
 pub struct AddUrlForm {
     pub input: InputField,
+    pub batch: InputField,
+    pub focus: AddUrlField,
 }
 
 #[derive(Debug)]
@@ -27,12 +38,92 @@ impl AddUrlForm {
             input.insert_str(initial);
         }
         input.set_placeholder_text("https://example.com/file.iso or magnet:?...");
-        Self { input }
+        let batch = batch_field("");
+        let mut form = Self {
+            input,
+            batch,
+            focus: AddUrlField::Url,
+        };
+        form.update_blocks();
+        form
     }
 
     pub fn value(&self) -> String {
         self.input.value().to_string()
     }
+
+    pub fn batch_value(&self) -> Option<Option<u32>> {
+        parse_queue_batch_token(self.batch.value())
+    }
+
+    pub fn next_focus(&mut self) {
+        self.focus = match self.focus {
+            AddUrlField::Url => AddUrlField::Batch,
+            AddUrlField::Batch => AddUrlField::Url,
+        };
+        self.update_blocks();
+    }
+
+    pub fn previous_focus(&mut self) {
+        self.focus = match self.focus {
+            AddUrlField::Url => AddUrlField::Batch,
+            AddUrlField::Batch => AddUrlField::Url,
+        };
+        self.update_blocks();
+    }
+
+    pub fn active_input(&mut self) -> &mut InputField {
+        match self.focus {
+            AddUrlField::Url => &mut self.input,
+            AddUrlField::Batch => &mut self.batch,
+        }
+    }
+
+    fn update_blocks(&mut self) {
+        self.input
+            .set_block(field_block("Download URI", self.focus == AddUrlField::Url));
+        self.batch.set_block(field_block(
+            "Batch (optional)",
+            self.focus == AddUrlField::Batch,
+        ));
+    }
+}
+
+/// One-line batch number editor used for “set batch” and queue slot settings.
+#[derive(Debug)]
+pub struct NumberForm {
+    pub input: InputField,
+    pub hint: String,
+}
+
+impl NumberForm {
+    pub fn new(title: &str, initial: &str, placeholder: &str, hint: &str) -> Self {
+        let mut input = InputField::new();
+        input.insert_str(initial);
+        input.set_placeholder_text(placeholder);
+        input.set_block(field_block(title, true));
+        Self {
+            input,
+            hint: hint.to_string(),
+        }
+    }
+
+    pub fn value(&self) -> String {
+        self.input.value().to_string()
+    }
+
+    pub fn batch_value(&self) -> Option<Option<u32>> {
+        parse_queue_batch_token(self.input.value())
+    }
+}
+
+fn batch_field(initial: &str) -> InputField {
+    let mut input = InputField::new();
+    if !initial.is_empty() {
+        input.insert_str(initial);
+    }
+    input.set_placeholder_text("0 (lower goes first, blank = unassigned)");
+    input
 }
 
 impl SearchForm {
@@ -63,11 +154,18 @@ pub struct FilenameChoiceForm {
     pub remote_filename: String,
     pub remote_label: String,
     pub custom: InputField,
+    pub batch: Option<u32>,
     pub selection: FilenameChoice,
 }
 
 impl FilenameChoiceForm {
-    pub fn new(url: &str, url_filename: &str, remote_label: &str, remote_filename: &str) -> Self {
+    pub fn new(
+        url: &str,
+        url_filename: &str,
+        remote_label: &str,
+        remote_filename: &str,
+        batch: Option<u32>,
+    ) -> Self {
         let mut custom = InputField::new();
         custom.insert_str(remote_filename);
         custom.set_placeholder_text("custom-file-name.bin");
@@ -78,6 +176,7 @@ impl FilenameChoiceForm {
             remote_filename: remote_filename.to_string(),
             remote_label: remote_label.to_string(),
             custom,
+            batch,
             selection: FilenameChoice::Remote,
         }
     }

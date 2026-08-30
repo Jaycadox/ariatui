@@ -168,6 +168,8 @@ mod tests {
             connections: None,
             error_code: None,
             error_message: None,
+            batch: None,
+            queue_held: false,
         }
     }
 

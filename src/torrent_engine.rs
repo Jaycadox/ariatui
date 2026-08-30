@@ -397,6 +397,8 @@ fn download_item_from_torrent(item: TorrentDownloadSnapshot) -> DownloadItem {
         connections: Some(item.live_peers as u32),
         error_code: None,
         error_message: None,
+        batch: None,
+        queue_held: false,
     }
 }
 

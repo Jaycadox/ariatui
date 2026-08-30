@@ -28,6 +28,10 @@ pub enum CancelBehaviorPreference {
     DeletePartials,
 }
 
+pub const MIN_QUEUE_SLOTS: u8 = 1;
+pub const MAX_QUEUE_SLOTS: u8 = 16;
+pub const MAX_QUEUE_BATCH: u32 = 9_999;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TorrentStreamingMode {
@@ -45,6 +49,7 @@ pub struct PersistedState {
     pub usual_internet_speed: String,
     pub remembered_cancel_behavior: CancelBehaviorPreference,
     pub schedule: Vec<String>,
+    pub queue_slots: u8,
     pub default_download_dir: String,
     pub download_rules: Vec<DownloadRoutingRule>,
     pub discord_webhook_url: String,
@@ -68,6 +73,7 @@ impl Default for PersistedState {
             usual_internet_speed: "unlimited".into(),
             remembered_cancel_behavior: CancelBehaviorPreference::Ask,
             schedule: vec!["unlimited".into(); 24],
+            queue_slots: DEFAULT_QUEUE_SLOTS,
             default_download_dir: "~/Downloads".into(),
             download_rules: vec![DownloadRoutingRule {
                 pattern: "*".into(),
@@ -98,7 +104,14 @@ impl PersistedState {
         }
         let contents = fs::read_to_string(&paths.state_file)
             .wrap_err_with(|| format!("failed to read {}", paths.state_file.display()))?;
-        let state: Self = toml::from_str(&contents).wrap_err("failed to parse state.toml")?;
+        let mut state: Self = toml::from_str(&contents).wrap_err("failed to parse state.toml")?;
+        // An out-of-range slot count (an older build, a hand-edited file) should
+        // not stop the app from starting, so repair it instead of bailing.
+        let repaired = state.queue_slots.clamp(MIN_QUEUE_SLOTS, MAX_QUEUE_SLOTS);
+        if repaired != state.queue_slots {
+            state.queue_slots = repaired;
+            state.save(&paths.state_file)?;
+        }
         state.validate()?;
         Ok(state)
     }
@@ -153,6 +166,7 @@ impl PersistedState {
         validate_rules(&self.default_download_dir, &self.download_rules)?;
         validate_discord_webhook_url(&self.discord_webhook_url)?;
         let _ = validate_ping_id(self.webhook_ping_mode, Some(&self.webhook_ping_id))?;
+        validate_queue_slots(self.queue_slots)?;
         validate_bind_address(&self.web_ui_bind_address)?;
         validate_cookie_days(self.web_ui_cookie_days)?;
         if self.web_ui_port == 0 {
@@ -161,6 +175,35 @@ impl PersistedState {
         self.torrent_prioritize_piece_value()?;
         Ok(())
     }
+}
+
+pub const DEFAULT_QUEUE_SLOTS: u8 = 3;
+
+pub fn validate_queue_slots(value: u8) -> Result<u8> {
+    if !(MIN_QUEUE_SLOTS..=MAX_QUEUE_SLOTS).contains(&value) {
+        bail!("download slots must be between {MIN_QUEUE_SLOTS} and {MAX_QUEUE_SLOTS}");
+    }
+    Ok(value)
+}
+
+/// Parses a user-entered batch number. `None` means "unassigned" (no batch),
+/// while an outer `None` means the input was not a valid batch number.
+pub fn parse_queue_batch_token(value: &str) -> Option<Option<u32>> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("unassigned") {
+        return Some(None);
+    }
+    let number = value.parse::<u32>().ok()?;
+    validate_queue_batch(Some(number)).ok()
+}
+
+pub fn validate_queue_batch(value: Option<u32>) -> Result<Option<u32>> {
+    if let Some(number) = value
+        && number > MAX_QUEUE_BATCH
+    {
+        bail!("batch number must be between 0 and {MAX_QUEUE_BATCH}");
+    }
+    Ok(value)
 }
 
 pub fn validate_torrent_size_mib(value: u32, label: &str) -> Result<()> {
@@ -177,6 +220,26 @@ mod tests {
     #[test]
     fn default_state_is_valid() {
         PersistedState::default().validate().expect("valid");
+    }
+
+    #[test]
+    fn queue_slots_bounds_are_enforced() {
+        validate_queue_slots(DEFAULT_QUEUE_SLOTS).expect("valid");
+        assert!(validate_queue_slots(0).is_err(), "zero slots is invalid");
+        assert!(
+            validate_queue_slots(MAX_QUEUE_SLOTS + 1).is_err(),
+            "too many slots is invalid"
+        );
+    }
+
+    #[test]
+    fn queue_batch_bounds_are_enforced() {
+        assert_eq!(validate_queue_batch(None).unwrap(), None);
+        assert_eq!(validate_queue_batch(Some(0)).unwrap(), Some(0));
+        assert!(
+            validate_queue_batch(Some(MAX_QUEUE_BATCH + 1)).is_err(),
+            "batch number is too large"
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@ const DEFAULT_REMOTE = {
   id: "local",
   label: "Local",
   base_url: "http://127.0.0.1:39123",
+  default_batch: null,
   created_at: 0
 };
 
@@ -36,9 +37,24 @@ function normalizeBaseUrl(input) {
   return url.toString().replace(/\/$/, "");
 }
 
-function extensionLaunchUrl(baseUrl, linkUrl) {
+function normalizeDefaultBatch(value) {
+  if (value === null || value === undefined || String(value).trim() === "") {
+    return null;
+  }
+  const text = String(value).trim();
+  if (!/^\d{1,4}$/.test(text)) {
+    throw new Error("Batch number must be a whole number from 0 to 9999, or empty.");
+  }
+  return String(Number(text));
+}
+
+function extensionLaunchUrl(baseUrl, linkUrl, defaultBatch) {
   const next = new URL("/extension/add", `${baseUrl}/`);
   next.searchParams.set("url", linkUrl);
+  const batch = normalizeDefaultBatch(defaultBatch);
+  if (batch !== null) {
+    next.searchParams.set("batch", batch);
+  }
   const root = new URL(`${baseUrl}/`);
   root.searchParams.set("next", `${next.pathname}${next.search}`);
   return root.toString();
@@ -110,6 +126,7 @@ async function saveRemote(input) {
     id: existing ? existing.id : crypto.randomUUID(),
     label: trimmedLabel,
     base_url: normalizedBaseUrl,
+    default_batch: normalizeDefaultBatch(input.default_batch),
     created_at: existing ? existing.created_at : Date.now()
   };
   const nextRemotes = remotes
@@ -153,7 +170,7 @@ async function launchDownload(remoteId, linkUrl) {
     type: "popup",
     width: 960,
     height: 620,
-    url: extensionLaunchUrl(remote.base_url, linkUrl)
+    url: extensionLaunchUrl(remote.base_url, linkUrl, remote.default_batch)
   };
   if (cookieStoreId) {
     createProperties.cookieStoreId = cookieStoreId;

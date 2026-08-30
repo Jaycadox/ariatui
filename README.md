@@ -10,6 +10,7 @@ It provides:
 - current/history views with search, filtering, and sorting
 - pause, resume, cancel, purge, and add-by-URL controls
 - queue reordering and pause-all/resume-all controls
+- numbered download batches with a queue that holds later batches back
 - scheduled or manual global speed limits
 - usual-speed-aware ETA projections for scheduled limits
 - regex-based download routing rules
@@ -85,6 +86,37 @@ cargo run -- service uninstall-user
 cargo run -- service uninstall-system
 ```
 
+## Queue & Batches
+
+Every download can carry a batch number from `0` to `9999`, or be unassigned.
+
+Batches run in ascending order and only one batch is *in play* at a time:
+downloads in later batches are paused by the scheduler and marked `held`. When a
+batch has nothing left to run, the next held batch starts on its own. Unassigned
+downloads sort after every numbered batch. `queue_slots` in `state.toml` (1-16,
+default `3`) decides how many downloads in the batch in play run at once, and is
+applied to `aria2c` as `--max-concurrent-downloads`.
+
+Holding is not the same as pausing: a scheduler-held download is started again
+when its batch comes up, while a download you paused yourself stays paused.
+
+In the TUI, on the `Current` tab:
+
+- `a` add links; `Tab` moves to the batch field of the add form
+- `b` set the batch of the selected download (blank clears it)
+- `[` and `]` nudge the selected download's batch down or up
+- `H` hold the selected download's batch: it stays paused until you start it, so
+  the following batches get their turn
+- `S` start the selected download's batch now and park the others; parked
+  batches resume on their own turn
+- `Q` change the download slot count
+- `f` filter down to `held`, `s` sort by `batch`
+
+The web UI shows the batch of every row with an inline batch field, plus a queue
+panel with the slot count and per-batch `Hold`/`Start` buttons. The Firefox
+extension has a per-server `default batch number` option so links it sends land
+in a batch of your choosing.
+
 ## Web UI
 
 The web UI is optional and starts disabled by default.
@@ -122,7 +154,9 @@ On first run, AriaTUI writes XDG config/state files. On a typical Linux setup th
 
 `config.toml` holds app defaults like `aria2c` path, download directory, and polling intervals.
 
-`state.toml` holds live app settings like scheduler ranges, routing rules, webhooks, web UI settings, and torrent behavior.
+`state.toml` holds live app settings like scheduler ranges, routing rules, webhooks, web UI settings, torrent behavior, and the download slot count.
+
+`queue-state.json` remembers each queued download's batch number and whether the scheduler is holding it, so batches survive a daemon restart.
 
 ## Notes
 

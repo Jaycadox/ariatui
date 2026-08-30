@@ -43,6 +43,7 @@ pub fn generate_secret() -> String {
 pub async fn spawn_aria2(
     config: &AppConfig,
     session_file: PathBuf,
+    max_concurrent_downloads: u8,
 ) -> Result<(ChildProcess, mpsc::UnboundedReceiver<ChildLogEvent>)> {
     let aria2_bin = which::which(&config.daemon.aria2_bin)
         .wrap_err_with(|| format!("failed to find '{}'", config.daemon.aria2_bin))?;
@@ -60,6 +61,9 @@ pub async fn spawn_aria2(
             expand_tilde(&config.daemon.download_dir).display()
         ))
         .arg("--continue=true")
+        .arg(format!(
+            "--max-concurrent-downloads={max_concurrent_downloads}"
+        ))
         .arg("--rpc-save-upload-metadata=true")
         .arg("--bt-save-metadata=true")
         .arg(format!(

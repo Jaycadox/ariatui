@@ -1,6 +1,7 @@
 pub mod child;
 pub mod marker;
 pub mod permissions;
+pub mod queue;
 pub mod reconcile;
 pub mod server;
 pub mod service;
@@ -17,7 +18,7 @@ pub use self::{
     reconcile::{DaemonState, SharedDaemonState},
     snapshot::{
         ApiEnvelope, ApiError, ApiPayload, ApiRequest, ApiResponse, ChildLifecycle, DownloadItem,
-        DownloadStatus, ResolvedHttpUrl, Snapshot,
+        DownloadStatus, QueueBatchTarget, QueueSnapshot, ResolvedHttpUrl, Snapshot,
     },
 };
 

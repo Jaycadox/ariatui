@@ -8,7 +8,7 @@ use ratatui::{
 };
 
 use crate::{
-    daemon::{DownloadItem, DownloadStatus, Snapshot},
+    daemon::{DownloadItem, DownloadStatus, QueueSnapshot, Snapshot},
     eta::{ProjectionPhaseEnd, ScheduledEtaPhase, project_scheduled_eta},
     routing::{DownloadRoutingRule, describe_directory_input, match_rule, validate_rule},
     state::{TorrentStreamingMode, validate_torrent_size_mib},
@@ -124,7 +124,7 @@ fn draw_current(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
         .split(layout[0]);
     frame.render_widget(
         Paragraph::new(format!(
-            "search: {}  filter: {}  sort: {}  visible: {}",
+            "search: {}  filter: {}  sort: {}  visible: {}  {}",
             if app.current_search.is_empty() {
                 "-".into()
             } else {
@@ -132,7 +132,8 @@ fn draw_current(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
             },
             app.current_filter.label(),
             app.current_sort.label(),
-            app.current_visible_items().len()
+            app.current_visible_items().len(),
+            queue_summary_text(&app.snapshot.queue)
         ))
         .block(bordered("Current View")),
         left[0],
@@ -147,7 +148,8 @@ fn draw_current(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
         rows,
         [
             Constraint::Length(8),
-            Constraint::Percentage(30),
+            Constraint::Length(6),
+            Constraint::Percentage(28),
             Constraint::Length(8),
             Constraint::Length(18),
             Constraint::Length(12),
@@ -158,6 +160,7 @@ fn draw_current(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
     )
     .header(Row::new(vec![
         "Status",
+        "Batch",
         "Name",
         "Progress",
         "Done/Total",
@@ -570,7 +573,7 @@ fn draw_web_ui(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
     let text = match app.tab {
         TabKind::Current => {
-            "q quit  arrows/vim move  / search  f filter  s sort  a add  p/r single  P/R all  J/K reorder waiting  c cancel  Enter details"
+            "q quit  arrows/vim move  / search  f filter  s sort  a add  p/r single  P/R all  J/K reorder  c cancel  b set batch  [ ] batch -/+  H hold batch  S start batch  Q slots  Enter details"
         }
         TabKind::History => {
             "q quit  arrows/vim move  / search  f filter  s sort  x forget selected  X clear history  Enter details"
@@ -601,12 +604,84 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
     );
     match app.modal.as_ref().expect("modal") {
         ModalState::AddUrl(form) => {
-            let widget = Paragraph::new(form.value())
-                .block(bordered("Add URI"))
-                .style(Style::default().bg(Color::Black))
-                .wrap(Wrap { trim: false });
-            frame.render_widget(widget, popup);
-            frame.render_widget(&form.input, popup);
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(4),
+                    Constraint::Length(3),
+                    Constraint::Length(3),
+                    Constraint::Length(2),
+                    Constraint::Min(2),
+                ])
+                .margin(1)
+                .split(popup);
+            frame.render_widget(
+                Paragraph::new("Paste a web, file transfer, or magnet link. Tab switches to the batch field: lower batch numbers download first, and links sharing a number download together.")
+                    .block(bordered("Add URI"))
+                    .style(Style::default().bg(Color::Black))
+                    .wrap(Wrap { trim: false }),
+                layout[0],
+            );
+            frame.render_widget(&form.input, layout[1]);
+            frame.render_widget(&form.batch, layout[2]);
+            let (batch_text, batch_color) = match form.batch_value() {
+                Some(Some(batch)) => (format!("Will join batch {batch}"), Color::Green),
+                Some(None) => (
+                    "Will be unassigned (downloads last)".to_string(),
+                    Color::DarkGray,
+                ),
+                None => ("Batch must be 0-9999 or blank".to_string(), Color::Red),
+            };
+            frame.render_widget(
+                Paragraph::new(batch_text)
+                    .style(Style::default().fg(batch_color).bg(Color::Black))
+                    .wrap(Wrap { trim: false }),
+                layout[3],
+            );
+            frame.render_widget(
+                Paragraph::new("Tab switches fields. Enter queues the download. Esc closes.")
+                    .style(Style::default().bg(Color::Black))
+                    .wrap(Wrap { trim: false }),
+                layout[4],
+            );
+        }
+        ModalState::SetBatch(form) | ModalState::QueueSettings(form) => {
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(4),
+                    Constraint::Length(3),
+                    Constraint::Length(2),
+                    Constraint::Min(2),
+                ])
+                .margin(1)
+                .split(popup);
+            frame.render_widget(
+                Paragraph::new(form.hint.clone())
+                    .block(bordered(
+                        if matches!(app.modal.as_ref().expect("modal"), ModalState::SetBatch(_)) {
+                            "Batch number"
+                        } else {
+                            "Downloads at once"
+                        },
+                    ))
+                    .style(Style::default().bg(Color::Black))
+                    .wrap(Wrap { trim: false }),
+                layout[0],
+            );
+            frame.render_widget(&form.input, layout[1]);
+            frame.render_widget(
+                Paragraph::new(format!("Value: {}", form.value()))
+                    .style(Style::default().bg(Color::Black))
+                    .wrap(Wrap { trim: false }),
+                layout[2],
+            );
+            frame.render_widget(
+                Paragraph::new("Enter saves. Esc cancels.")
+                    .style(Style::default().bg(Color::Black))
+                    .wrap(Wrap { trim: false }),
+                layout[3],
+            );
         }
         ModalState::Search { form, tab } => {
             let title = match tab {
@@ -691,6 +766,13 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, app: &UiApp) {
                 ),
                 Err(error) => error.to_string(),
             };
+            let preview = format!(
+                "{preview}\nBatch: {}",
+                match form.batch {
+                    Some(batch) => batch.to_string(),
+                    None => "unassigned (downloads last)".into(),
+                }
+            );
             frame.render_widget(
                 Paragraph::new(preview)
                     .style(Style::default().bg(Color::Black))
@@ -1112,6 +1194,38 @@ fn split_main(area: Rect, details: bool) -> Vec<Rect> {
     }
 }
 
+fn queue_summary_text(queue: &QueueSnapshot) -> String {
+    let active = match queue.active_batch {
+        Some(target) => format!("batch {} in play", target.label()),
+        None => "nothing running".into(),
+    };
+    let held = if queue.held_count > 0 {
+        format!(" · {} waiting for their turn", queue.held_count)
+    } else {
+        String::new()
+    };
+    format!(
+        "{active} · {} slot{}{held}",
+        queue.slots,
+        if queue.slots == 1 { "" } else { "s" }
+    )
+}
+
+fn batch_label(item: &DownloadItem) -> String {
+    match item.batch {
+        Some(batch) => batch.to_string(),
+        None => "-".into(),
+    }
+}
+
+fn status_word(item: &DownloadItem) -> &'static str {
+    if item.queue_held {
+        "held"
+    } else {
+        status_label(&item.status)
+    }
+}
+
 fn row_from_download(selected: bool, item: &DownloadItem, snapshot: &Snapshot) -> Row<'static> {
     let progress = if item.total_bytes == 0 {
         "0%".into()
@@ -1119,7 +1233,8 @@ fn row_from_download(selected: bool, item: &DownloadItem, snapshot: &Snapshot) -
         Percentage(item.completed_bytes as f64 / item.total_bytes as f64).to_string()
     };
     Row::new(vec![
-        Cell::from(status_label(&item.status)),
+        Cell::from(status_word(item)),
+        Cell::from(batch_label(item)),
         Cell::from(item.name.clone()),
         Cell::from(progress),
         Cell::from(format!(
@@ -1166,6 +1281,15 @@ fn details_paragraph(item: Option<&DownloadItem>, snapshot: &Snapshot) -> Paragr
         let mut lines = vec![
             Line::from(format!("Name: {}", item.name)),
             Line::from(format!("GID: {}", item.gid)),
+            Line::from(format!("Batch: {}", batch_label(item))),
+            Line::from(format!(
+                "Queue: {}",
+                if item.queue_held {
+                    "held by the batch scheduler; it starts when its batch comes up".into()
+                } else {
+                    String::from("not held")
+                }
+            )),
             Line::from(format!(
                 "Progress: {} / {}",
                 format_bytes(item.completed_bytes),

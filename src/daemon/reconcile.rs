@@ -19,11 +19,11 @@ use tracing::{error, warn};
 
 use crate::{
     daemon::{
-        AppContext, child,
+        AppContext, child, queue,
         snapshot::{
             ApiPayload, ApiReply, Aria2ChildStatus, ChildLifecycle, DownloadItem, DownloadStatus,
-            GlobalStats, ResolvedHttpUrl, RoutingSnapshot, SchedulerSnapshot, Snapshot,
-            TorrentSettingsSnapshot, WebUiStatus, WebhookSnapshot,
+            GlobalStats, QueueBatchTarget, QueueSnapshot, ResolvedHttpUrl, RoutingSnapshot,
+            SchedulerSnapshot, Snapshot, TorrentSettingsSnapshot, WebUiStatus, WebhookSnapshot,
         },
     },
     download_uri::{DownloadUriKind, classify_download_uri, magnet_display_name},
@@ -36,6 +36,7 @@ use crate::{
     schedule,
     speed::RollingSpeedTracker,
     state::validate_torrent_size_mib,
+    state::{validate_queue_batch, validate_queue_slots},
     torrent_engine::TorrentEngine,
     units, web,
     webhook::{
@@ -56,6 +57,8 @@ struct RetryEntry {
     retries: u32,
     next_attempt_at: Option<DateTime<Utc>>,
     daily: bool,
+    #[serde(default)]
+    batch: Option<u32>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -91,6 +94,8 @@ pub struct DaemonState {
     pub torrent_engine: TorrentEngine,
     pub snapshot: RwLock<Snapshot>,
     pub desired_limit_bps: RwLock<Option<u64>>,
+    pub desired_slots: RwLock<Option<u8>>,
+    pub queue_state: Mutex<queue::QueueState>,
     pub speed_tracker: Mutex<RollingSpeedTracker>,
     pub history_downloads: Mutex<Vec<DownloadItem>>,
     pub log_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -136,12 +141,15 @@ impl DaemonState {
             app.current_build_id.clone(),
         );
         let retry_state = RetryState::load(&app.paths.retry_state_file);
+        let queue_state = queue::QueueState::load(&app.paths.queue_state_file);
         Ok(Self {
             app,
             runtime: Mutex::new(None),
             torrent_engine,
             snapshot: RwLock::new(snapshot),
             desired_limit_bps: RwLock::new(None),
+            desired_slots: RwLock::new(None),
+            queue_state: Mutex::new(queue_state),
             speed_tracker: Mutex::new(RollingSpeedTracker::default()),
             history_downloads: Mutex::new(history_downloads),
             log_task: Mutex::new(None),
@@ -173,8 +181,14 @@ impl DaemonState {
         lifecycle: ChildLifecycle,
     ) -> Result<()> {
         self.set_lifecycle(lifecycle).await;
-        let (child_process, rx) =
-            child::spawn_aria2(&self.app.config, self.app.paths.aria2_session_file.clone()).await?;
+        let slots = self.app.state.read().await.queue_slots;
+        let (child_process, rx) = child::spawn_aria2(
+            &self.app.config,
+            self.app.paths.aria2_session_file.clone(),
+            slots,
+        )
+        .await?;
+        *self.desired_slots.write().await = Some(slots);
 
         let endpoint = format!("http://127.0.0.1:{}/jsonrpc", child_process.port);
         let rpc = Aria2RpcClient::new(
@@ -252,33 +266,47 @@ impl DaemonState {
                 ])],
             )
             .await?;
-        let waiting: Vec<Aria2Status> = runtime
-            .rpc
-            .call(
-                "aria2.tellWaiting",
-                vec![
-                    json!(0),
-                    json!(self.app.config.daemon.waiting_limit),
-                    json!([
-                        "gid",
-                        "status",
-                        "totalLength",
-                        "completedLength",
-                        "downloadSpeed",
-                        "uploadSpeed",
-                        "connections",
-                        "errorCode",
-                        "errorMessage",
-                        "infoHash",
-                        "numSeeders",
-                        "followedBy",
-                        "belongsTo",
-                        "files",
-                        "bittorrent"
-                    ]),
-                ],
-            )
-            .await?;
+        // Batch enforcement must see the entire waiting queue. Treat the
+        // configured limit as an RPC page size; otherwise downloads beyond the
+        // first page could start without ever being held for their batch.
+        let waiting_page_size = self.app.config.daemon.waiting_limit.max(1);
+        let mut waiting = Vec::new();
+        let mut waiting_offset = 0usize;
+        loop {
+            let page: Vec<Aria2Status> = runtime
+                .rpc
+                .call(
+                    "aria2.tellWaiting",
+                    vec![
+                        json!(waiting_offset),
+                        json!(waiting_page_size),
+                        json!([
+                            "gid",
+                            "status",
+                            "totalLength",
+                            "completedLength",
+                            "downloadSpeed",
+                            "uploadSpeed",
+                            "connections",
+                            "errorCode",
+                            "errorMessage",
+                            "infoHash",
+                            "numSeeders",
+                            "followedBy",
+                            "belongsTo",
+                            "files",
+                            "bittorrent"
+                        ]),
+                    ],
+                )
+                .await?;
+            let page_len = page.len();
+            waiting.extend(page);
+            if page_len < waiting_page_size {
+                break;
+            }
+            waiting_offset = waiting_offset.saturating_add(page_len);
+        }
         let stopped: Vec<Aria2Status> = runtime
             .rpc
             .call(
@@ -321,7 +349,7 @@ impl DaemonState {
         let torrent_downloads = self.torrent_engine.snapshot();
         let torrent_terminal_downloads = TorrentEngine::terminal_download_items(&torrent_downloads);
         let stopped_downloads = stopped.into_iter().map(map_status).collect::<Vec<_>>();
-        let history_downloads = {
+        let mut history_downloads = {
             let mut history_downloads = self.history_downloads.lock().await;
             let merged = history::merge_terminal_events(
                 &history_downloads,
@@ -335,6 +363,17 @@ impl DaemonState {
             }
             history_downloads.clone()
         };
+        let mut current_downloads: Vec<DownloadItem> =
+            active.into_iter().chain(waiting).map(map_status).collect();
+        current_downloads.extend(TorrentEngine::current_download_items(&torrent_downloads));
+        {
+            let queue_state = self.queue_state.lock().await;
+            queue::attach_metadata(&queue_state, &mut current_downloads);
+            queue::attach_metadata(&queue_state, &mut history_downloads);
+        }
+        let queue_summary = self
+            .apply_queue_policy(runtime, &mut current_downloads)
+            .await;
 
         let mut snapshot = self.snapshot.write().await;
         snapshot.scheduler = SchedulerSnapshot {
@@ -378,9 +417,7 @@ impl DaemonState {
         snapshot.web_ui.pending_pair_pins = pending_pair_pins;
         snapshot.web_ui.active_session_count = active_session_count;
         snapshot.global = parse_global(global);
-        let mut current_downloads: Vec<DownloadItem> =
-            active.into_iter().chain(waiting).map(map_status).collect();
-        current_downloads.extend(TorrentEngine::current_download_items(&torrent_downloads));
+        snapshot.queue = queue_summary;
         self.speed_tracker
             .lock()
             .await
@@ -389,6 +426,7 @@ impl DaemonState {
         snapshot.history_downloads = history_downloads;
         let snapshot_copy = snapshot.clone();
         drop(snapshot);
+        self.prune_queue_state(&snapshot_copy).await;
         self.process_download_retries(runtime, &snapshot_copy).await;
         self.process_webhook_events(&snapshot_copy).await;
         self.write_snapshot_cache(&snapshot_copy).await;
@@ -437,7 +475,12 @@ impl DaemonState {
                 retries: 0,
                 next_attempt_at: None,
                 daily: false,
+                batch: item.batch,
             });
+            if entry.batch.is_none() && item.batch.is_some() {
+                entry.batch = item.batch;
+                changed = true;
+            }
             if entry.current_gid != item.gid || entry.next_attempt_at.is_some() {
                 continue;
             }
@@ -475,11 +518,13 @@ impl DaemonState {
                 .await
             {
                 Ok(gid) => {
+                    let batch = state.entries.get(&key).and_then(|entry| entry.batch);
                     if let Some(current) = state.entries.get_mut(&key) {
-                        current.current_gid = gid;
+                        current.current_gid = gid.clone();
                         current.retries = current.retries.saturating_add(1);
                         current.next_attempt_at = None;
                     }
+                    self.remember_download_batch(&gid, batch).await;
                     let _ = runtime
                         .rpc
                         .call::<String>(
@@ -514,6 +559,33 @@ impl DaemonState {
         }
     }
 
+    async fn forget_download_queue(&self, gid: &str) {
+        let mut queue = self.queue_state.lock().await;
+        let before = queue.len();
+        queue.forget(gid);
+        if before != queue.len()
+            && let Err(error) = queue.save(&self.app.paths.queue_state_file)
+        {
+            warn!("failed to persist queue state: {error}");
+        }
+    }
+
+    /// Mark a download as paused by the user rather than by the batch scheduler.
+    async fn user_pause_download(&self, gid: &str) {
+        let mut queue = self.queue_state.lock().await;
+        if queue.is_held(gid) {
+            queue.set_held(gid, false);
+            if let Err(error) = queue.save(&self.app.paths.queue_state_file) {
+                warn!("failed to persist queue state: {error}");
+            }
+        }
+    }
+
+    async fn batch_target_of(&self, gid: &str) -> QueueBatchTarget {
+        let queue = self.queue_state.lock().await;
+        QueueBatchTarget::of(queue.batch(gid))
+    }
+
     async fn clear_download_retries(&self) {
         let mut state = self.retry_state.lock().await;
         if state.entries.is_empty() {
@@ -543,6 +615,168 @@ impl DaemonState {
         Ok(())
     }
 
+    async fn apply_queue_slots(&self, runtime: &RuntimeAria2, slots: u8) -> Result<()> {
+        let mut desired = self.desired_slots.write().await;
+        if *desired == Some(slots) {
+            return Ok(());
+        }
+        let _: String = runtime
+            .rpc
+            .call(
+                "aria2.changeGlobalOption",
+                vec![json!({ "max-concurrent-downloads": slots.to_string() })],
+            )
+            .await?;
+        *desired = Some(slots);
+        Ok(())
+    }
+
+    /// Attach batch bookkeeping to what aria2 just reported, keep the batch
+    /// policy enforced, and return the summary the UI surfaces show.
+    async fn apply_queue_policy(
+        &self,
+        runtime: &RuntimeAria2,
+        items: &mut [DownloadItem],
+    ) -> QueueSnapshot {
+        let slots = self.app.state.read().await.queue_slots;
+        if let Err(error) = self.apply_queue_slots(runtime, slots).await {
+            warn!("failed to update aria2 download slots: {error}");
+        }
+        let (active_batch, actions) = queue::plan_batch_policy(items);
+        let (applied, _) = self.apply_queue_actions(runtime, &actions).await;
+        for (gid, held) in applied {
+            if let Some(item) = items.iter_mut().find(|item| item.gid == gid) {
+                item.queue_held = held;
+                if held {
+                    item.status = DownloadStatus::Paused;
+                } else if item.status == DownloadStatus::Paused {
+                    item.status = DownloadStatus::Waiting;
+                }
+            }
+        }
+        queue::summarize_queue(slots, active_batch, items)
+    }
+
+    /// Runs scheduler decisions against aria2 and returns `(gid, held)` for the
+    /// ones that succeeded so callers can update their own view immediately.
+    async fn apply_queue_actions(
+        &self,
+        runtime: &RuntimeAria2,
+        actions: &[queue::QueueAction],
+    ) -> (Vec<(String, bool)>, Vec<String>) {
+        let mut applied = Vec::new();
+        let mut failures = Vec::new();
+        if actions.is_empty() {
+            return (applied, failures);
+        }
+        let mut queue = self.queue_state.lock().await;
+        for action in actions {
+            if let queue::QueueAction::KeepPausedByUser { gid } = action {
+                queue.set_held(gid, false);
+                applied.push((gid.clone(), false));
+                continue;
+            }
+            let (method, gid, held) = match action {
+                queue::QueueAction::Hold { gid } => ("aria2.forcePause", gid.as_str(), true),
+                queue::QueueAction::HoldByUser { gid } => ("aria2.forcePause", gid.as_str(), false),
+                queue::QueueAction::Release { gid } => ("aria2.unpause", gid.as_str(), false),
+                queue::QueueAction::KeepPausedByUser { .. } => unreachable!(),
+            };
+            let result = if TorrentEngine::is_torrent_gid(gid) {
+                if method == "aria2.unpause" {
+                    self.torrent_engine.resume(gid).await
+                } else {
+                    self.torrent_engine.pause(gid).await
+                }
+            } else {
+                runtime
+                    .rpc
+                    .call::<String>(method, vec![json!(gid)])
+                    .await
+                    .map(|_| ())
+            };
+            match result {
+                Ok(_) => {
+                    queue.set_held(gid, held);
+                    applied.push((gid.to_string(), held));
+                }
+                Err(error) => {
+                    let message = format!("failed to {method} queued download {gid}: {error}");
+                    warn!("{message}");
+                    failures.push(message);
+                }
+            }
+        }
+        if !applied.is_empty()
+            && let Err(error) = queue.save(&self.app.paths.queue_state_file)
+        {
+            warn!("failed to persist queue state: {error}");
+        }
+        (applied, failures)
+    }
+
+    async fn apply_queue_request(&self, actions: Vec<queue::QueueAction>) -> Result<()> {
+        if actions.is_empty() {
+            return Ok(());
+        }
+        self.ensure_runtime().await?;
+        let runtime = self.runtime.lock().await;
+        let runtime = runtime
+            .as_ref()
+            .ok_or_else(|| eyre!("aria2 runtime missing"))?;
+        let (_, failures) = self.apply_queue_actions(runtime, &actions).await;
+        if !failures.is_empty() {
+            return Err(eyre!(failures.join("; ")));
+        }
+        Ok(())
+    }
+
+    async fn hold_queue_batch(&self, target: QueueBatchTarget) -> Result<()> {
+        let items = self.snapshot.read().await.current_downloads.clone();
+        self.apply_queue_request(queue::plan_hold_batch(&items, target))
+            .await
+    }
+
+    async fn start_queue_batch(&self, target: QueueBatchTarget) -> Result<()> {
+        let items = self.snapshot.read().await.current_downloads.clone();
+        self.apply_queue_request(queue::plan_start_batch(&items, target))
+            .await
+    }
+
+    async fn set_download_batch(&self, gid: &str, batch: Option<u32>) -> Result<()> {
+        let batch = validate_queue_batch(batch)?;
+        let mut queue = self.queue_state.lock().await;
+        queue.set_batch(gid, batch);
+        queue.save(&self.app.paths.queue_state_file)
+    }
+
+    async fn remember_download_batch(&self, gid: &str, batch: Option<u32>) {
+        if batch.is_none() {
+            return;
+        }
+        let mut queue = self.queue_state.lock().await;
+        queue.set_batch(gid, batch);
+        if let Err(error) = queue.save(&self.app.paths.queue_state_file) {
+            warn!("failed to persist queue state: {error}");
+        }
+    }
+
+    async fn prune_queue_state(&self, snapshot: &Snapshot) {
+        let live = snapshot
+            .current_downloads
+            .iter()
+            .chain(snapshot.history_downloads.iter())
+            .flat_map(|item| [Some(item.gid.as_str()), item.belongs_to.as_deref()])
+            .flatten()
+            .collect::<HashSet<_>>();
+        let mut queue = self.queue_state.lock().await;
+        if queue.retain(|gid| live.contains(gid))
+            && let Err(error) = queue.save(&self.app.paths.queue_state_file)
+        {
+            warn!("failed to persist queue state: {error}");
+        }
+    }
+
     pub async fn execute(&self, request: crate::daemon::ApiRequest) -> Result<ApiReply> {
         let mut payload = None;
         match request {
@@ -552,13 +786,18 @@ impl DaemonState {
                     self.resolve_http_url(&url).await?,
                 ));
             }
-            crate::daemon::ApiRequest::AddHttpUrl { url, filename } => {
+            crate::daemon::ApiRequest::AddHttpUrl {
+                url,
+                filename,
+                batch,
+            } => {
+                let batch = validate_queue_batch(batch)?;
                 let state = self.app.state.read().await.clone();
                 let uri_kind = classify_download_uri(&url)?;
                 let effective_limit_bps =
                     schedule::resolve(Local::now(), &state)?.effective_limit_bps;
                 if matches!(uri_kind, DownloadUriKind::HttpLike)
-                    && self.try_add_remote_torrent(&url, &state).await?
+                    && self.try_add_remote_torrent(&url, &state, batch).await?
                 {
                     self.save_aria2_session().await;
                     self.perform_refresh().await?;
@@ -583,7 +822,8 @@ impl DaemonState {
                 )?;
                 tokio::fs::create_dir_all(&route.resolved_directory).await?;
                 if matches!(uri_kind, DownloadUriKind::Magnet) {
-                    self.torrent_engine
+                    let gid = self
+                        .torrent_engine
                         .add_url(
                             &url,
                             route.resolved_directory,
@@ -591,6 +831,7 @@ impl DaemonState {
                             state.torrent_streaming_mode != crate::state::TorrentStreamingMode::Off,
                         )
                         .await?;
+                    self.remember_download_batch(&gid, batch).await;
                     self.perform_refresh().await?;
                     return Ok(ApiReply {
                         snapshot: self.snapshot().await,
@@ -604,9 +845,10 @@ impl DaemonState {
                     "dir": route.resolved_directory.display().to_string(),
                     "out": filename,
                 });
-                let _: String = self
+                let gid: String = self
                     .call("aria2.addUri", vec![json!([url]), options])
                     .await?;
+                self.remember_download_batch(&gid, batch).await;
                 self.save_aria2_session().await;
                 self.perform_refresh().await?;
             }
@@ -737,6 +979,7 @@ impl DaemonState {
             crate::daemon::ApiRequest::Pause { gid, force } => {
                 if TorrentEngine::is_torrent_gid(&gid) {
                     self.torrent_engine.pause(&gid).await?;
+                    self.user_pause_download(&gid).await;
                     self.perform_refresh().await?;
                     return Ok(ApiReply {
                         snapshot: self.snapshot().await,
@@ -749,25 +992,52 @@ impl DaemonState {
                     "aria2.pause"
                 };
                 let _: String = self.call(method, vec![json!(gid)]).await?;
+                self.user_pause_download(&gid).await;
                 self.save_aria2_session().await;
                 self.perform_refresh().await?;
             }
             crate::daemon::ApiRequest::Resume { gid } => {
-                if TorrentEngine::is_torrent_gid(&gid) {
+                let held = self.queue_state.lock().await.is_held(&gid);
+                if held {
+                    // Resuming a file the scheduler held means the user wants
+                    // that whole batch now, so hand it the turn.
+                    let target = self.batch_target_of(&gid).await;
+                    self.start_queue_batch(target).await?;
+                } else if TorrentEngine::is_torrent_gid(&gid) {
                     self.torrent_engine.resume(&gid).await?;
-                    self.perform_refresh().await?;
-                    return Ok(ApiReply {
-                        snapshot: self.snapshot().await,
-                        payload,
-                    });
+                } else {
+                    let _: String = self.call("aria2.unpause", vec![json!(gid)]).await?;
+                    self.save_aria2_session().await;
                 }
-                let _: String = self.call("aria2.unpause", vec![json!(gid)]).await?;
-                self.save_aria2_session().await;
+                self.perform_refresh().await?;
+            }
+            crate::daemon::ApiRequest::SetDownloadBatch { gid, batch } => {
+                self.set_download_batch(&gid, batch).await?;
+                self.perform_refresh().await?;
+            }
+            crate::daemon::ApiRequest::HoldQueueBatch { target } => {
+                let target = QueueBatchTarget::of(validate_queue_batch(target.batch())?);
+                self.hold_queue_batch(target).await?;
+                self.perform_refresh().await?;
+            }
+            crate::daemon::ApiRequest::StartQueueBatch { target } => {
+                let target = QueueBatchTarget::of(validate_queue_batch(target.batch())?);
+                self.start_queue_batch(target).await?;
+                self.perform_refresh().await?;
+            }
+            crate::daemon::ApiRequest::SetQueueSlots { slots } => {
+                let slots = validate_queue_slots(slots)?;
+                let mut state = self.app.state.write().await;
+                state.queue_slots = slots;
+                state.save(&self.app.paths.state_file)?;
+                drop(state);
                 self.perform_refresh().await?;
             }
             crate::daemon::ApiRequest::Cancel { gid, delete_files } => {
                 if TorrentEngine::is_torrent_gid(&gid) {
                     self.torrent_engine.cancel(&gid, delete_files).await?;
+                    self.forget_download_retry(&gid).await;
+                    self.forget_download_queue(&gid).await;
                     self.perform_refresh().await?;
                     return Ok(ApiReply {
                         snapshot: self.snapshot().await,
@@ -777,6 +1047,7 @@ impl DaemonState {
                 self.cancel_download(&gid, delete_files).await?;
                 self.forget_download_retry(&gid).await;
                 self.save_aria2_session().await;
+                self.forget_download_queue(&gid).await;
                 self.perform_refresh().await?;
             }
             crate::daemon::ApiRequest::RemoveHistory { gid } => {
@@ -796,6 +1067,7 @@ impl DaemonState {
                     self.save_aria2_session().await;
                 }
                 self.forget_download_retry(&gid).await;
+                self.forget_download_queue(&gid).await;
                 self.perform_refresh().await?;
             }
             crate::daemon::ApiRequest::ChangePosition { gid, offset } => {
@@ -810,11 +1082,36 @@ impl DaemonState {
             }
             crate::daemon::ApiRequest::PauseAll => {
                 let _: String = self.call("aria2.pauseAll", vec![]).await?;
+                for item in TorrentEngine::current_download_items(&self.torrent_engine.snapshot())
+                    .into_iter()
+                    .filter(|item| {
+                        matches!(
+                            item.status,
+                            DownloadStatus::Active | DownloadStatus::Waiting
+                        )
+                    })
+                {
+                    self.torrent_engine.pause(&item.gid).await?;
+                }
                 self.save_aria2_session().await;
+                {
+                    let mut queue = self.queue_state.lock().await;
+                    if queue.clear_held()
+                        && let Err(error) = queue.save(&self.app.paths.queue_state_file)
+                    {
+                        warn!("failed to persist queue state: {error}");
+                    }
+                }
                 self.perform_refresh().await?;
             }
             crate::daemon::ApiRequest::ResumeAll => {
                 let _: String = self.call("aria2.unpauseAll", vec![]).await?;
+                for item in TorrentEngine::current_download_items(&self.torrent_engine.snapshot())
+                    .into_iter()
+                    .filter(|item| item.status == DownloadStatus::Paused)
+                {
+                    self.torrent_engine.resume(&item.gid).await?;
+                }
                 self.save_aria2_session().await;
                 self.perform_refresh().await?;
             }
@@ -1110,6 +1407,7 @@ impl DaemonState {
         &self,
         url: &str,
         state: &crate::state::PersistedState,
+        batch: Option<u32>,
     ) -> Result<bool> {
         if !url.starts_with("http://") && !url.starts_with("https://") {
             return Ok(false);
@@ -1167,7 +1465,8 @@ impl DaemonState {
             &routing_name,
         )?;
         let effective_limit_bps = schedule::resolve(Local::now(), state)?.effective_limit_bps;
-        self.torrent_engine
+        let gid = self
+            .torrent_engine
             .add_url(
                 url,
                 route.resolved_directory,
@@ -1175,6 +1474,7 @@ impl DaemonState {
                 state.torrent_streaming_mode != crate::state::TorrentStreamingMode::Off,
             )
             .await?;
+        self.remember_download_batch(&gid, batch).await;
         Ok(true)
     }
 
@@ -1349,6 +1649,8 @@ fn map_status(status: Aria2Status) -> DownloadItem {
         connections: status.connections.and_then(|v| v.parse().ok()),
         error_code: status.error_code,
         error_message: status.error_message,
+        batch: None,
+        queue_held: false,
     }
 }
 
@@ -1681,6 +1983,7 @@ impl IfEmptyThen for String {
 #[cfg(test)]
 mod retry_tests {
     use super::*;
+    use crate::config::AppConfig;
 
     fn history_item(gid: &str, status: DownloadStatus) -> DownloadItem {
         DownloadItem {
@@ -1703,6 +2006,8 @@ mod retry_tests {
             connections: None,
             error_code: None,
             error_message: None,
+            batch: None,
+            queue_held: false,
         }
     }
 
@@ -1715,6 +2020,68 @@ mod retry_tests {
         assert_eq!(retry_delay_secs(50), 3_600);
     }
 
+    #[tokio::test]
+    async fn batch_assignments_persist_and_validate() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ariatui-queue-tests-{nonce}"));
+        let config_dir = root.join("config");
+        let state_dir = root.join("state");
+        let runtime_dir = root.join("runtime");
+        let paths = crate::paths::AppPaths {
+            config_dir: config_dir.clone(),
+            state_dir: state_dir.clone(),
+            runtime_dir: runtime_dir.clone(),
+            config_file: config_dir.join("config.toml"),
+            state_file: state_dir.join("state.toml"),
+            socket_path: runtime_dir.join("daemon.sock"),
+            daemon_marker_file: runtime_dir.join(".daemon"),
+            snapshot_cache_file: runtime_dir.join(".snapshot"),
+            history_file: state_dir.join("history.json"),
+            torrent_session_dir: state_dir.join("rqbit-session"),
+            aria2_session_file: state_dir.join("aria2.session"),
+            retry_state_file: state_dir.join("retry-state.json"),
+            queue_state_file: state_dir.join("queue-state.json"),
+            user_service_dir: config_dir.join("systemd/user"),
+            user_service_file: config_dir.join("systemd/user/ariatui-daemon.service"),
+            system_service_file: root.join("ariatui-daemon.service"),
+        };
+        let app = Arc::new(AppContext::new(
+            paths.clone(),
+            AppConfig::default(),
+            crate::state::PersistedState::default(),
+            "/tmp/ariatui".into(),
+            "test-build".into(),
+        ));
+        let daemon = DaemonState::new(app).await.unwrap();
+
+        daemon
+            .set_download_batch("gid-a", Some(4))
+            .await
+            .expect("batch saved");
+        let reloaded = queue::QueueState::load(&paths.queue_state_file);
+        assert_eq!(reloaded.batch("gid-a"), Some(4));
+
+        daemon
+            .set_download_batch("gid-a", None)
+            .await
+            .expect("batch cleared");
+        let reloaded = queue::QueueState::load(&paths.queue_state_file);
+        assert_eq!(reloaded.batch("gid-a"), None);
+
+        assert!(
+            daemon
+                .set_download_batch("gid-b", Some(crate::state::MAX_QUEUE_BATCH + 1))
+                .await
+                .is_err(),
+            "batch numbers are bounded"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn retry_preserves_http_output_location() {
         let entry = RetryEntry {
@@ -1724,6 +2091,7 @@ mod retry_tests {
             retries: 1,
             next_attempt_at: None,
             daily: false,
+            batch: None,
         };
         assert_eq!(
             retry_options(&entry),
@@ -1746,6 +2114,7 @@ mod retry_tests {
                 retries: 2,
                 next_attempt_at: None,
                 daily: false,
+                batch: None,
             },
         );
 
